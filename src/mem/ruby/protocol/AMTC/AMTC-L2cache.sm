@@ -119,7 +119,6 @@ machine(MachineType:L2Cache, "Token protocol")
   structure(Entry, desc="...", interface="AbstractCacheEntry") {
     State CacheState,        desc="cache state";
     bool Dirty,              desc="Is the data dirty (different than memory)?";
-    //int Tokens,              desc="The number of tokens we're holding for the line";
     int ValidSectors, default="0", desc="AMTC valid sectors in this L2 line";
     int DirtySectors, default="0", desc="AMTC dirty sectors in this L2 line";
     int TokenSectorMask, default="0", desc="AMTC sectors for which L2 token state is meaningful";

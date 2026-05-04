@@ -167,7 +167,7 @@ machine(MachineType:L1Cache, "Token protocol")
   structure(Entry, desc="...", interface="AbstractCacheEntry") {
     State CacheState,        desc="cache state";
     bool Dirty,              desc="Is the data dirty (different than memory)?";
-    int Tokens,              desc="The number of tokens we're holding for the line";
+    //int Tokens,              desc="The number of tokens we're holding for the line";
     DataBlock DataBlk,       desc="data for the block";
 
     // AMTC per-sector metadata for a 64B Ruby line split into 2 x 32B sectors.
@@ -1576,55 +1576,73 @@ action(a_issueReadRequest, "a", desc="Issue GETS") {
     }
   }
 
-  action(d_sendDataWithNTokenIfAvail, "\dd", desc="Send data and a token from cache to requestor") {
+  action(d_sendDataWithNTokenIfAvail, "\dd", desc="Send data and N tokens from cache to requestor") {
     assert(is_valid(cache_entry));
     int tokens_per_sector := max_tokens() / 2;
+    int owner_limit := N_tokens + tokens_per_sector;
+
     peek(requestNetwork_in, RequestMsg) {
-      if (cache_entry.Tokens > (N_tokens + (max_tokens() / 2))) {
-        enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
-          out_msg.addr := address;
-          out_msg.Type := CoherenceResponseType:DATA_SHARED;
-          out_msg.Sender := machineID;
-          out_msg.Destination.add(in_msg.Requestor);
-          out_msg.TokensSec0 := cache_entry.TokensSec0;
-      out_msg.TokensSec1 := cache_entry.TokensSec1;
-          out_msg.DataBlk := cache_entry.DataBlk;
-          out_msg.valid_sector_mask := cache_entry.ValidSectors;
-          // out_msg.Dirty := cache_entry.Dirty;
-          out_msg.Dirty := false;
-          if (in_msg.isLocal) {
-            out_msg.MessageSize := MessageSizeType:ResponseLocal_Data;
-          } else {
-            out_msg.MessageSize := MessageSizeType:Response_Data;
-          }
-        }
-        cache_entry.TokensSec1 := cache_entry.TokensSec1 - 1;
-        cache_entry.TokensSec1 := cache_entry.TokensSec1 - N_tokens;
-        if (cache_entry.TokensSec1 < tokens_per_sector) {
-            cache_entry.ValidSectors := amtc_subtractMask(cache_entry.ValidSectors, 2);
+      int req_mask := in_msg.requested_sector_mask;
+      if (req_mask == 0) { req_mask := amtc_fullMask(); }
+      int send_mask := amtc_intersectMasks(req_mask, cache_entry.ValidSectors);
+
+      int send_t0 := 0;
+      int send_t1 := 0;
+
+      // Evaluate Sector 0
+      if (amtc_maskHasSector(send_mask, 0)) {
+        if (cache_entry.TokensSec0 > owner_limit) {
+            send_t0 := N_tokens;
+        } else if (cache_entry.TokensSec0 > 1) {
+            send_t0 := 1;
         }
       }
-      else if (cache_entry.Tokens > 1) {
+
+      // Evaluate Sector 1
+      if (amtc_maskHasSector(send_mask, 1)) {
+        if (cache_entry.TokensSec1 > owner_limit) {
+            send_t1 := N_tokens;
+        } else if (cache_entry.TokensSec1 > 1) {
+            send_t1 := 1;
+        }
+      }
+
+      // If we have any tokens to give, send the payload
+      if (send_t0 > 0 || send_t1 > 0) {
         enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
           out_msg.addr := address;
           out_msg.Type := CoherenceResponseType:DATA_SHARED;
           out_msg.Sender := machineID;
           out_msg.Destination.add(in_msg.Requestor);
-          out_msg.TokensSec0 := 1;
-      out_msg.TokensSec1 := 1;
-          out_msg.DataBlk := cache_entry.DataBlk;
-          // out_msg.Dirty := cache_entry.Dirty;
+          out_msg.TokensSec0 := send_t0;
+          out_msg.TokensSec1 := send_t1;
+
+          if (amtc_maskHasSector(send_mask, 0)) { out_msg.DataBlk.copyPartial(cache_entry.DataBlk, 0, 32); }
+          if (amtc_maskHasSector(send_mask, 1)) { out_msg.DataBlk.copyPartial(cache_entry.DataBlk, 32, 32); }
+
+          out_msg.valid_sector_mask := send_mask;
           out_msg.Dirty := false;
+
           if (in_msg.isLocal) {
             out_msg.MessageSize := MessageSizeType:ResponseLocal_Data;
           } else {
-            out_msg.MessageSize := MessageSizeType:Response_Data;
+            out_msg.MessageSize := amtc_getSizeFromDirtyMask(send_mask);
           }
         }
-        cache_entry.Tokens := cache_entry.Tokens - 1;
+
+        // Deduct tokens
+        cache_entry.TokensSec0 := cache_entry.TokensSec0 - send_t0;
+        cache_entry.TokensSec1 := cache_entry.TokensSec1 - send_t1;
+
+        // Downgrade ValidSectors if we lost our Owner status for that sector
+        if (cache_entry.TokensSec0 < tokens_per_sector) {
+            cache_entry.ValidSectors := amtc_clearSector(cache_entry.ValidSectors, 0);
+        }
+        if (cache_entry.TokensSec1 < tokens_per_sector) {
+            cache_entry.ValidSectors := amtc_clearSector(cache_entry.ValidSectors, 1);
+        }
       }
     }
-//    assert(cache_entry.Tokens >= 1);
   }
 
 action(dd_sendDataWithAllTokens, "\d", desc="Send data and all tokens") {
@@ -1654,146 +1672,202 @@ action(dd_sendDataWithAllTokens, "\d", desc="Send data and all tokens") {
         }
       }
     }
-    cache_entry.Tokens := 0;
+    cache_entry.TokensSec0 := 0;
+    cache_entry.TokensSec1 := 0;
   }
 
-  action(e_sendAckWithCollectedTokens, "e", desc="Send ack with the tokens we've collected thus far.") {
-    // assert(persistentTable.findSmallest(address) != id); // Make sure we never bounce tokens to ourself
+action(e_sendAckWithCollectedTokens, "e", desc="Send ack with the tokens we've collected thus far.") {
     assert(is_valid(cache_entry));
-    if (cache_entry.Tokens > 0) {
+
+    // Evaluate our sectored token pools directly
+    if (cache_entry.TokensSec0 > 0 || cache_entry.TokensSec1 > 0) {
       enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
         out_msg.addr := address;
-        int expected_tokens := amtc_expectedTokensForMask(cache_entry.ValidSectors);
-        if (cache_entry.Tokens > (expected_tokens / 2)){
-          out_msg.Type := CoherenceResponseType:DATA_OWNER;
-        } else {
-          out_msg.Type := CoherenceResponseType:ACK;
-        }
+
+        // This is an ACK action. We yield the tokens as a control message.
+        out_msg.Type := CoherenceResponseType:ACK;
+
         out_msg.Sender := machineID;
         out_msg.Destination.add(persistentTable.findSmallest(address));
-        assert(cache_entry.Tokens >= 1);
+
         out_msg.TokensSec0 := cache_entry.TokensSec0;
-      out_msg.TokensSec1 := cache_entry.TokensSec1;
+        out_msg.TokensSec1 := cache_entry.TokensSec1;
         out_msg.DataBlk := cache_entry.DataBlk;
         out_msg.MessageSize := MessageSizeType:Response_Control;
+
+        // AMTC Metadata: Dynamically flag which sectors these tokens belong to
+        int t_mask := 0;
+        if (cache_entry.TokensSec0 > 0) { t_mask := amtc_unionMasks(t_mask, 1); }
+        if (cache_entry.TokensSec1 > 0) { t_mask := amtc_unionMasks(t_mask, 2); }
+
+        out_msg.token_sector_mask := t_mask;
+        out_msg.valid_sector_mask := 0; // ACKs never carry valid data
       }
     }
-    cache_entry.Tokens := 0;
+
+    // Safely zero out local tokens
+    cache_entry.TokensSec0 := 0;
+    cache_entry.TokensSec1 := 0;
   }
 
-  action(ee_sendDataWithAllTokens, "\e", desc="Send data and all tokens from cache to starver") {
-    //assert(persistentTable.findSmallest(address) != id); // Make sure we never bounce tokens to ourself
+action(ee_sendDataWithAllTokens, "\e", desc="Send data and all tokens from cache to starver") {
     assert(is_valid(cache_entry));
-    assert(cache_entry.Tokens > 0);
+    assert(cache_entry.TokensSec0 > 0 || cache_entry.TokensSec1 > 0);
+
     enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
       out_msg.addr := address;
       out_msg.Type := CoherenceResponseType:DATA_OWNER;
       out_msg.Sender := machineID;
       out_msg.Destination.add(persistentTable.findSmallest(address));
-      int expected_tokens := amtc_expectedTokensForMask(cache_entry.ValidSectors);
-      assert(cache_entry.Tokens == expected_tokens);
+
       out_msg.TokensSec0 := cache_entry.TokensSec0;
       out_msg.TokensSec1 := cache_entry.TokensSec1;
       out_msg.DataBlk := cache_entry.DataBlk;
+
       out_msg.valid_sector_mask := cache_entry.ValidSectors;
+      out_msg.token_sector_mask := cache_entry.ValidSectors;
       out_msg.Dirty := cache_entry.Dirty;
-      out_msg.MessageSize := MessageSizeType:Response_Data;
+
+      // Dynamic message sizing based on how many sectors are valid
+      out_msg.MessageSize := amtc_getSizeFromDirtyMask(cache_entry.ValidSectors);
     }
-    cache_entry.Tokens := 0;
+
+    // Safely zero out the sector token pools
+    cache_entry.TokensSec0 := 0;
+    cache_entry.TokensSec1 := 0;
   }
 
   action(f_sendAckWithAllButNorOneTokens, "f", desc="Send ack with all our tokens but one to starver.") {
-    //assert(persistentTable.findSmallest(address) != id); // Make sure we never bounce tokens to ourself
     assert(is_valid(cache_entry));
-    assert(cache_entry.Tokens > 0);
-    if (cache_entry.Tokens > 1) {
-      enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
-        out_msg.addr := address;
-        int expected_tokens := amtc_expectedTokensForMask(cache_entry.ValidSectors);
-        if ((cache_entry.Tokens > (expected_tokens / 2))) {
-          out_msg.Type := CoherenceResponseType:DATA_OWNER;
-        } else {
-          out_msg.Type := CoherenceResponseType:ACK;
-        }
-        out_msg.Sender := machineID;
-        out_msg.Destination.add(persistentTable.findSmallest(address));
-        assert(cache_entry.Tokens >= 1);
-        if (cache_entry.TokensSec0 > N_tokens) {
-          out_msg.TokensSec0 := cache_entry.TokensSec0 - N_tokens;
 
-      out_msg.TokensSec1 := cache_entry.TokensSec1 -N_tokens;
-        } else {
-          out_msg.TokensSec0 := cache_entry.TokensSec0 -1;
-      out_msg.TokensSec1 := cache_entry.TokensSec1 -1;
-        }
-        out_msg.DataBlk := cache_entry.DataBlk;
-        out_msg.MessageSize := MessageSizeType:Response_Control;
-      }
+    int send_t0 := 0;
+    int send_t1 := 0;
+
+    // Evaluate Sector 0: If we have > 1 token, keep 1 and send the rest.
+    if (cache_entry.TokensSec0 > 1) {
+        send_t0 := cache_entry.TokensSec0 - 1;
+        cache_entry.TokensSec0 := 1;
+    }
+    // Evaluate Sector 1: If we have > 1 token, keep 1 and send the rest.
+    if (cache_entry.TokensSec1 > 1) {
+        send_t1 := cache_entry.TokensSec1 - 1;
+        cache_entry.TokensSec1 := 1;
     }
 
+    if (send_t0 > 0 || send_t1 > 0) {
+      enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:ACK; // ACKs never carry data
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(persistentTable.findSmallest(address));
+
+        out_msg.TokensSec0 := send_t0;
+        out_msg.TokensSec1 := send_t1;
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+
+        // AMTC Metadata: Flag which sectors these tokens belong to
+        int t_mask := 0;
+        if (send_t0 > 0) { t_mask := amtc_unionMasks(t_mask, 1); }
+        if (send_t1 > 0) { t_mask := amtc_unionMasks(t_mask, 2); }
+
+        out_msg.token_sector_mask := t_mask;
+        out_msg.valid_sector_mask := 0;
+      }
+    }
   }
 
   action(ff_sendDataWithAllButNorOneTokens, "\f", desc="Send data and out tokens but one to starver") {
-    //assert(persistentTable.findSmallest(address) != id); // Make sure we never bounce tokens to ourself
     assert(is_valid(cache_entry));
-    assert(cache_entry.Tokens > ((max_tokens() / 2) + 1));
-    enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
-        out_msg.addr := address;
-        out_msg.Type := CoherenceResponseType:DATA_OWNER;
-        out_msg.Sender := machineID;
-        out_msg.Destination.add(persistentTable.findSmallest(address));
-out_msg.TokensSec0 := cache_entry.TokensSec0;
-out_msg.TokensSec1 := cache_entry.TokensSec1;
 
-        out_msg.DataBlk := cache_entry.DataBlk;
-        out_msg.valid_sector_mask := cache_entry.ValidSectors;
-        out_msg.Dirty := cache_entry.Dirty;
-        out_msg.MessageSize := MessageSizeType:Response_Data;
+    int send_t0 := 0;
+    int send_t1 := 0;
+    int send_mask := 0;
+
+    // Evaluate Sector 0
+    if (cache_entry.TokensSec0 > 1) {
+        send_t0 := cache_entry.TokensSec0 - 1;
+        cache_entry.TokensSec0 := 1;
+        send_mask := amtc_unionMasks(send_mask, 1);
     }
-    if (cache_entry.Tokens > (N_tokens + (max_tokens() / 2))) {
-      cache_entry.Tokens := N_tokens;
-    } else {
-      cache_entry.Tokens := 1;
+    // Evaluate Sector 1
+    if (cache_entry.TokensSec1 > 1) {
+        send_t1 := cache_entry.TokensSec1 - 1;
+        cache_entry.TokensSec1 := 1;
+        send_mask := amtc_unionMasks(send_mask, 2);
+    }
+
+    if (send_t0 > 0 || send_t1 > 0) {
+      enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceResponseType:DATA_OWNER;
+          out_msg.Sender := machineID;
+          out_msg.Destination.add(persistentTable.findSmallest(address));
+
+          out_msg.TokensSec0 := send_t0;
+          out_msg.TokensSec1 := send_t1;
+
+          // Sector-Aware Data Copy: Only send the bytes we are yielding
+          if (amtc_maskHasSector(send_mask, 0)) { out_msg.DataBlk.copyPartial(cache_entry.DataBlk, 0, 32); }
+          if (amtc_maskHasSector(send_mask, 1)) { out_msg.DataBlk.copyPartial(cache_entry.DataBlk, 32, 32); }
+
+          out_msg.valid_sector_mask := send_mask;
+          out_msg.token_sector_mask := send_mask;
+          out_msg.Dirty := cache_entry.Dirty;
+          out_msg.MessageSize := amtc_getSizeFromDirtyMask(send_mask);
+      }
     }
   }
 
   action(fo_sendDataWithOwnerToken, "fo", desc="Send data and owner tokens") {
     assert(is_valid(cache_entry));
-    assert(cache_entry.Tokens == ((max_tokens() / 2) + 1));
     enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
         out_msg.addr := address;
         out_msg.Type := CoherenceResponseType:DATA_OWNER;
         out_msg.Sender := machineID;
         out_msg.Destination.add(persistentTable.findSmallest(address));
+
         out_msg.TokensSec0 := cache_entry.TokensSec0;
         out_msg.TokensSec1 := cache_entry.TokensSec1;
-
         out_msg.DataBlk := cache_entry.DataBlk;
+
         out_msg.valid_sector_mask := cache_entry.ValidSectors;
+        out_msg.token_sector_mask := cache_entry.ValidSectors;
         out_msg.Dirty := cache_entry.Dirty;
-        out_msg.MessageSize := MessageSizeType:Response_Data;
+        out_msg.MessageSize := amtc_getSizeFromDirtyMask(cache_entry.ValidSectors);
     }
-    cache_entry.Tokens := 0;
+    cache_entry.TokensSec0 := 0;
+    cache_entry.TokensSec1 := 0;
   }
 
   action(g_bounceResponseToStarver, "g", desc="Redirect response to starving processor") {
-    // assert(persistentTable.isLocked(address));
-
     peek(responseNetwork_in, ResponseMsg) {
-      // assert(persistentTable.findSmallest(address) != id); // Make sure we never bounce tokens to ourself
-      // FIXME, should use a 3rd vnet in some cases
       enqueue(responseNetwork_out, ResponseMsg, 1) {
         out_msg.addr := address;
         out_msg.Type := in_msg.Type;
         out_msg.Sender := machineID;
         out_msg.Destination.add(persistentTable.findSmallest(address));
-       out_msg.TokensSec0 := cache_entry.TokensSec0;
-out_msg.TokensSec1 := cache_entry.TokensSec1;
+
+        // CRITICAL FIX: Combine incoming tokens with our local tokens!
+        if (is_valid(cache_entry)) {
+            out_msg.TokensSec0 := in_msg.TokensSec0 + cache_entry.TokensSec0;
+            out_msg.TokensSec1 := in_msg.TokensSec1 + cache_entry.TokensSec1;
+        } else {
+            out_msg.TokensSec0 := in_msg.TokensSec0;
+            out_msg.TokensSec1 := in_msg.TokensSec1;
+        }
+
         out_msg.DataBlk := in_msg.DataBlk;
         out_msg.valid_sector_mask := in_msg.valid_sector_mask;
+        out_msg.token_sector_mask := in_msg.token_sector_mask;
         out_msg.Dirty := in_msg.Dirty;
         out_msg.MessageSize := in_msg.MessageSize;
       }
+    }
+
+    // Safely zero out our local tokens since we just yielded them all
+    if (is_valid(cache_entry)) {
+        cache_entry.TokensSec0 := 0;
+        cache_entry.TokensSec1 := 0;
     }
   }
 
@@ -2129,27 +2203,39 @@ out_msg.TokensSec1 := 0;
 
   action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've collected thus far.") {
     assert(is_valid(cache_entry));
-    if (cache_entry.Tokens > 0) {
+
+    // Evaluate if we hold tokens for ANY sector
+    if (cache_entry.TokensSec0 > 0 || cache_entry.TokensSec1 > 0) {
       peek(requestNetwork_in, RequestMsg) {
         enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
           out_msg.addr := address;
-          int expected_tokens := amtc_expectedTokensForMask(cache_entry.ValidSectors);
-          if ( (cache_entry.Tokens > (expected_tokens / 2))) {
-            out_msg.Type := CoherenceResponseType:DATA_OWNER;
-          } else {
-            out_msg.Type := CoherenceResponseType:ACK;
-          }
+
+          // We are yielding stray tokens. This is strictly a control message.
+          out_msg.Type := CoherenceResponseType:ACK;
           out_msg.Sender := machineID;
           out_msg.Destination.add(in_msg.Requestor);
-          assert(cache_entry.Tokens >= 1);
+
           out_msg.TokensSec0 := cache_entry.TokensSec0;
-out_msg.TokensSec1 := cache_entry.TokensSec1;
+          out_msg.TokensSec1 := cache_entry.TokensSec1;
+
+          // Even though it's an ACK, we pass the block along just in case
           out_msg.DataBlk := cache_entry.DataBlk;
           out_msg.MessageSize := MessageSizeType:Response_Control;
+
+          // AMTC Metadata: Flag exactly which sectors these tokens belong to
+          int t_mask := 0;
+          if (cache_entry.TokensSec0 > 0) { t_mask := amtc_unionMasks(t_mask, 1); }
+          if (cache_entry.TokensSec1 > 0) { t_mask := amtc_unionMasks(t_mask, 2); }
+
+          out_msg.token_sector_mask := t_mask;
+          out_msg.valid_sector_mask := 0; // ACKs never carry valid payload bytes
         }
       }
     }
-    cache_entry.Tokens := 0;
+
+    // Safely zero out our local tokens since we just yielded them all
+    cache_entry.TokensSec0 := 0;
+    cache_entry.TokensSec1 := 0;
   }
 
   action(u_writeDataToCache, "u", desc="Write data to cache") {
