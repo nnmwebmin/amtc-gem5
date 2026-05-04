@@ -1,0 +1,9 @@
+protocol "AMTC";
+
+//include "AMTC/AMTC-util.sm";
+
+include "AMTC/AMTC-msg.sm";
+include "AMTC/AMTC-L1cache.sm";
+include "AMTC/AMTC-L2cache.sm";
+include "AMTC/AMTC-dir.sm";
+include "AMTC/AMTC-dma.sm";

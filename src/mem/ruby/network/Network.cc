@@ -185,6 +185,14 @@ Network::MessageSizeType_to_int(MessageSizeType size_type)
       case MessageSizeType_ResponseL2hit_Data:
       case MessageSizeType_Writeback_Data:
         return m_data_msg_size;
+      // ==========================================
+      // SECTOR-AWARE SIZES HERE:
+      // ==========================================
+      case MessageSizeType_Response_Sector1_Data:
+          return m_control_msg_size + 32; // Header + 32B data
+      case MessageSizeType_Response_Sector2_Data:
+          return m_data_msg_size;
+
       default:
         panic("Invalid range for type MessageSizeType");
         break;

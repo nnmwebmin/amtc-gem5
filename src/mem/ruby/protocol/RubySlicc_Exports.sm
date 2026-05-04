@@ -298,6 +298,11 @@ enumeration(MessageSizeType, desc="...") {
   ResponseL2hit_Data, desc="data response";
   ResponseLocal_Data, desc="data response";
   Response_Control, desc="non-data response";
+
+  //sector aware
+  Response_Sector1_Data;
+  Response_Sector2_Data;
+
   Writeback_Data, desc="Writeback data";
   Writeback_Control, desc="Writeback control";
   Broadcast_Control, desc="Broadcast control";

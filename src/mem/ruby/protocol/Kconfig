@@ -55,5 +55,8 @@ config RUBY_PROTOCOL_MOESI_hammer
 config RUBY_PROTOCOL_Garnet_standalone
     bool "Garnet standalone"
     default n
+config RUBY_PROTOCOL_AMTC
+    bool "AMTC"
+    depends on RUBY
 
 rsource "chi/Kconfig"
