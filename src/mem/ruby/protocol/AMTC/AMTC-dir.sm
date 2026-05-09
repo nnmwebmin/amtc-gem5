@@ -42,18 +42,12 @@ machine(MachineType:Directory, "Token protocol")
    MessageBuffer * responseFromDir, network="To", virtual_network="4",
         vnet_type="response";
 
-   MessageBuffer * persistentFromDir, network="To", virtual_network="3",
-        vnet_type="persistent";
-
    MessageBuffer * requestFromDir, network="To", virtual_network="1",
         vnet_type="request";
 
    // Message Queues to dir from other controllers / network
    MessageBuffer * responseToDir, network="From", virtual_network="4",
         vnet_type="response";
-
-   MessageBuffer * persistentToDir, network="From", virtual_network="3",
-        vnet_type="persistent";
 
    MessageBuffer * requestToDir, network="From", virtual_network="2",
         vnet_type="request";
@@ -63,6 +57,7 @@ machine(MachineType:Directory, "Token protocol")
 
    MessageBuffer * requestToMemory;
    MessageBuffer * responseFromMemory;
+   MessageBuffer * triggerQueue;
 {
   // STATES
   state_declaration(State, desc="Directory states", default="Directory_State_O") {
@@ -92,6 +87,11 @@ machine(MachineType:Directory, "Token protocol")
 
     NO_W_DataOnly, AccessPermission:Busy, "NO_W_DataOnly", desc="Not Owner, fetching memory for partial fill without tokens";
 
+    // --- ADD THE NEW ACCUMULATOR STATES HERE ---
+    NO_DW_ACCUM, AccessPermission:Busy, desc="Accumulating data and tokens for DMA write";
+    NO_DR_ACCUM, AccessPermission:Busy, desc="Waiting for DMA Read tokens and data from sharers/owner"; // <--- ADD THIS LINE
+    // O_DW_ACCUM, AccessPermission:Busy, desc="Accumulating data and tokens for DMA write (Owner)";
+
   }
 
   // Events
@@ -103,11 +103,10 @@ machine(MachineType:Directory, "Token protocol")
     Own_Lock_or_Unlock, desc="own lock or unlock";
     Own_Lock_or_Unlock_Tokens, desc="own lock or unlock with tokens";
     Data_Owner, desc="Data arrive";
-    Data_All_Tokens, desc="Data and all tokens";
+    Data_Shared,  desc="Data from a sharer";
     Ack_Owner, desc="Owner token arrived without data because it was clean";
-    Ack_Owner_All_Tokens, desc="All tokens including owner arrived without data because it was clean";
+   // Ack_Owner_All_Tokens, desc="All tokens including owner arrived without data because it was clean";
     Tokens, desc="Tokens arrive";
-    Ack_All_Tokens, desc="All_Tokens arrive";
     Request_Timeout, desc="A DMA request has timed out";
 
     // Memory Controller
@@ -117,11 +116,12 @@ machine(MachineType:Directory, "Token protocol")
     // DMA requests
     DMA_READ, desc="A DMA Read memory request";
     DMA_WRITE, desc="A DMA Write memory request";
-    DMA_WRITE_All_Tokens, desc="A DMA Write memory request, directory has all tokens";
-
-    GETS_Tokens_Left, desc="A GETS arrives and directory still has some sector tokens";
 
     GETS_Owner_Pull, desc="The Owner is requesting raw data for a missing sector";
+
+    // --- ADD THESE TWO INTERNAL TRIGGERS ---
+    Write_Complete,  desc="Internal trigger: All data and tokens for a write are accumulated";
+    Read_Complete,   desc="Internal trigger: All data for a read is accumulated";
   }
 
   // TYPES
@@ -149,18 +149,6 @@ machine(MachineType:Directory, "Token protocol")
     Set Sharers,                   desc="Probable sharers of the line.  More accurately, the set of processors who need to see a GetX";
   }
 
-  structure(PersistentTable, external="yes") {
-    void persistentRequestLock(Addr, MachineID, AccessType);
-    void persistentRequestUnlock(Addr, MachineID);
-    bool okToIssueStarving(Addr, MachineID);
-    MachineID findSmallest(Addr);
-    AccessType typeOfSmallest(Addr);
-    void markEntries(Addr);
-    bool isLocked(Addr);
-    int countStarvingForAddress(Addr);
-    int countReadStarvingForAddress(Addr);
-  }
-
   // TBE entries for DMA requests
   structure(TBE, desc="TBE entries for outstanding DMA requests") {
     Addr PhysicalAddress, desc="physical address";
@@ -185,14 +173,17 @@ machine(MachineType:Directory, "Token protocol")
     bool isPresent(Addr);
   }
 
+  structure(TriggerMsg, desc="Internal trigger message", interface="Message") {
+    Addr addr, desc="Physical address";
+    Event Type, desc="Event to trigger";
+    // CRITICAL FIX: Use the underscore instead of the colon here
+    MessageSizeType MessageSize, default="MessageSizeType_Request_Control";
+  }
+
   // ** OBJECTS **
 
-  PersistentTable persistentTable;
   TimerTable reissueTimerTable;
-
   TBETable TBEs, template="<Directory_TBE>", constructor="m_number_of_TBEs";
-
-  bool starving, default="false";
   int l2_select_low_bit, default="m_ruby_system->getBlockSizeBits()";
 
   Tick clockEdge();
@@ -423,14 +414,6 @@ machine(MachineType:Directory, "Token protocol")
     getDirectoryEntry(addr).changePermission(Directory_State_to_permission(state));
   }
 
-  bool okToIssueStarving(Addr addr, MachineID machinID) {
-    return persistentTable.okToIssueStarving(addr, machineID);
-  }
-
-  void markPersistentEntries(Addr addr) {
-    persistentTable.markEntries(addr);
-  }
-
   void functionalRead(Addr addr, Packet *pkt) {
     TBE tbe := TBEs[addr];
     if(is_valid(tbe)) {
@@ -453,15 +436,38 @@ machine(MachineType:Directory, "Token protocol")
     return num_functional_writes;
   }
 
+  bool amtc_hasAllTokens(Addr addr) {
 
+    Entry entry := getDirectoryEntry(addr);
+
+    return
+        (entry.TokensSec0 == (max_tokens() / 2)) &&
+        (entry.TokensSec1 == (max_tokens() / 2));
+  }
+
+  bool amtc_hasRequestedData(TBE tbe) {
+    return amtc_maskContainsAll(tbe.ReceivedSectorMask, tbe.RequestedSectorMask);
+  }
+
+  bool amtc_hasRequestedTokens(TBE tbe) {
+    return amtc_maskContainsAll(tbe.TokenReadySectorMask, tbe.RequestedSectorMask);
+  }
+
+  bool amtc_readComplete(TBE tbe) {
+    return amtc_hasRequestedData(tbe);
+  }
+
+  bool amtc_writeComplete(Addr addr, TBE tbe) {
+    return amtc_hasRequestedData(tbe) && amtc_hasRequestedTokens(tbe);
+  }
 
 
   // ** OUT_PORTS **
   out_port(responseNetwork_out, ResponseMsg, responseFromDir);
-  out_port(persistentNetwork_out, PersistentMsg, persistentFromDir);
   out_port(requestNetwork_out, RequestMsg, requestFromDir);
   out_port(dmaResponseNetwork_out, DMAResponseMsg, dmaResponseFromDir);
   out_port(memQueue_out, MemoryMsg, requestToMemory);
+  out_port(triggerQueue_out, TriggerMsg, triggerQueue);
 
   // ** IN_PORTS **
   // off-chip memory request/response is done
@@ -491,110 +497,38 @@ machine(MachineType:Directory, "Token protocol")
 
   in_port(responseNetwork_in, ResponseMsg, responseToDir) {
     if (responseNetwork_in.isReady(clockEdge())) {
-      peek(responseNetwork_in, ResponseMsg) {
-        assert(in_msg.Destination.isElement(machineID));
-        Entry dir_entry := getDirectoryEntry(in_msg.addr);
+        peek(responseNetwork_in, ResponseMsg) {
 
-        // Phase 2 Token Aggregation
-        int future_t0 := dir_entry.TokensSec0 + in_msg.TokensSec0;
-        int future_t1 := dir_entry.TokensSec1 + in_msg.TokensSec1;
-        int required := max_tokens() / 2;
+            assert(in_msg.Destination.isElement(machineID));
 
-        // Has the directory reclaimed all tokens for both sectors?
-        bool is_effectively_all_tokens := (future_t0 == required) && (future_t1 == required);
+            if (in_msg.Type == CoherenceResponseType:DATA_OWNER) {
 
-        if (is_effectively_all_tokens) {
-          if ((in_msg.Type == CoherenceResponseType:DATA_OWNER) ||
-              (in_msg.Type == CoherenceResponseType:DATA_SHARED)) {
-            trigger(Event:Data_All_Tokens, in_msg.addr, TBEs[in_msg.addr]);
-          } else if (in_msg.Type == CoherenceResponseType:ACK_OWNER) {
-            trigger(Event:Ack_Owner_All_Tokens, in_msg.addr, TBEs[in_msg.addr]);
-          } else if (in_msg.Type == CoherenceResponseType:ACK) {
-            trigger(Event:Ack_All_Tokens, in_msg.addr, TBEs[in_msg.addr]);
-          } else {
-            error("Invalid message");
-          }
-        } else {
-          if (in_msg.Type == CoherenceResponseType:DATA_OWNER) {
-            trigger(Event:Data_Owner, in_msg.addr, TBEs[in_msg.addr]);
-          } else if ((in_msg.Type == CoherenceResponseType:ACK) ||
-                     (in_msg.Type == CoherenceResponseType:DATA_SHARED)) {
-            trigger(Event:Tokens, in_msg.addr, TBEs[in_msg.addr]);
-          } else if (in_msg.Type == CoherenceResponseType:ACK_OWNER) {
-            trigger(Event:Ack_Owner, in_msg.addr, TBEs[in_msg.addr]);
-          } else {
-            error("Invalid message");
-          }
-        }
-      }
-    }
-  }
-
-  in_port(persistentNetwork_in, PersistentMsg, persistentToDir) {
-    if (persistentNetwork_in.isReady(clockEdge())) {
-      peek(persistentNetwork_in, PersistentMsg) {
-        assert(in_msg.Destination.isElement(machineID));
-
-        Entry dir_entry := getDirectoryEntry(in_msg.addr);
-
-        if (distributed_persistent) {
-          // Apply the lockdown or unlockdown message to the table
-          if (in_msg.Type == PersistentRequestType:GETX_PERSISTENT) {
-            persistentTable.persistentRequestLock(in_msg.addr, in_msg.Requestor, AccessType:Write);
-          } else if (in_msg.Type == PersistentRequestType:GETS_PERSISTENT) {
-            persistentTable.persistentRequestLock(in_msg.addr, in_msg.Requestor, AccessType:Read);
-          } else if (in_msg.Type == PersistentRequestType:DEACTIVATE_PERSISTENT) {
-            persistentTable.persistentRequestUnlock(in_msg.addr, in_msg.Requestor);
-          } else {
-            error("Invalid message");
-          }
-
-          // React to the message based on the current state of the table
-          if (persistentTable.isLocked(in_msg.addr)) {
-            if (persistentTable.findSmallest(in_msg.addr) == machineID) {
-              // PHASE 2 FIX: Check both sector token pools independently
-              if (dir_entry.TokensSec0 > 0 || dir_entry.TokensSec1 > 0) {
-                trigger(Event:Own_Lock_or_Unlock_Tokens, in_msg.addr,
+                trigger(Event:Data_Owner,
+                        in_msg.addr,
                         TBEs[in_msg.addr]);
-              } else {
-                trigger(Event:Own_Lock_or_Unlock, in_msg.addr,
+
+            } else if (in_msg.Type == CoherenceResponseType:DATA_SHARED) {
+                trigger(Event:Data_Shared, in_msg.addr, TBEs[in_msg.addr]);
+            } else if (in_msg.Type == CoherenceResponseType:ACK_OWNER) {
+
+                trigger(Event:Ack_Owner,
+                        in_msg.addr,
                         TBEs[in_msg.addr]);
-              }
+
+            } else if (in_msg.Type == CoherenceResponseType:ACK) {
+
+                trigger(Event:Tokens,
+                        in_msg.addr,
+                        TBEs[in_msg.addr]);
+
             } else {
-              // locked
-              trigger(Event:Lockdown, in_msg.addr, TBEs[in_msg.addr]);
+
+                error("Invalid response type");
+
             }
-          } else {
-            // unlocked
-            trigger(Event:Unlockdown, in_msg.addr, TBEs[in_msg.addr]);
-          }
         }
-        else {
-          if (persistentTable.findSmallest(in_msg.addr) == machineID) {
-              // PHASE 2 FIX: Check both sector token pools independently
-              if (dir_entry.TokensSec0 > 0 || dir_entry.TokensSec1 > 0) {
-                trigger(Event:Own_Lock_or_Unlock_Tokens, in_msg.addr,
-                        TBEs[in_msg.addr]);
-              } else {
-                trigger(Event:Own_Lock_or_Unlock, in_msg.addr,
-                        TBEs[in_msg.addr]);
-              }
-          } else if (in_msg.Type == PersistentRequestType:GETX_PERSISTENT) {
-            // locked
-            trigger(Event:Lockdown, in_msg.addr, TBEs[in_msg.addr]);
-          } else if (in_msg.Type == PersistentRequestType:GETS_PERSISTENT) {
-            // locked
-            trigger(Event:Lockdown, in_msg.addr, TBEs[in_msg.addr]);
-          } else if (in_msg.Type == PersistentRequestType:DEACTIVATE_PERSISTENT) {
-            // unlocked
-            trigger(Event:Unlockdown, in_msg.addr, TBEs[in_msg.addr]);
-          } else {
-            error("Invalid message");
-          }
-        }
-      }
     }
-  }
+}
 
   in_port(requestNetwork_in, RequestMsg, requestToDir) {
     if (requestNetwork_in.isReady(clockEdge())) {
@@ -617,28 +551,30 @@ machine(MachineType:Directory, "Token protocol")
     }
   }
 
-in_port(dmaRequestQueue_in, DMARequestMsg, dmaRequestToDir) {
-    if (dmaRequestQueue_in.isReady(clockEdge())) {
-      peek(dmaRequestQueue_in, DMARequestMsg) {
-        Entry dir_entry := getDirectoryEntry(in_msg.LineAddress);
+  in_port(dmaRequestQueue_in, DMARequestMsg, dmaRequestToDir) {
+      if (dmaRequestQueue_in.isReady(clockEdge())) {
+          peek(dmaRequestQueue_in, DMARequestMsg) {
 
-        if (in_msg.Type == DMARequestType:READ) {
-          trigger(Event:DMA_READ, in_msg.LineAddress, TBEs[in_msg.LineAddress]);
-        } else if (in_msg.Type == DMARequestType:WRITE) {
-
-          // PHASE 2 FIX: Verify the directory holds 100% of tokens for BOTH sectors
-          if (dir_entry.TokensSec0 == (max_tokens() / 2) &&
-              dir_entry.TokensSec1 == (max_tokens() / 2)) {
-            trigger(Event:DMA_WRITE_All_Tokens, in_msg.LineAddress,
-                    TBEs[in_msg.LineAddress]);
-          } else {
-            trigger(Event:DMA_WRITE, in_msg.LineAddress,
-                    TBEs[in_msg.LineAddress]);
+              if (in_msg.Type == DMARequestType:READ) {
+                  trigger(Event:DMA_READ,
+                          in_msg.LineAddress,
+                          TBEs[in_msg.LineAddress]);
+              } else if (in_msg.Type == DMARequestType:WRITE) {
+                  trigger(Event:DMA_WRITE,
+                          in_msg.LineAddress,
+                          TBEs[in_msg.LineAddress]);
+              } else {
+                  error("Invalid DMA message");
+              }
           }
+      }
+  }
 
-        } else {
-          error("Invalid message");
-        }
+  in_port(triggerQueue_in, TriggerMsg, triggerQueue) {
+    if (triggerQueue_in.isReady(clockEdge())) {
+      peek(triggerQueue_in, TriggerMsg) {
+        // Dynamically trigger the event stored in the message
+        trigger(in_msg.Type, in_msg.addr, TBEs[in_msg.addr]);
       }
     }
   }
@@ -683,61 +619,6 @@ in_port(dmaRequestQueue_in, DMARequestMsg, dmaRequestToDir) {
     }
   }
 
-  action(px_tryIssuingPersistentGETXRequest, "px", desc="...") {
-    if (okToIssueStarving(address, machineID) && (starving == false)) {
-      enqueue(persistentNetwork_out, PersistentMsg, 1) {
-        out_msg.addr := address;
-        out_msg.Type := PersistentRequestType:GETX_PERSISTENT;
-        out_msg.Requestor := machineID;
-        out_msg.Destination.broadcast(MachineType:L1Cache);
-
-        //
-        // Currently the configuration system limits the system to only one
-        // chip.  Therefore, if we assume one shared L2 cache, then only one
-        // pertinent L2 cache exist.
-        //
-        //out_msg.Destination.addNetDest(getAllPertinentL2Banks(address));
-
-          out_msg.Destination.add(mapAddressToRange(address,
-                                    MachineType:L2Cache, l2_select_low_bit,
-                                    l2_select_num_bits, intToID(0)));
-
-          out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
-          out_msg.MessageSize := MessageSizeType:Persistent_Control;
-          out_msg.Prefetch := PrefetchBit:No;
-          out_msg.AccessMode := RubyAccessMode:Supervisor;
-
-          int req_mask := tbe.RequestedSectorMask;
-          if (req_mask == 0) {
-           // req_mask := amtc_fullMask();
-          }
-          out_msg.sector_mask := amtc_sanitizeMask(req_mask);
-          out_msg.requested_sector_mask := amtc_sanitizeMask(req_mask);
-
-          out_msg.is_gpu := false;
-          out_msg.is_sync := false;
-
-          DPRINTF(RubySlicc,
-            "AMTC_DIR_REQUEST_MASK_DEFAULT addr=%#x mask=%d\n",
-            address, out_msg.sector_mask);
-      }
-      markPersistentEntries(address);
-      starving := true;
-
-      tbe.WentPersistent := true;
-
-      // Do not schedule a wakeup, a persistent requests will always complete
-    } else {
-
-      // We'd like to issue a persistent request, but are not allowed
-      // to issue a P.R. right now.  This, we do not increment the
-      // IssueCount.
-
-      // Set a wakeup timer
-      reissueTimerTable.set(address, clockEdge(reissue_wakeup_latency));
-    }
-  }
-
   action(bw_broadcastWrite, "bw", desc="Broadcast GETX if we need tokens") {
     peek(dmaRequestQueue_in, DMARequestMsg) {
       //
@@ -777,56 +658,6 @@ in_port(dmaRequestQueue_in, DMARequestMsg, dmaRequestToDir) {
     }
   }
 
-  action(ps_tryIssuingPersistentGETSRequest, "ps", desc="...") {
-    if (okToIssueStarving(address, machineID) && (starving == false)) {
-      enqueue(persistentNetwork_out, PersistentMsg, 1) {
-        out_msg.addr := address;
-        out_msg.Type := PersistentRequestType:GETS_PERSISTENT;
-        out_msg.Requestor := machineID;
-        out_msg.Destination.broadcast(MachineType:L1Cache);
-
-        //
-        // Currently the configuration system limits the system to only one
-        // chip.  Therefore, if we assume one shared L2 cache, then only one
-        // pertinent L2 cache exist.
-        //
-        //out_msg.Destination.addNetDest(getAllPertinentL2Banks(address));
-        int req_mask := tbe.RequestedSectorMask;
-        if (req_mask == 0) {
-          //req_mask := amtc_fullMask();
-        }
-
-        out_msg.Destination.add(mapAddressToRange(address,
-                                  MachineType:L2Cache, l2_select_low_bit,
-                                  l2_select_num_bits, intToID(0)));
-
-        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
-        out_msg.MessageSize := MessageSizeType:Persistent_Control;
-        out_msg.Prefetch := PrefetchBit:No;
-        out_msg.AccessMode := RubyAccessMode:Supervisor;
-        out_msg.sector_mask := amtc_sanitizeMask(req_mask);
-        out_msg.requested_sector_mask := amtc_sanitizeMask(req_mask);
-        out_msg.is_gpu := false;
-        out_msg.is_sync := false;
-        DPRINTF(RubySlicc, "AMTC_DIR_PERSIST_MASK_DEFAULT addr=%#x mask=%d\n", address, out_msg.sector_mask);
-      }
-      markPersistentEntries(address);
-      starving := true;
-
-      tbe.WentPersistent := true;
-
-      // Do not schedule a wakeup, a persistent requests will always complete
-    } else {
-
-      // We'd like to issue a persistent request, but are not allowed
-      // to issue a P.R. right now.  This, we do not increment the
-      // IssueCount.
-
-      // Set a wakeup timer
-      reissueTimerTable.set(address, clockEdge(reissue_wakeup_latency));
-    }
-  }
-
   action(br_broadcastRead, "br", desc="Broadcast GETS for data") {
     peek(dmaRequestQueue_in, DMARequestMsg) {
       enqueue(requestNetwork_out, RequestMsg, 1) {
@@ -850,44 +681,25 @@ in_port(dmaRequestQueue_in, DMARequestMsg, dmaRequestToDir) {
     }
   }
 
-  action(aa_sendTokensToStarver, "\a", desc="Send tokens to starver") {
-    Entry dir_entry := getDirectoryEntry(address);
-
-    // PHASE 2: Check if we have tokens for ANY sector
-    if (dir_entry.TokensSec0 > 0 || dir_entry.TokensSec1 > 0) {
-      enqueue(responseNetwork_out, ResponseMsg, directory_latency) {
-        out_msg.addr := address;
-        out_msg.Type := CoherenceResponseType:ACK;
-        out_msg.Sender := machineID;
-        out_msg.Destination.add(persistentTable.findSmallest(address));
-
-        // Attach the split tokens
-        out_msg.TokensSec0 := dir_entry.TokensSec0;
-        out_msg.TokensSec1 := dir_entry.TokensSec1;
-
-        int req_mask := dir_entry.RequestedSectorMask;
-        if (req_mask == 0) {
-          //req_mask := amtc_fullMask();
+  action(cwc_checkWriteComplete, "cwc", desc="Check Write completion and fire trigger") {
+    if (amtc_hasRequestedTokens(tbe) && amtc_hasRequestedData(tbe)) {
+        enqueue(triggerQueue_out, TriggerMsg, 1) {
+            out_msg.addr := address;
+            out_msg.Type := Event:Write_Complete;
         }
-
-        // AMTC Metadata: Dynamically flag which sectors these tokens belong to
-        int t_mask := 0;
-        if (dir_entry.TokensSec0 > 0) { t_mask := amtc_unionMasks(t_mask, 1); }
-        if (dir_entry.TokensSec1 > 0) { t_mask := amtc_unionMasks(t_mask, 2); }
-
-        out_msg.MessageSize := MessageSizeType:Response_Control;
-        out_msg.sector_mask := amtc_sanitizeMask(req_mask);
-        out_msg.token_sector_mask := t_mask;
-        out_msg.requested_sector_mask := amtc_sanitizeMask(req_mask);
-      }
-
-      // Safely clear the sent tokens
-      dir_entry.TokensSec0 := 0;
-      dir_entry.TokensSec1 := 0;
     }
   }
 
-  action(d_sendMemoryDataWithAllTokens, "d", desc="Send data to requestor without tokens") {
+  action(crc_checkReadComplete, "crc", desc="Check Read completion and fire trigger") {
+    if (amtc_hasRequestedTokens(tbe) && amtc_hasRequestedData(tbe)) {
+        enqueue(triggerQueue_out, TriggerMsg, 1) {
+            out_msg.addr := address;
+            out_msg.Type := Event:Read_Complete;
+        }
+    }
+  }
+
+  action(d_sendMemoryDataOwnerResponse, "d", desc="Send data to requestor without tokens") {
     peek(memQueue_in, MemoryMsg) {
 
       Entry entry := getDirectoryEntry(address);
@@ -938,85 +750,6 @@ in_port(dmaRequestQueue_in, DMARequestMsg, dmaRequestToDir) {
     }
   }
 
-action(dd_sendMemDataToStarver, "\d", desc="Send data and tokens to starver") {
-    peek(memQueue_in, MemoryMsg) {
-      Entry dir_entry := getDirectoryEntry(address);
-
-      enqueue(responseNetwork_out, ResponseMsg, 1) {
-        out_msg.addr := address;
-        out_msg.Type := CoherenceResponseType:DATA_OWNER;
-        out_msg.Sender := machineID;
-        out_msg.Destination.add(persistentTable.findSmallest(address));
-
-        assert(dir_entry.TokensSec0 > 0 || dir_entry.TokensSec1 > 0);
-
-        // Give up the tokens!
-        out_msg.TokensSec0 := dir_entry.TokensSec0;
-        out_msg.TokensSec1 := dir_entry.TokensSec1;
-
-        out_msg.DataBlk := in_msg.DataBlk;
-        out_msg.Dirty := false;
-        out_msg.MessageSize := MessageSizeType:Response_Data;
-
-        // Ensure safe metadata for the network
-        int req_mask := dir_entry.RequestedSectorMask;
-        //if (req_mask == 0) { req_mask := amtc_fullMask(); }
-        out_msg.sector_mask := req_mask;
-        out_msg.valid_sector_mask := req_mask;
-
-        int t_mask := 0;
-        if (dir_entry.TokensSec0 > 0) { t_mask := amtc_unionMasks(t_mask, 1); }
-        if (dir_entry.TokensSec1 > 0) { t_mask := amtc_unionMasks(t_mask, 2); }
-
-        out_msg.token_sector_mask := t_mask;
-        out_msg.requested_sector_mask := req_mask;
-      }
-
-      // Safely clear the sent tokens
-      dir_entry.TokensSec0 := 0;
-      dir_entry.TokensSec1 := 0;
-    }
-  }
-
-action(de_sendTbeDataToStarver, "de", desc="Send data and tokens to starver") {
-    Entry dir_entry := getDirectoryEntry(address);
-
-    enqueue(responseNetwork_out, ResponseMsg, 1) {
-      out_msg.addr := address;
-      out_msg.Type := CoherenceResponseType:DATA_OWNER;
-      out_msg.Sender := machineID;
-      out_msg.Destination.add(persistentTable.findSmallest(address));
-
-      assert(dir_entry.TokensSec0 > 0 || dir_entry.TokensSec1 > 0);
-
-      // Give up the tokens!
-      out_msg.TokensSec0 := dir_entry.TokensSec0;
-      out_msg.TokensSec1 := dir_entry.TokensSec1;
-
-      // Pull the data from the TBE instead of in_msg
-      out_msg.DataBlk := tbe.DataBlk;
-      out_msg.Dirty := false;
-      out_msg.MessageSize := MessageSizeType:Response_Data;
-
-      // Ensure safe metadata for the network
-      int req_mask := dir_entry.RequestedSectorMask;
-     // if (req_mask == 0) { req_mask := amtc_fullMask(); }
-      out_msg.sector_mask := req_mask;
-      out_msg.valid_sector_mask := req_mask;
-
-      int t_mask := 0;
-      if (dir_entry.TokensSec0 > 0) { t_mask := amtc_unionMasks(t_mask, 1); }
-      if (dir_entry.TokensSec1 > 0) { t_mask := amtc_unionMasks(t_mask, 2); }
-
-      out_msg.token_sector_mask := t_mask;
-      out_msg.requested_sector_mask := req_mask;
-    }
-
-    // Safely clear the sent tokens
-    dir_entry.TokensSec0 := 0;
-    dir_entry.TokensSec1 := 0;
-  }
-
   action(qf_queueMemoryFetchRequest, "qf", desc="Queue off-chip fetch request") {
     peek(requestNetwork_in, RequestMsg) {
 
@@ -1047,17 +780,6 @@ action(de_sendTbeDataToStarver, "de", desc="Send data and tokens to starver") {
       DPRINTF(RubySlicc,
         "AMTC_DIR_QUEUE_MEM addr=%#x sid=%d mask=%d\n",
         address, req_sid, req_mask);
-    }
-  }
-
-  action(qp_queueMemoryForPersistent, "qp", desc="Queue off-chip fetch request") {
-    enqueue(memQueue_out, MemoryMsg, to_memory_controller_latency) {
-      out_msg.addr := address;
-      out_msg.Type := MemoryRequestType:MEMORY_READ;
-      out_msg.Sender := persistentTable.findSmallest(address);
-      out_msg.OriginalRequestorMachId := persistentTable.findSmallest(address);
-      out_msg.MessageSize := MessageSizeType:Request_Control;
-      out_msg.Len := 64;
     }
   }
 
@@ -1128,33 +850,6 @@ action(de_sendTbeDataToStarver, "de", desc="Send data and tokens to starver") {
   }
 
   action(s_deallocateTBE, "s", desc="Deallocate TBE") {
-
-    if (tbe.WentPersistent) {
-      assert(starving);
-
-      enqueue(persistentNetwork_out, PersistentMsg, 1) {
-        out_msg.addr := address;
-        out_msg.Type := PersistentRequestType:DEACTIVATE_PERSISTENT;
-        out_msg.Requestor := machineID;
-        out_msg.Destination.broadcast(MachineType:L1Cache);
-
-        //
-        // Currently the configuration system limits the system to only one
-        // chip.  Therefore, if we assume one shared L2 cache, then only one
-        // pertinent L2 cache exist.
-        //
-        //out_msg.Destination.addNetDest(getAllPertinentL2Banks(address));
-
-        out_msg.Destination.add(mapAddressToRange(address,
-                                  MachineType:L2Cache, l2_select_low_bit,
-                                  l2_select_num_bits, intToID(0)));
-
-        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
-        out_msg.MessageSize := MessageSizeType:Persistent_Control;
-      }
-      starving := false;
-    }
-
     TBEs.deallocate(address);
     unset_tbe();
   }
@@ -1168,7 +863,7 @@ action(de_sendTbeDataToStarver, "de", desc="Send data and tokens to starver") {
     }
   }
 
-action(f_incrementTokens, "f", desc="Increment the number of tokens we're tracking") {
+  action(f_incrementTokens, "f", desc="Increment the number of tokens we're tracking") {
     peek(responseNetwork_in, ResponseMsg) {
       Entry dir_entry := getDirectoryEntry(address);
       dir_entry.TokensSec0 := dir_entry.TokensSec0 + in_msg.TokensSec0;
@@ -1197,10 +892,6 @@ action(f_incrementTokens, "f", desc="Increment the number of tokens we're tracki
     responseNetwork_in.recycle(clockEdge(), cyclesToTicks(recycle_latency));
   }
 
-  action(l_popIncomingPersistentQueue, "l", desc="Pop incoming persistent queue") {
-    persistentNetwork_in.dequeue(clockEdge());
-  }
-
   action(p_popDmaRequestQueue, "pd", desc="pop dma request queue") {
     dmaRequestQueue_in.dequeue(clockEdge());
   }
@@ -1211,23 +902,6 @@ action(f_incrementTokens, "f", desc="Increment the number of tokens we're tracki
 
   action(l_popMemQueue, "q", desc="Pop off-chip request queue") {
     dequeueMemRespQueue();
-  }
-
-  action(r_bounceResponse, "r", desc="Bounce response to starving processor") {
-    peek(responseNetwork_in, ResponseMsg) {
-      enqueue(responseNetwork_out, ResponseMsg, 1) {
-        out_msg.addr := address;
-        out_msg.Type := in_msg.Type;
-        out_msg.Sender := machineID;
-        out_msg.Destination.add(persistentTable.findSmallest(address));
-
-        out_msg.TokensSec0 := getDirectoryEntry(address).TokensSec0;
-        out_msg.TokensSec1 := getDirectoryEntry(address).TokensSec1;
-        out_msg.MessageSize := in_msg.MessageSize;
-        out_msg.DataBlk := in_msg.DataBlk;
-        out_msg.Dirty := in_msg.Dirty;
-      }
-    }
   }
 
   action(rs_resetScheduleTimeout, "rs", desc="Reschedule Schedule Timeout") {
@@ -1250,28 +924,6 @@ action(f_incrementTokens, "f", desc="Increment the number of tokens we're tracki
   action(ut_unsetReissueTimer, "ut", desc="Unset reissue timer.") {
     if (reissueTimerTable.isSet(address)) {
       reissueTimerTable.unset(address);
-    }
-  }
-
-  action(bd_bounceDatalessOwnerToken, "bd", desc="Bounce clean owner token to starving processor") {
-    peek(responseNetwork_in, ResponseMsg) {
-      assert(in_msg.Type == CoherenceResponseType:ACK_OWNER);
-      assert(in_msg.Dirty == false);
-      assert(in_msg.MessageSize == MessageSizeType:Writeback_Control);
-
-      // Bounce the message, but "re-associate" the data and the owner
-      // token.  In essence we're converting an ACK_OWNER message to a
-      // DATA_OWNER message, keeping the number of tokens the same.
-      enqueue(responseNetwork_out, ResponseMsg, 1) {
-        out_msg.addr := address;
-        out_msg.Type := CoherenceResponseType:DATA_OWNER;
-        out_msg.Sender := machineID;
-        out_msg.Destination.add(persistentTable.findSmallest(address));
-        out_msg.TokensSec0 := getDirectoryEntry(address).TokensSec0;
-        out_msg.TokensSec1 := getDirectoryEntry(address).TokensSec1;
-        out_msg.Dirty := in_msg.Dirty;
-        out_msg.MessageSize := MessageSizeType:Response_Data;
-      }
     }
   }
 
@@ -1320,122 +972,90 @@ action(f_incrementTokens, "f", desc="Increment the number of tokens we're tracki
   }
 
 action(d_sendMemoryDataWithoutTokens, "d_nt", desc="Send requested sector data without tokens") {
-
     peek(memQueue_in, MemoryMsg) {
-
       // Use a local variable to find the mask
-
       int final_mask := 0;
-
       int final_sid  := 0;
-
-
-
       MachineID dest;
 
-
-
       if (is_valid(tbe)) {
-
           dest := tbe.OriginalRequestorMachId;
-
       } else {
-
           dest := in_msg.OriginalRequestorMachId;
-
       }
-
-
 
       //assert(dest != MachineID(-1));
-
-
-
       if (is_valid(tbe)) {
-
           // If TBE exists, it's the most accurate source
-
           final_mask := tbe.RequestedSectorMask;
-
           final_sid  := tbe.LastSectorID;
-
       } else {
-
           // Fallback to the persistent Directory Entry
-
           Entry directory_entry := getDirectoryEntry(address);
-
           if (is_valid(directory_entry)) {
-
               final_mask := directory_entry.RequestedSectorMask;
-
               final_sid  := directory_entry.LastSectorID;
-
           }
-
       }
-
-
-
-      // Final fallback: If everything is 0, assume a full line request
-
-      if (final_mask == 0) {
-
-          //final_mask := amtc_fullMask();
-
-      }
-
-
-
-
 
       enqueue(responseNetwork_out, ResponseMsg, directory_latency) {
-
         out_msg.addr := address;
-
         out_msg.Type := CoherenceResponseType:DATA_SHARED;
-
         out_msg.Sender := machineID;
-
-        //out_msg.Destination.add(in_msg.OriginalRequestorMachId);
-
         out_msg.Destination.add(dest);
-
         out_msg.DataBlk := in_msg.DataBlk;
-
         out_msg.Dirty := false;
 
-
-
-        // PHASE 2 FIX: This is a data-only response. Send ZERO tokens.
-
         out_msg.TokensSec0 := 0;
-
         out_msg.TokensSec1 := 0;
-
         out_msg.token_sector_mask := 0;
 
-
-
         out_msg.sector_id := final_sid;
-
         out_msg.sector_mask := final_mask;
-
         out_msg.valid_sector_mask := final_mask;
-
         out_msg.requested_sector_mask := final_mask;
-
         out_msg.MessageSize := amtc_getSizeFromDirtyMask(final_mask);
-
       }
-
     }
-
   }
 
   action(j_dropStaleRequest, "j_drop", desc="Drop a stale incoming request") {
     // Simply pop the queue without doing anything else
     requestNetwork_in.dequeue(clockEdge());
+  }
+
+  action(l_writeTbeDataToMemory, "lwt", desc="Write assembled TBE data to DRAM") {
+    enqueue(memQueue_out, MemoryMsg, to_memory_controller_latency) {
+      out_msg.addr := address;
+      out_msg.Type := MemoryRequestType:MEMORY_WB;
+      out_msg.Sender := machineID;
+      out_msg.OriginalRequestorMachId := tbe.OriginalRequestorMachId;
+      out_msg.Len := tbe.Len;
+      out_msg.DataBlk := tbe.DataBlk;
+      out_msg.MessageSize := MessageSizeType:Writeback_Data;
+    }
+  }
+
+  // Send the fully assembled line from the TBE to the DMA Controller
+  action(dt_sendTbeDataToDma, "dt", desc="Send accumulated TBE data to DMA") {
+    enqueue(dmaResponseNetwork_out, DMAResponseMsg, directory_latency) {
+      out_msg.LineAddress := address;
+      out_msg.Type := DMAResponseType:DATA;
+      out_msg.DataBlk := tbe.DataBlk;
+      out_msg.Destination.add(tbe.DmaRequestor);
+      out_msg.MessageSize := MessageSizeType:Response_Data;
+    }
+  }
+
+  // Update the Directory's memory copy from the TBE after a read/write
+  action(lt_queueTbeWritebackToMemory, "lt", desc="Queue memory writeback from TBE") {
+    enqueue(memQueue_out, MemoryMsg, to_memory_controller_latency) {
+      out_msg.addr := address;
+      out_msg.Type := MemoryRequestType:MEMORY_WB;
+      out_msg.Sender := machineID;
+      out_msg.DataBlk := tbe.DataBlk;
+      out_msg.MessageSize := MessageSizeType:Writeback_Data;
+    }
   }
 
   action(z_stallAndWaitRequest, "\z", desc="Stall incoming requests") {
@@ -1454,13 +1074,48 @@ action(d_sendMemoryDataWithoutTokens, "d_nt", desc="Send requested sector data w
     wakeUpBuffers(address);
   }
 
+
+  action(rb_recordReceivedSectors, "rb", desc="Record received data sectors") {
+    peek(responseNetwork_in, ResponseMsg) {
+      tbe.ReceivedSectorMask := amtc_unionMasks(tbe.ReceivedSectorMask, in_msg.valid_sector_mask);
+    }
+  }
+
+  action(rt_recordTokenSectors, "rt", desc="Record received token sectors") {
+    peek(responseNetwork_in, ResponseMsg) {
+      tbe.TokenReadySectorMask := amtc_unionMasks(tbe.TokenReadySectorMask, in_msg.token_sector_mask);
+    }
+  }
+
+  action(ccw_checkWriteCompletion, "ccw", desc="Check write completion") {
+    if (amtc_writeComplete(address, tbe)) {
+      enqueue(triggerQueue_out, TriggerMsg, 1) {
+        out_msg.addr := address;
+        out_msg.Type := Event:Write_Complete; // You must add Write_Complete to your Event enumeration
+      }
+    }
+  }
+
+  action(ccr_checkReadCompletion, "ccr", desc="Check read completion") {
+    if (amtc_readComplete(tbe)) {
+      enqueue(triggerQueue_out, TriggerMsg, 1) {
+        out_msg.addr := address;
+        out_msg.Type := Event:Read_Complete; // You must add Read_Complete to your Event enumeration
+      }
+    }
+  }
+
+  action(tq_popTriggerQueue, "tq", desc="Pop internal trigger queue") {
+    triggerQueue_in.dequeue(clockEdge());
+  }
+
   // ============================================================================
   // TRANSITIONS FROM 'O' (Directory holds Tokens)
   // ============================================================================
 
   // GETS (Read): Give 1 token per sector. Directory keeps the rest.
   // Because Directory still holds tokens, it safely transitions to O_W.
-  transition(O, {GETS, GETS_Tokens_Left}, O_W) {
+  transition(O, GETS,  O_W) {
     a_sendTokens;
     qf_queueMemoryFetchRequest;
     j_popIncomingRequestQueue;
@@ -1480,7 +1135,7 @@ action(d_sendMemoryDataWithoutTokens, "d_nt", desc="Send requested sector data w
     j_popIncomingRequestQueue;
   }
 
-  transition(O, {Tokens, Ack_All_Tokens, Data_Owner, Data_All_Tokens}) {
+  transition(O, {Tokens, Data_Owner }) {
     f_incrementTokens;
     k_popIncomingResponseQueue;
   }
@@ -1490,7 +1145,7 @@ action(d_sendMemoryDataWithoutTokens, "d_nt", desc="Send requested sector data w
   // ============================================================================
 
   // GETX or normal GETS: We have 0 tokens to give, just fetch the data.
-  transition(NO, {GETS, GETX, GETS_Tokens_Left}, NO_W) {
+  transition(NO, {GETS, GETX}, NO_W) {
     a_sendTokens;               // Will safely send 0 and do nothing
     qf_queueMemoryFetchRequest;
     j_popIncomingRequestQueue;
@@ -1502,20 +1157,57 @@ action(d_sendMemoryDataWithoutTokens, "d_nt", desc="Send requested sector data w
     j_popIncomingRequestQueue;
   }
 
-  transition(NO, {Ack_Owner, Ack_Owner_All_Tokens}, O) {
+  transition(NO, Ack_Owner, O) {
     f_incrementTokens;
-    k_popIncomingResponseQueue;
-  }
-
-  transition(NO, {Data_Owner, Data_All_Tokens}, O_W) {
-    f_incrementTokens;
-    lq_queueMemoryWbRequest;
     k_popIncomingResponseQueue;
   }
 
   transition(NO, Tokens) {
+      f_incrementTokens;
+      k_popIncomingResponseQueue;
+  }
+
+  transition(NO, Data_Owner) {
+      f_incrementTokens;
+      rd_recordDataInTbe;
+      k_popIncomingResponseQueue;
+  }
+
+  // -------------------------------------------------------------------------
+  // THE ACCUMULATOR: Loop silently in this state as responses arrive
+  // -------------------------------------------------------------------------
+// Receives BOTH data payload and tokens
+  transition(NO_DW_ACCUM, Data_Owner) {
     f_incrementTokens;
+    rd_recordDataInTbe;         // Safe: Data_Owner carries a DataBlk
+    rb_recordReceivedSectors;   // Safe: Data_Owner carries sector masks
+    rt_recordTokenSectors;
+    ccw_checkWriteCompletion;   // Will enqueue Write_Complete if true
     k_popIncomingResponseQueue;
+  }
+
+  // Receives ONLY tokens (no data payload)
+  transition(NO_DW_ACCUM, Tokens) {
+    f_incrementTokens;
+    rt_recordTokenSectors;      // Safe: Tokens message carries token masks
+    ccw_checkWriteCompletion;   // Will enqueue Write_Complete if true
+    k_popIncomingResponseQueue;
+  }
+
+  // -------------------------------------------------------------------------
+  // THE EXIT: Transition only occurs when all requirements are met
+  // -------------------------------------------------------------------------
+  transition(NO_DW_ACCUM, Write_Complete, O_DW_W) {
+    l_writeTbeDataToMemory;
+    tq_popTriggerQueue;
+  }
+
+  transition(O_DW_W, Memory_Ack, NO) {
+    da_sendDmaAck;
+    ut_unsetReissueTimer;
+    s_deallocateTBE;
+    l_popMemQueue;
+    qw_wakeUpDependents;
   }
 
   // ============================================================================
@@ -1538,7 +1230,7 @@ action(d_sendMemoryDataWithoutTokens, "d_nt", desc="Send requested sector data w
 
   // Return to NO (Tokens were sent via ACK)
   transition(NO_W, Memory_Data, NO) {
-    d_sendMemoryDataWithAllTokens;
+    d_sendMemoryDataOwnerResponse;
     l_popMemQueue;
     qw_wakeUpDependents;
   }
@@ -1561,12 +1253,6 @@ action(d_sendMemoryDataWithoutTokens, "d_nt", desc="Send requested sector data w
     p_popDmaRequestQueue;
   }
 
-  transition(O, DMA_WRITE_All_Tokens, O_DW_W) {
-    vd_allocateDmaRequestInTBE;
-    ld_queueMemoryDmaWriteFromTbe;
-    p_popDmaRequestQueue;
-  }
-
   transition(O, DMA_READ, O_DR_W) {
     vd_allocateDmaRequestInTBE;
     fd_memoryDma;
@@ -1574,27 +1260,18 @@ action(d_sendMemoryDataWithoutTokens, "d_nt", desc="Send requested sector data w
     p_popDmaRequestQueue;
   }
 
-  transition(NO, DMA_WRITE, NO_DW) {
+  transition(NO, DMA_WRITE, NO_DW_ACCUM) {
     vd_allocateDmaRequestInTBE;
     bw_broadcastWrite;
     st_scheduleTimeout;
     p_popDmaRequestQueue;
   }
 
-  transition(NO, DMA_READ, NO_DR) {
+  transition(NO, DMA_READ, NO_DR_ACCUM) {
     vd_allocateDmaRequestInTBE;
     br_broadcastRead;
     st_scheduleTimeout;
     p_popDmaRequestQueue;
-  }
-
-  transition({O, NO}, Lockdown, L) {
-    aa_sendTokensToStarver;
-    l_popIncomingPersistentQueue;
-  }
-
-  transition({O, NO}, {Unlockdown, Own_Lock_or_Unlock, Own_Lock_or_Unlock_Tokens}) {
-    l_popIncomingPersistentQueue;
   }
 
   // DMA Wait State Resolutions
@@ -1605,163 +1282,54 @@ action(d_sendMemoryDataWithoutTokens, "d_nt", desc="Send requested sector data w
     l_popMemQueue;
   }
 
-  transition(O_DW_W, Memory_Ack, O) {
-    da_sendDmaAck;
-    s_deallocateTBE;
-    l_popMemQueue;
-  }
-
-  transition(NO_DR, {Data_Owner, Data_All_Tokens}, O_W) {
-    f_incrementTokens;
-    dd_sendDmaData;
-    lr_queueMemoryDmaReadWriteback;
-    ut_unsetReissueTimer;
-    s_deallocateTBE;
-    k_popIncomingResponseQueue;
-  }
-
-  transition({NO_DW, O_DW}, Data_All_Tokens, O_DW_W) {
+  // Accumulate from Sharers or Owner
+  transition(NO_DR_ACCUM, {Data_Owner, Data_Shared}) {
     f_incrementTokens;
     rd_recordDataInTbe;
-    ld_queueMemoryDmaWriteFromTbe;
-    ut_unsetReissueTimer;
+    rb_recordReceivedSectors;
+    rt_recordTokenSectors;
+    crc_checkReadComplete;
     k_popIncomingResponseQueue;
+  }
+
+  transition(NO_DR_ACCUM, Tokens) {
+    f_incrementTokens;
+    rt_recordTokenSectors;
+    crc_checkReadComplete;
+    k_popIncomingResponseQueue;
+  }
+
+  transition(NO_DR_ACCUM, Read_Complete, O_DR_W) {
+    dt_sendTbeDataToDma;
+    lt_queueTbeWritebackToMemory;
+    tq_popTriggerQueue;
+  }
+
+  transition(O_DR_W, Memory_Ack, O) {
+    ut_unsetReissueTimer;
+    s_deallocateTBE;
+    l_popMemQueue;
+    qw_wakeUpDependents;
   }
 
   // ============================================================================
   // BLOCKED STATES (Safely recycle requests while DRAM is fetching)
   // ============================================================================
 
-  transition({NO_W, O_W, L_O_W, L_NO_W, DR_L_W, DW_L_W, O_DW_W, O_DR_W, O_DW, NO_DW, NO_DR, NO_W_DataOnly}, {GETX, GETS, GETS_Tokens_Left, GETS_Owner_Pull}) {
+  transition({NO_W, O_W, L_O_W, L_NO_W, DR_L_W, DW_L_W, O_DW_W, O_DR_W, O_DW, NO_DW, NO_DR, NO_W_DataOnly}, {GETX, GETS, GETS_Owner_Pull}) {
     z_stallAndWaitRequest;
   }
 
-  transition({NO_W, O_W, L_O_W, L_NO_W, DR_L_W, DW_L_W, O_DW_W, O_DR_W, O_DW, NO_DW, NO_DR, L, DW_L, DR_L, NO_W_DataOnly}, {DMA_READ, DMA_WRITE, DMA_WRITE_All_Tokens}) {
+  transition({NO_W, O_W, L_O_W, L_NO_W, DR_L_W, DW_L_W, O_DW_W, O_DR_W, O_DW, NO_DW, NO_DR, L, DW_L, DR_L, NO_W_DataOnly}, {DMA_READ, DMA_WRITE }) {
     y_stallAndWaitDmaRequest;
   }
 
-  transition({NO_W, O_W, L_O_W, L_NO_W, DR_L_W, DW_L_W, O_DW_W, O_DR_W, NO_W_DataOnly}, {Data_Owner, Ack_Owner, Tokens, Data_All_Tokens, Ack_All_Tokens}) {
+  transition({NO_W, O_W, L_O_W, L_NO_W, DR_L_W, DW_L_W, O_DW_W, O_DR_W, NO_W_DataOnly}, {Data_Owner, Ack_Owner, Tokens}) {
     kz_stallAndWaitResponse;
-  }
-
-  // ============================================================================
-  // LOCKDOWN & TIMEOUT MANAGEMENT
-  // ============================================================================
-
-  transition({L, DW_L, DR_L}, {GETX, GETS, GETS_Tokens_Left, GETS_Owner_Pull}) {
-    j_popIncomingRequestQueue;
-  }
-
-  transition({L, DW_L, DR_L, L_O_W, L_NO_W, DR_L_W, DW_L_W}, Lockdown) {
-    l_popIncomingPersistentQueue;
-  }
-
-  transition({DW_L, DR_L, L}, {Data_Owner, Data_All_Tokens, Tokens}) {
-    r_bounceResponse;
-    k_popIncomingResponseQueue;
-  }
-
-  transition({DW_L, DR_L}, {Ack_Owner_All_Tokens, Ack_Owner}) {
-    bd_bounceDatalessOwnerToken;
-    k_popIncomingResponseQueue;
-  }
-
-  transition(L, {Ack_Owner_All_Tokens, Ack_Owner}, L_O_W) {
-    f_incrementTokens;
-    qp_queueMemoryForPersistent;
-    k_popIncomingResponseQueue;
-  }
-
-  transition(L, {Unlockdown, Own_Lock_or_Unlock}, NO) {
-    l_popIncomingPersistentQueue;
-  }
-
-  transition(L, Own_Lock_or_Unlock_Tokens, O) {
-    l_popIncomingPersistentQueue;
-  }
-
-  transition({L_NO_W, L_O_W}, Memory_Data, L) {
-    dd_sendMemDataToStarver;
-    l_popMemQueue;
-    qw_wakeUpDependents;
-  }
-
-  transition(L_O_W, Memory_Ack) {
-    qp_queueMemoryForPersistent;
-    l_popMemQueue;
-  }
-
-  transition(L_O_W, {Unlockdown, Own_Lock_or_Unlock, Own_Lock_or_Unlock_Tokens}, O_W) {
-    l_popIncomingPersistentQueue;
-  }
-
-  transition(L_NO_W, {Unlockdown, Own_Lock_or_Unlock, Own_Lock_or_Unlock_Tokens}, NO_W) {
-    l_popIncomingPersistentQueue;
-  }
-
-  transition(DR_L_W, Memory_Data, DR_L) {
-    dd_sendMemDataToStarver;
-    l_popMemQueue;
-    qw_wakeUpDependents;
-  }
-
-  transition(DW_L_W, Memory_Ack, L) {
-    aat_assertAllTokens;
-    da_sendDmaAck;
-    s_deallocateTBE;
-    dd_sendMemDataToStarver;
-    l_popMemQueue;
-    qw_wakeUpDependents;
-  }
-
-  transition(DW_L, {Unlockdown, Own_Lock_or_Unlock, Own_Lock_or_Unlock_Tokens}, NO_DW) {
-    l_popIncomingPersistentQueue;
-  }
-
-  transition(DR_L_W, {Unlockdown, Own_Lock_or_Unlock, Own_Lock_or_Unlock_Tokens}, O_DR_W) {
-    l_popIncomingPersistentQueue;
-  }
-
-  transition(DW_L_W, {Unlockdown, Own_Lock_or_Unlock, Own_Lock_or_Unlock_Tokens}, O_DW_W) {
-    l_popIncomingPersistentQueue;
-  }
-
-  transition({DW_L, DR_L_W, DW_L_W, NO_DW, O_DW}, Request_Timeout) {
-    ut_unsetReissueTimer;
-    px_tryIssuingPersistentGETXRequest;
-  }
-
-  transition(DR_L, {Unlockdown, Own_Lock_or_Unlock, Own_Lock_or_Unlock_Tokens}, NO_DR) {
-    l_popIncomingPersistentQueue;
-  }
-
-  transition({DR_L, NO_DR}, Request_Timeout) {
-    ut_unsetReissueTimer;
-    ps_tryIssuingPersistentGETSRequest;
   }
 
   transition({O_DW_W, O_DR_W}, Request_Timeout) {
     rs_resetScheduleTimeout;
-  }
-
-  transition(NO_W, Lockdown, L_NO_W) {
-    l_popIncomingPersistentQueue;
-  }
-
-  transition(O_W, Lockdown, L_O_W) {
-    l_popIncomingPersistentQueue;
-  }
-
-  transition(O_DR_W, Lockdown, DR_L_W) {
-    l_popIncomingPersistentQueue;
-  }
-
-  transition(O_DW_W, Lockdown, DW_L_W) {
-    l_popIncomingPersistentQueue;
-  }
-
-  transition({NO_W, O_W, O_DR_W, O_DW_W, O_DW, NO_DR, NO_DW}, {Unlockdown, Own_Lock_or_Unlock, Own_Lock_or_Unlock_Tokens}) {
-    l_popIncomingPersistentQueue;
   }
 
 }

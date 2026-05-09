@@ -1997,7 +1997,6 @@ action(i_allocateTBE, "i", desc="Allocate TBE") {
       // =========================================================
       // AMTC MIXED-MODE FETCH LOGIC
       // =========================================================
-      int req_offset := getOffset(in_msg.PhysicalAddress);
       int req_mask := amtc_fullMask();
 
       tbe.RequestedSectorMask := req_mask;

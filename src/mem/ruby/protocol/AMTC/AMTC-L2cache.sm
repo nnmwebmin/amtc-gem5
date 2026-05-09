@@ -46,20 +46,19 @@ machine(MachineType:L2Cache, "Token protocol")
    MessageBuffer * L1RequestFromL2Cache, network="To", virtual_network="1",
         vnet_type="request";
 
-
    // FROM the network to this local bank of L2 cache
-
    // a local L1 || mod-directory -> this L2 bank
    MessageBuffer * responseToL2Cache, network="From", virtual_network="4",
         vnet_type="response";
-   MessageBuffer * persistentToL2Cache, network="From", virtual_network="3",
-        vnet_type="persistent";
    // mod-directory -> this L2 bank
    MessageBuffer * GlobalRequestToL2Cache, network="From", virtual_network="2",
         vnet_type="request";
    // a local L1 -> this L2 bank
    MessageBuffer * L1RequestToL2Cache, network="From", virtual_network="1",
         vnet_type="request";
+
+   // Internal loopback for accumulation triggers
+   MessageBuffer * triggerQueue;
 
 {
   // STATES
@@ -70,10 +69,6 @@ machine(MachineType:L2Cache, "Token protocol")
     S, AccessPermission:Read_Only, desc="Shared, not present in any local L1s";
     O, AccessPermission:Read_Only, desc="Owned, not present in any L1s";
     M, AccessPermission:Read_Write, desc="Modified, not present in any L1s";
-
-    // Locked states
-    I_L, AccessPermission:Busy, "I^L", desc="Invalid, Locked";
-    S_L, AccessPermission:Busy, "S^L", desc="Shared, Locked";
   }
 
   // EVENTS
@@ -81,36 +76,25 @@ machine(MachineType:L2Cache, "Token protocol")
 
     // Requests
     L1_GETS,             desc="local L1 GETS request";
-    L1_GETS_Last_Token,    desc="local L1 GETS request";
     L1_GETX,             desc="local L1 GETX request";
     L1_INV,              desc="L1 no longer has tokens";
     Transient_GETX,      desc="A GetX from another processor";
     Transient_GETS,      desc="A GetS from another processor";
-    Transient_GETS_Last_Token,   desc="A GetS from another processor";
 
     // events initiated by this L2
     L2_Replacement,     desc="L2 Replacement", format="!r";
 
-    // events of external L2 responses
-
     // Responses
     Writeback_Tokens,               desc="Received a writeback from L1 with only tokens (no data)";
     Writeback_Shared_Data,               desc="Received a writeback from L1 that includes clean data";
-    Writeback_All_Tokens,    desc="Received a writeback from L1";
     Writeback_Owned,                desc="Received a writeback from L1";
-
 
     Data_Shared,             desc="Received a data message, we are now a sharer";
     Data_Owner,              desc="Received a data message, we are now the owner";
-    Data_All_Tokens,   desc="Received a data message, we are now the owner, we now have all the tokens";
     Ack,                     desc="Received an ack message";
-    Ack_All_Tokens,          desc="Received an ack message, we now have all the tokens";
 
-    // Lock/Unlock
-    Persistent_GETX,     desc="Another processor has priority to read/write";
-    Persistent_GETS,     desc="Another processor has priority to read";
-    Persistent_GETS_Last_Token, desc="Another processor has priority to read";
-    Own_Lock_or_Unlock,  desc="This processor now has priority";
+    // Internal Triggers:
+    L2_Accumulation_Done, desc="L2 now has all required tokens/sectors";
   }
 
   // TYPES
@@ -126,6 +110,8 @@ machine(MachineType:L2Cache, "Token protocol")
     DataBlock DataBlk,       desc="data for the block";
     int TokensSec0, default="0", desc="AMTC token count for sector 0";
     int TokensSec1, default="0", desc="AMTC token count for sector 1";
+
+    bool AccumulationPending, default="false";
   }
 
   structure(DirEntry, desc="...", interface="AbstractCacheEntry", main="false") {
@@ -140,18 +126,19 @@ machine(MachineType:L2Cache, "Token protocol")
     bool isTagPresent(Addr);
   }
 
-  structure(PersistentTable, external="yes") {
-    void persistentRequestLock(Addr, MachineID, AccessType);
-    void persistentRequestUnlock(Addr, MachineID);
-    MachineID findSmallest(Addr);
-    AccessType typeOfSmallest(Addr);
-    void markEntries(Addr);
-    bool isLocked(Addr);
-    int countStarvingForAddress(Addr);
-    int countReadStarvingForAddress(Addr);
+  structure(TriggerMsg, interface="Message") {
+    Addr addr,             desc="Address for this trigger";
+    Event Type,            desc="Type of event to trigger";
+
+    // Required functional boilerplate for SLICC
+    bool functionalWrite(Packet *pkt) {
+        return false;
+    }
+    bool functionalRead(Packet *pkt) {
+        return false;
+    }
   }
 
-  PersistentTable persistentTable;
   PerfectCacheMemory localDirectory, template="<L2Cache_DirEntry>";
 
   Tick clockEdge();
@@ -332,23 +319,26 @@ machine(MachineType:L2Cache, "Token protocol")
     return num_functional_writes;
   }
 
-  int getTokens(Entry cache_entry, int sid) {
+  int getTokensForMask(Entry cache_entry, int mask) {
+    int total := 0;
+
     if (is_valid(cache_entry)) {
-      if (sid == 0) {
-        return cache_entry.TokensSec0;
-      }
-      if (sid == 1) {
-        return cache_entry.TokensSec1;
-      }
+
+        if (amtc_maskHasSector(mask, 0)) {
+            total := total + cache_entry.TokensSec0;
+        }
+
+        if (amtc_maskHasSector(mask, 1)) {
+            total := total + cache_entry.TokensSec1;
+        }
     }
-    return 0;
-  }
+
+    return total;
+}
 
   State getState(Entry cache_entry, Addr addr) {
     if (is_valid(cache_entry)) {
       return cache_entry.CacheState;
-    } else if (persistentTable.isLocked(addr)) {
-      return State:I_L;
     } else {
       return State:NP;
     }
@@ -367,7 +357,7 @@ machine(MachineType:L2Cache, "Token protocol")
       // =========================================================
       // NP & Locked States: Zero local token ownership allowed
       // =========================================================
-      if (state == State:I_L || state == State:NP) {
+      if (state == State:NP) {
         assert(cache_entry.TokensSec0 == 0);
         assert(cache_entry.TokensSec1 == 0);
       }
@@ -492,55 +482,26 @@ machine(MachineType:L2Cache, "Token protocol")
     }
   }
 
+  bool amtc_L2_hasAllTokens(Entry cache_entry) {
+    int tokens_per_sector := max_tokens() / 2;
+    if (amtc_maskHasSector(cache_entry.ValidSectors, 0) && cache_entry.TokensSec0 < tokens_per_sector) {
+        return false;
+    }
+    if (amtc_maskHasSector(cache_entry.ValidSectors, 1) && cache_entry.TokensSec1 < tokens_per_sector) {
+        return false;
+    }
+    return true;
+  }
+
   // ** OUT_PORTS **
   out_port(globalRequestNetwork_out, RequestMsg, GlobalRequestFromL2Cache);
   out_port(localRequestNetwork_out, RequestMsg, L1RequestFromL2Cache);
   out_port(responseNetwork_out, ResponseMsg, responseFromL2Cache);
+  out_port(triggerQueue_out, TriggerMsg, triggerQueue);
 
 
 
   // ** IN_PORTS **
-
-  // Persistent Network
-  in_port(persistentNetwork_in, PersistentMsg, persistentToL2Cache) {
-    if (persistentNetwork_in.isReady(clockEdge())) {
-      peek(persistentNetwork_in, PersistentMsg) {
-        assert(in_msg.Destination.isElement(machineID));
-
-        if (in_msg.Type == PersistentRequestType:GETX_PERSISTENT) {
-          persistentTable.persistentRequestLock(in_msg.addr, in_msg.Requestor, AccessType:Write);
-        } else if (in_msg.Type == PersistentRequestType:GETS_PERSISTENT) {
-          persistentTable.persistentRequestLock(in_msg.addr, in_msg.Requestor, AccessType:Read);
-        } else if (in_msg.Type == PersistentRequestType:DEACTIVATE_PERSISTENT) {
-          persistentTable.persistentRequestUnlock(in_msg.addr, in_msg.Requestor);
-        } else {
-          error("Unexpected message");
-        }
-
-        Entry cache_entry := getCacheEntry(in_msg.addr);
-        // React to the message based on the current state of the table
-        if (persistentTable.isLocked(in_msg.addr)) {
-
-          if (persistentTable.typeOfSmallest(in_msg.addr) == AccessType:Read) {
-            if (getTokens(cache_entry, amtc_fullMask()) == 1 ||
-                getTokens(cache_entry, amtc_fullMask()) == (max_tokens() / 2) + 1) {
-              trigger(Event:Persistent_GETS_Last_Token, in_msg.addr,
-                      cache_entry);
-            } else {
-              trigger(Event:Persistent_GETS, in_msg.addr, cache_entry);
-            }
-          } else {
-            trigger(Event:Persistent_GETX, in_msg.addr, cache_entry);
-          }
-        }
-        else {
-            trigger(Event:Own_Lock_or_Unlock, in_msg.addr, cache_entry);
-        }
-      }
-    }
-  }
-
-
   // Request Network
   in_port(requestNetwork_in, RequestMsg, GlobalRequestToL2Cache) {
     if (requestNetwork_in.isReady(clockEdge())) {
@@ -551,13 +512,7 @@ machine(MachineType:L2Cache, "Token protocol")
         if (in_msg.Type == CoherenceRequestType:GETX) {
             trigger(Event:Transient_GETX, in_msg.addr, cache_entry);
         } else if (in_msg.Type == CoherenceRequestType:GETS) {
-          if (getTokens(cache_entry,amtc_fullMask()) == 1) {
-            trigger(Event:Transient_GETS_Last_Token, in_msg.addr,
-                    cache_entry);
-          }
-          else {
             trigger(Event:Transient_GETS, in_msg.addr, cache_entry);
-          }
         } else {
           error("Unexpected message");
         }
@@ -571,11 +526,6 @@ machine(MachineType:L2Cache, "Token protocol")
         assert(in_msg.Destination.isElement(machineID));
         Entry cache_entry := getCacheEntry(in_msg.addr);
 
-        // ===================================================================
-        // CRITICAL FIX: The Home Bank Filter
-        // If an L1 is broadcasting for tokens, and we are empty (NP/I),
-        // we ONLY fetch from the Directory if we are the Home L2 bank!
-        // ===================================================================
         bool is_home_l2 := (mapAddressToMachine(in_msg.addr, MachineType:L2Cache) == machineID);
         State current_state := getState(cache_entry, in_msg.addr);
 
@@ -587,13 +537,7 @@ machine(MachineType:L2Cache, "Token protocol")
             if (in_msg.Type == CoherenceRequestType:GETX) {
               trigger(Event:L1_GETX, in_msg.addr, cache_entry);
             } else if (in_msg.Type == CoherenceRequestType:GETS) {
-              if (getTokens(cache_entry,amtc_fullMask()) == 1 ||
-                  getTokens(cache_entry,amtc_fullMask()) == (max_tokens() / 2) + 1) {
-                trigger(Event:L1_GETS_Last_Token, in_msg.addr, cache_entry);
-              }
-              else {
                 trigger(Event:L1_GETS, in_msg.addr, cache_entry);
-              }
             } else {
               error("Unexpected message");
             }
@@ -605,122 +549,56 @@ machine(MachineType:L2Cache, "Token protocol")
 
   // Response Network
     in_port(responseNetwork_in, ResponseMsg, responseToL2Cache) {
-      if (responseNetwork_in.isReady(clockEdge())) {
-        peek(responseNetwork_in, ResponseMsg) {
-          assert(in_msg.Destination.isElement(machineID));
-          Entry cache_entry := getCacheEntry(in_msg.addr);
+    if (responseNetwork_in.isReady(clockEdge())) {
+      peek(responseNetwork_in, ResponseMsg) {
+        assert(in_msg.Destination.isElement(machineID));
+        Entry cache_entry := getCacheEntry(in_msg.addr);
 
-          // =====================================================================
-          // PHASE 2: L2 Sector Token Accounting
-          // =====================================================================
-          int future_t0 := in_msg.TokensSec0;
-          int future_t1 := in_msg.TokensSec1;
+        // PURE TYPE-BASED TRIGGERING: No token counting here!
+        if (in_msg.Type == CoherenceResponseType:ACK) {
+            trigger(Event:Ack, in_msg.addr, cache_entry);
 
-          if (is_valid(cache_entry)) {
-              future_t0 := future_t0 + cache_entry.TokensSec0;
-              future_t1 := future_t1 + cache_entry.TokensSec1;
-          }
+        } else if (in_msg.Type == CoherenceResponseType:DATA_OWNER) {
+            trigger(Event:Data_Owner, in_msg.addr, cache_entry);
 
-          int required_per_sector := max_tokens() / 2;
-          bool is_effectively_all_tokens := true;
+        } else if (in_msg.Type == CoherenceResponseType:DATA_SHARED) {
+            trigger(Event:Data_Shared, in_msg.addr, cache_entry);
 
-          // We check if we have achieved "All Tokens" for the sectors
-          // this specific writeback/response is targeting.
-          int target_mask := in_msg.sector_mask;
-          if (target_mask == 0) {
-              target_mask := amtc_fullMask();
-          }
+        } else if (in_msg.Type == CoherenceResponseType:WB_TOKENS ||
+                   in_msg.Type == CoherenceResponseType:WB_OWNED ||
+                   in_msg.Type == CoherenceResponseType:WB_SHARED_DATA) {
 
-          // Evaluate Sector 0
-          if (amtc_maskHasSector(target_mask, 0)) {
-              if (future_t0 < required_per_sector) {
-                  is_effectively_all_tokens := false;
-              }
-          }
-          // Evaluate Sector 1
-          if (amtc_maskHasSector(target_mask, 1)) {
-              if (future_t1 < required_per_sector) {
-                  is_effectively_all_tokens := false;
-              }
-          }
-
-          // =====================================================================
-          // EVENT ROUTING
-          // =====================================================================
-          if (!is_effectively_all_tokens) {
-
-            if (in_msg.Type == CoherenceResponseType:ACK) {
-              trigger(Event:Ack, in_msg.addr, cache_entry);
-            } else if (in_msg.Type == CoherenceResponseType:DATA_OWNER) {
-              trigger(Event:Data_Owner, in_msg.addr, cache_entry);
-            } else if (in_msg.Type == CoherenceResponseType:DATA_SHARED) {
-              trigger(Event:Data_Shared, in_msg.addr, cache_entry);
-            } else if (in_msg.Type == CoherenceResponseType:WB_TOKENS ||
-                       in_msg.Type == CoherenceResponseType:WB_OWNED ||
-                       in_msg.Type == CoherenceResponseType:WB_SHARED_DATA) {
-
-              if (L2cache.cacheAvail(in_msg.addr) || is_valid(cache_entry)) {
-                // either room is available or the block is already present
+            if (L2cache.cacheAvail(in_msg.addr) || is_valid(cache_entry)) {
                 if (in_msg.Type == CoherenceResponseType:WB_TOKENS) {
-                  assert(in_msg.Dirty == false);
-                  trigger(Event:Writeback_Tokens, in_msg.addr, cache_entry);
+                    trigger(Event:Writeback_Tokens, in_msg.addr, cache_entry);
                 } else if (in_msg.Type == CoherenceResponseType:WB_SHARED_DATA) {
-                  assert(in_msg.Dirty == false);
-                  trigger(Event:Writeback_Shared_Data, in_msg.addr, cache_entry);
+                    trigger(Event:Writeback_Shared_Data, in_msg.addr, cache_entry);
                 } else if (in_msg.Type == CoherenceResponseType:WB_OWNED) {
-                  trigger(Event:Writeback_Owned, in_msg.addr, cache_entry);
+                    trigger(Event:Writeback_Owned, in_msg.addr, cache_entry);
                 }
-              } else {
-                  Addr victim := L2cache.cacheProbe(in_msg.addr);
-                  trigger(Event:L2_Replacement, victim, getCacheEntry(victim));
-              }
-
-            } else if (in_msg.Type == CoherenceResponseType:INV) {
-              trigger(Event:L1_INV, in_msg.addr, cache_entry);
             } else {
-              error("Unexpected message");
+                Addr victim := L2cache.cacheProbe(in_msg.addr);
+                trigger(Event:L2_Replacement, victim, getCacheEntry(victim));
             }
 
-          } else {
+        } else if (in_msg.Type == CoherenceResponseType:INV) {
+            trigger(Event:L1_INV, in_msg.addr, cache_entry);
 
-            // WE HAVE ALL TOKENS FOR THE TARGET SECTORS
-            if (in_msg.Type == CoherenceResponseType:ACK) {
-              trigger(Event:Ack_All_Tokens, in_msg.addr, cache_entry);
-            } else if (in_msg.Type == CoherenceResponseType:DATA_OWNER ||
-                       in_msg.Type == CoherenceResponseType:DATA_SHARED) {
-              trigger(Event:Data_All_Tokens, in_msg.addr, cache_entry);
-            } else if (in_msg.Type == CoherenceResponseType:WB_TOKENS ||
-                       in_msg.Type == CoherenceResponseType:WB_OWNED ||
-                       in_msg.Type == CoherenceResponseType:WB_SHARED_DATA) {
-
-              if (L2cache.cacheAvail(in_msg.addr) || is_valid(cache_entry)) {
-                // either room is available or the block is already present
-                if (in_msg.Type == CoherenceResponseType:WB_TOKENS) {
-                  assert(in_msg.Dirty == false);
-                  assert( (getState(cache_entry, in_msg.addr) != State:NP) &&
-                          (getState(cache_entry, in_msg.addr) != State:I) );
-                  trigger(Event:Writeback_All_Tokens, in_msg.addr, cache_entry);
-                } else if (in_msg.Type == CoherenceResponseType:WB_SHARED_DATA) {
-                  assert(in_msg.Dirty == false);
-                  trigger(Event:Writeback_All_Tokens, in_msg.addr, cache_entry);
-                } else if (in_msg.Type == CoherenceResponseType:WB_OWNED) {
-                  trigger(Event:Writeback_All_Tokens, in_msg.addr, cache_entry);
-                }
-              } else {
-                  Addr victim := L2cache.cacheProbe(in_msg.addr);
-                  trigger(Event:L2_Replacement, victim, getCacheEntry(victim));
-              }
-
-            } else if (in_msg.Type == CoherenceResponseType:INV) {
-              trigger(Event:L1_INV, in_msg.addr, cache_entry);
-            } else {
-              DPRINTF(RubySlicc, "%s\n", in_msg.Type);
-              error("Unexpected message");
-            }
-          }
+        } else {
+            error("Unexpected message");
         }
       }
     }
+  }
+
+  in_port(triggerQueue_in, TriggerMsg, triggerQueue) {
+    if (triggerQueue_in.isReady(clockEdge())) {
+      peek(triggerQueue_in, TriggerMsg) {
+        // Trigger the internal event (e.g., L2_Accumulation_Done)
+        trigger(in_msg.Type, in_msg.addr, getCacheEntry(in_msg.addr));
+      }
+    }
+  }
 
 
   // ACTIONS
@@ -779,8 +657,8 @@ machine(MachineType:L2Cache, "Token protocol")
         out_msg.Type := in_msg.Type;
         out_msg.Sender := machineID;
         out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
-                out_msg.TokensSec0 := cache_entry.TokensSec0;
-        out_msg.TokensSec1 := cache_entry.TokensSec1;
+        out_msg.TokensSec0 := in_msg.TokensSec0;
+        out_msg.TokensSec1 := in_msg.TokensSec1;
         out_msg.MessageSize := in_msg.MessageSize;
         out_msg.DataBlk := in_msg.DataBlk;
         out_msg.valid_sector_mask := in_msg.valid_sector_mask;
@@ -855,6 +733,23 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
     }
     cache_entry.TokensSec0 := 0;
       cache_entry.TokensSec1 := 0;
+  }
+
+  action(cl2_checkL2Accumulation, "cl2", desc="Check if L2 line is whole") {
+    if (!cache_entry.AccumulationPending &&
+        getState(cache_entry, address) != State:M) { // STRICT GUARD
+        bool has_tokens := amtc_L2_hasAllTokens(cache_entry);
+        bool has_data := (cache_entry.ValidSectors != 0) &&
+                         amtc_maskContainsAll(cache_entry.ValidSectors, cache_entry.RequestedSectorMask);
+
+        if (has_tokens && has_data) {
+          cache_entry.AccumulationPending := true;
+            enqueue(triggerQueue_out, TriggerMsg, 1) {
+                out_msg.addr := address;
+                out_msg.Type := Event:L2_Accumulation_Done;
+            }
+        }
+    }
   }
 
   action(d_sendDataWithTokens, "d", desc="Send data and a token from cache to requestor") {
@@ -942,242 +837,6 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
     cache_entry.TokensSec0 := 0;
       cache_entry.TokensSec1 := 0;
   }
-
-  action(e_sendAckWithCollectedTokens, "e", desc="Send ack with the tokens we've collected thus far.") {
-    assert(is_valid(cache_entry));
-
-    // PHASE 2 FIX: Check if we have tokens for ANY sector
-    if (cache_entry.TokensSec0 > 0 || cache_entry.TokensSec1 > 0) {
-      enqueue(responseNetwork_out, ResponseMsg, l2_response_latency) {
-        out_msg.addr := address;
-        out_msg.Type := CoherenceResponseType:ACK;
-        out_msg.Sender := machineID;
-        out_msg.Destination.add(persistentTable.findSmallest(address));
-
-        // Attach the split tokens
-        out_msg.TokensSec0 := cache_entry.TokensSec0;
-        out_msg.TokensSec1 := cache_entry.TokensSec1;
-
-        // AMTC Metadata: Dynamically flag which sectors these tokens belong to
-        int t_mask := 0;
-        if (cache_entry.TokensSec0 > 0) { t_mask := amtc_unionMasks(t_mask, 1); }
-        if (cache_entry.TokensSec1 > 0) { t_mask := amtc_unionMasks(t_mask, 2); }
-
-        out_msg.token_sector_mask := t_mask;
-        out_msg.valid_sector_mask := 0; // ACKs never carry data
-        out_msg.MessageSize := MessageSizeType:Response_Control;
-      }
-    }
-
-    // Safely clear local tokens
-    cache_entry.TokensSec0 := 0;
-    cache_entry.TokensSec1 := 0;
-  }
-
-  action(ee_sendDataWithAllTokens, "\e", desc="Send data and all tokens from cache to starver") {
-    assert(is_valid(cache_entry));
-    enqueue(responseNetwork_out, ResponseMsg, l2_response_latency) {
-      out_msg.addr := address;
-      out_msg.Type := CoherenceResponseType:DATA_OWNER;
-      out_msg.Sender := machineID;
-      out_msg.Destination.add(persistentTable.findSmallest(address));
-      assert(cache_entry.TokensSec0 >= 1);
-assert(cache_entry.TokensSec1 >= 1);
-              out_msg.TokensSec0 := cache_entry.TokensSec0;
-        out_msg.TokensSec1 := cache_entry.TokensSec1;
-      out_msg.DataBlk := cache_entry.DataBlk;
-      out_msg.Dirty := cache_entry.Dirty;
-      out_msg.MessageSize := MessageSizeType:Response_Data;
-    }
-    cache_entry.TokensSec0 := 0;
-      cache_entry.TokensSec1 := 0;
-  }
-
-action(f_sendAckWithAllButOneTokens, "f", desc="Send ack with all our tokens but one to starver.") {
-    assert(is_valid(cache_entry));
-
-    int send_t0 := 0;
-    int send_t1 := 0;
-
-    if (cache_entry.TokensSec0 > 1) {
-        send_t0 := cache_entry.TokensSec0 - 1;
-        cache_entry.TokensSec0 := 1;
-    }
-    if (cache_entry.TokensSec1 > 1) {
-        send_t1 := cache_entry.TokensSec1 - 1;
-        cache_entry.TokensSec1 := 1;
-    }
-
-    if (send_t0 > 0 || send_t1 > 0) {
-      enqueue(responseNetwork_out, ResponseMsg, l2_response_latency) {
-        out_msg.addr := address;
-        out_msg.Type := CoherenceResponseType:ACK;
-        out_msg.Sender := machineID;
-        out_msg.Destination.add(persistentTable.findSmallest(address));
-
-        out_msg.TokensSec0 := send_t0;
-        out_msg.TokensSec1 := send_t1;
-        out_msg.MessageSize := MessageSizeType:Response_Control;
-      }
-    }
-  }
-
-action(ff_sendDataWithAllButOneTokens, "\f", desc="Send data and out tokens but one to starver") {
-    // Make sure we never bounce tokens to ourself
-    // assert(persistentTable.findSmallest(address) != id);
-    assert(is_valid(cache_entry));
-
-    int send_t0 := 0;
-    int send_t1 := 0;
-    int send_mask := 0;
-
-    // Evaluate Sector 0
-    if (cache_entry.TokensSec0 > 1) {
-        send_t0 := cache_entry.TokensSec0 - 1;
-        cache_entry.TokensSec0 := 1;
-        send_mask := amtc_unionMasks(send_mask, 1);
-    }
-
-    // Evaluate Sector 1
-    if (cache_entry.TokensSec1 > 1) {
-        send_t1 := cache_entry.TokensSec1 - 1;
-        cache_entry.TokensSec1 := 1;
-        send_mask := amtc_unionMasks(send_mask, 2);
-    }
-
-    // PHASE 2 ASSERT: We must be sending tokens for at least one sector!
-    assert(send_t0 > 0 || send_t1 > 0);
-
-    enqueue(responseNetwork_out, ResponseMsg, l2_response_latency) {
-        out_msg.addr := address;
-        out_msg.Type := CoherenceResponseType:DATA_OWNER;
-        out_msg.Sender := machineID;
-        out_msg.Destination.add(persistentTable.findSmallest(address));
-
-        // Attach the split tokens
-        out_msg.TokensSec0 := send_t0;
-        out_msg.TokensSec1 := send_t1;
-
-        // PHASE 1: Sector Aware Data Copy (Only send physical bytes for the tokens we are forwarding)
-        if (amtc_maskHasSector(send_mask, 0)) {
-            out_msg.DataBlk.copyPartial(cache_entry.DataBlk, 0, 32);
-        }
-        if (amtc_maskHasSector(send_mask, 1)) {
-            out_msg.DataBlk.copyPartial(cache_entry.DataBlk, 32, 32);
-        }
-
-        // Metadata Tracking
-        out_msg.valid_sector_mask := send_mask;
-        out_msg.token_sector_mask := send_mask;
-        out_msg.Dirty := cache_entry.Dirty;
-
-        // PHASE 1: Dynamic Message Size! (Cuts NoC bandwidth if only 1 sector is sent)
-        out_msg.MessageSize := amtc_getSizeFromDirtyMask(send_mask);
-    }
-  }
-
-  action(fa_sendDataWithAllTokens, "fa", desc="Send data and out tokens but one to starver") {
-    //assert(persistentTable.findSmallest(address) != id); // Make sure we never bounce tokens to ourself
-    assert(is_valid(cache_entry));
-      int send_t0 := 0;
-    int send_t1 := 0;
-    int send_mask := 0;
-
-    // Evaluate Sector 0
-    if (cache_entry.TokensSec0 > 1) {
-        send_t0 := cache_entry.TokensSec0 - 1;
-        cache_entry.TokensSec0 := 1;
-        send_mask := amtc_unionMasks(send_mask, 1);
-    }
-
-    // Evaluate Sector 1
-    if (cache_entry.TokensSec1 > 1) {
-        send_t1 := cache_entry.TokensSec1 - 1;
-        cache_entry.TokensSec1 := 1;
-        send_mask := amtc_unionMasks(send_mask, 2);
-    }
-
-    // PHASE 2 ASSERT: We must be sending tokens for at least one sector!
-    assert(send_t0 > 0 || send_t1 > 0);
-    enqueue(responseNetwork_out, ResponseMsg, l2_response_latency) {
-        out_msg.addr := address;
-        out_msg.Type := CoherenceResponseType:DATA_OWNER;
-        out_msg.Sender := machineID;
-        out_msg.Destination.add(persistentTable.findSmallest(address));
-                out_msg.TokensSec0 := cache_entry.TokensSec0;
-        out_msg.TokensSec1 := cache_entry.TokensSec1;
-        out_msg.DataBlk := cache_entry.DataBlk;
-        out_msg.Dirty := cache_entry.Dirty;
-        out_msg.MessageSize := MessageSizeType:Response_Data;
-    }
-    cache_entry.TokensSec0 := 0;
-      cache_entry.TokensSec1 := 0;
-  }
-
-
-
-  action(gg_bounceResponseToStarver, "\g", desc="Redirect response to starving processor") {
-    // assert(persistentTable.isLocked(address));
-    peek(responseNetwork_in, ResponseMsg) {
-      // FIXME, should use a 3rd vnet in some cases
-      enqueue(responseNetwork_out, ResponseMsg, 1) {
-        out_msg.addr := address;
-        out_msg.Type := in_msg.Type;
-        out_msg.Sender := machineID;
-        out_msg.Destination.add(persistentTable.findSmallest(address));
-                out_msg.TokensSec0 := cache_entry.TokensSec0;
-        out_msg.TokensSec1 := cache_entry.TokensSec1;
-        out_msg.DataBlk := in_msg.DataBlk;
-        out_msg.valid_sector_mask := in_msg.valid_sector_mask;
-        out_msg.Dirty := in_msg.Dirty;
-        out_msg.MessageSize := in_msg.MessageSize;
-      }
-    }
-  }
-
-  action(gg_bounceWBSharedToStarver, "\gg", desc="Redirect response to starving processor") {
-    //assert(persistentTable.isLocked(address));
-    peek(responseNetwork_in, ResponseMsg) {
-      // FIXME, should use a 3rd vnet in some cases
-      enqueue(responseNetwork_out, ResponseMsg, 1) {
-        out_msg.addr := address;
-        if (in_msg.Type == CoherenceResponseType:WB_SHARED_DATA) {
-          out_msg.Type := CoherenceResponseType:DATA_SHARED;
-        } else {
-
-          out_msg.Type := CoherenceResponseType:ACK;
-        }
-        out_msg.Sender := machineID;
-        out_msg.Destination.add(persistentTable.findSmallest(address));
-        out_msg.TokensSec0 := cache_entry.TokensSec0;
-        out_msg.TokensSec1 := cache_entry.TokensSec1;
-        out_msg.DataBlk := in_msg.DataBlk;
-        out_msg.valid_sector_mask := in_msg.valid_sector_mask;
-        out_msg.Dirty := in_msg.Dirty;
-        out_msg.MessageSize := in_msg.MessageSize;
-      }
-    }
-  }
-
-  action(gg_bounceWBOwnedToStarver, "\ggg", desc="Redirect response to starving processor") {
-    // assert(persistentTable.isLocked(address));
-    peek(responseNetwork_in, ResponseMsg) {
-      // FIXME, should use a 3rd vnet in some cases
-      enqueue(responseNetwork_out, ResponseMsg, 1) {
-        out_msg.addr := address;
-        out_msg.Type := CoherenceResponseType:DATA_OWNER;
-        out_msg.Sender := machineID;
-        out_msg.Destination.add(persistentTable.findSmallest(address));
-        out_msg.TokensSec0 := cache_entry.TokensSec0;
-        out_msg.TokensSec1 := cache_entry.TokensSec1;
-        out_msg.DataBlk := in_msg.DataBlk;
-        out_msg.valid_sector_mask := in_msg.valid_sector_mask;
-        out_msg.Dirty := in_msg.Dirty;
-        out_msg.MessageSize := in_msg.MessageSize;
-      }
-    }
-  }
-
 
   action(h_updateFilterFromL1HintOrWB, "h", desc="update filter from received writeback") {
     peek(responseNetwork_in, ResponseMsg) {
@@ -1366,8 +1025,8 @@ action(ff_sendDataWithAllButOneTokens, "\f", desc="Send data and out tokens but 
           out_msg.token_sector_mask := safe_send_mask;
           out_msg.requested_sector_mask := req_mask;
           out_msg.MessageSize := amtc_getSizeFromDirtyMask(safe_send_mask);
-                  out_msg.TokensSec0 := cache_entry.TokensSec0;
-        out_msg.TokensSec1 := cache_entry.TokensSec1;
+          out_msg.TokensSec0 := send_t0;
+          out_msg.TokensSec1 := send_t1;
         }
       } else {
         enqueue(responseNetwork_out, ResponseMsg, l2_response_latency) {
@@ -1383,8 +1042,8 @@ action(ff_sendDataWithAllButOneTokens, "\f", desc="Send data and out tokens but 
           out_msg.token_sector_mask := req_mask;
           out_msg.requested_sector_mask := req_mask;
           out_msg.MessageSize := MessageSizeType:Response_Control;
-                  out_msg.TokensSec0 := cache_entry.TokensSec0;
-        out_msg.TokensSec1 := cache_entry.TokensSec1;
+          out_msg.TokensSec0 := send_t0;
+          out_msg.TokensSec1 := send_t1;
         }
         enqueue(globalRequestNetwork_out, RequestMsg, l2_request_latency) {
            out_msg.addr := address;
@@ -1407,8 +1066,6 @@ action(ff_sendDataWithAllButOneTokens, "\f", desc="Send data and out tokens but 
            out_msg.is_owner_pull := true;
         }
       }
-      cache_entry.TokensSec0 := 0;
-      cache_entry.TokensSec1 := 0;
     }
   }
 
@@ -1511,10 +1168,6 @@ action(ff_sendDataWithAllButOneTokens, "\f", desc="Send data and out tokens but 
     }
   }
 
-  action(l_popPersistentQueue, "l", desc="Pop persistent queue.") {
-    persistentNetwork_in.dequeue(clockEdge());
-  }
-
   action(m_popRequestQueue, "m", desc="Pop request queue.") {
     requestNetwork_in.dequeue(clockEdge());
   }
@@ -1568,6 +1221,20 @@ action(ff_sendDataWithAllButOneTokens, "\f", desc="Send data and out tokens but 
           (is_valid(cache_entry))) {
         L2cache.setMRU(address);
       }
+    }
+  }
+
+  action(rm_updateRequestedMask, "rm", desc="Update requested sector mask from L1 request") {
+    peek(L1requestNetwork_in, RequestMsg) {
+      if (is_valid(cache_entry)) {
+        cache_entry.RequestedSectorMask := amtc_unionMasks(cache_entry.RequestedSectorMask, in_msg.requested_sector_mask);
+      }
+    }
+  }
+
+  action(rc_clearRequestedMask, "rc", desc="Clear requested sector mask upon M promotion") {
+    if (is_valid(cache_entry)) {
+      cache_entry.RequestedSectorMask := 0;
     }
   }
 
@@ -1633,6 +1300,10 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     // Safely clear local tokens
     cache_entry.TokensSec0 := 0;
     cache_entry.TokensSec1 := 0;
+  }
+
+  action(t_popTriggerQueue, "tq", desc="Pop trigger queue") {
+    triggerQueue_in.dequeue(clockEdge());
   }
 
   action(u_writeDataToCache, "u", desc="Write data to cache") {
@@ -1703,21 +1374,22 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     }
   }
 
+  action(z_resetAccumulationFlag, "z", desc="Reset the accumulation trigger flag") {
+    if (is_valid(cache_entry)) {
+      cache_entry.AccumulationPending := false;
+    }
+  }
+
 
   //*****************************************************
   // TRANSITIONS
   //*****************************************************
 
-  transition({NP, I, S, O, M, I_L, S_L}, L1_INV) {
+  transition({NP, I, S, O, M}, L1_INV) {
 
     h_updateFilterFromL1HintOrWB;
     n_popResponseQueue;
   }
-
-  transition({NP, I, S, O, M}, Own_Lock_or_Unlock) {
-    l_popPersistentQueue;
-  }
-
 
   // Transitions from NP
 
@@ -1736,7 +1408,7 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     o_popL1RequestQueue;
   }
 
-  transition(NP, {Ack, Data_Shared, Data_Owner, Data_All_Tokens}) {
+  transition(NP, {Ack, Data_Shared, Data_Owner}) {
     bb_bounceResponse;
     n_popResponseQueue;
   }
@@ -1746,6 +1418,7 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     u_writeDataToCache;
     q_updateTokensFromResponse;
     h_updateFilterFromL1HintOrWB;
+    cl2_checkL2Accumulation;
     n_popResponseQueue;
   }
 
@@ -1753,14 +1426,7 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     vv_allocateL2CacheBlock;
     q_updateTokensFromResponse;
     h_updateFilterFromL1HintOrWB;
-    n_popResponseQueue;
-  }
-
-  transition(NP, Writeback_All_Tokens, M) {
-    vv_allocateL2CacheBlock;
-    u_writeDataToCache;
-    q_updateTokensFromResponse;
-    h_updateFilterFromL1HintOrWB;
+    cl2_checkL2Accumulation;
     n_popResponseQueue;
   }
 
@@ -1769,19 +1435,13 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     u_writeDataToCache;
     q_updateTokensFromResponse;
     h_updateFilterFromL1HintOrWB;
+    cl2_checkL2Accumulation;
     n_popResponseQueue;
-  }
-
-
-  transition(NP,
-             {Persistent_GETX, Persistent_GETS, Persistent_GETS_Last_Token},
-             I_L) {
-    l_popPersistentQueue;
   }
 
   // Transitions from Idle
 
-  transition(I, {L1_GETS, L1_GETS_Last_Token}) {
+  transition(I, {L1_GETS }) {
     a_broadcastLocalRequest;
     tt_sendLocalAckWithCollectedTokens;  // send any tokens we have collected
     r_markNewSharer;
@@ -1802,20 +1462,12 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     rr_deallocateL2CacheBlock;
   }
 
-  transition(I, {Transient_GETX, Transient_GETS, Transient_GETS_Last_Token}) {
+  transition(I, {Transient_GETX, Transient_GETS}) {
     r_clearExclusive;
     t_sendAckWithCollectedTokens;
     j_forwardTransientRequestToLocalSharers;
     m_popRequestQueue;
   }
-
-  transition(I,
-             {Persistent_GETX, Persistent_GETS, Persistent_GETS_Last_Token},
-             I_L) {
-    e_sendAckWithCollectedTokens;
-    l_popPersistentQueue;
-  }
-
 
   transition(I, Ack) {
     q_updateTokensFromResponse;
@@ -1832,18 +1484,21 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     u_writeDataToCache;
     q_updateTokensFromResponse;
     h_updateFilterFromL1HintOrWB;
+    cl2_checkL2Accumulation;
     n_popResponseQueue;
   }
 
   transition(I, Writeback_Tokens) {
     q_updateTokensFromResponse;
     h_updateFilterFromL1HintOrWB;
+    cl2_checkL2Accumulation;
     n_popResponseQueue;
   }
 
   transition(I, Data_Owner, O) {
     u_writeDataToCache;
     q_updateTokensFromResponse;
+    cl2_checkL2Accumulation;
     n_popResponseQueue;
   }
 
@@ -1851,20 +1506,7 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     u_writeDataToCache;
     q_updateTokensFromResponse;
     h_updateFilterFromL1HintOrWB;
-    n_popResponseQueue;
-  }
-
-  transition(I, Data_All_Tokens, M) {
-    u_writeDataToCache;
-    q_updateTokensFromResponse;
-    n_popResponseQueue;
-  }
-
-
-  transition(I, Writeback_All_Tokens, M) {
-    u_writeDataToCache;
-    q_updateTokensFromResponse;
-    h_updateFilterFromL1HintOrWB;
+    cl2_checkL2Accumulation;
     n_popResponseQueue;
   }
 
@@ -1882,31 +1524,13 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     m_popRequestQueue;
   }
 
-  transition(S, {Transient_GETS, Transient_GETS_Last_Token}) {
+  transition(S, {Transient_GETS}) {
     j_forwardTransientRequestToLocalSharers;
     r_clearExclusive;
     m_popRequestQueue;
   }
 
-  transition(S, Persistent_GETX, I_L) {
-    e_sendAckWithCollectedTokens;
-    l_popPersistentQueue;
-  }
-
-
-  transition(S, {Persistent_GETS, Persistent_GETS_Last_Token}, S_L) {
-    f_sendAckWithAllButOneTokens;
-    l_popPersistentQueue;
-  }
-
-
   transition(S, Ack) {
-    q_updateTokensFromResponse;
-    n_popResponseQueue;
-  }
-
-  transition(S, Data_Shared) {
-    w_assertIncomingDataAndCacheDataMatch;
     q_updateTokensFromResponse;
     n_popResponseQueue;
   }
@@ -1938,20 +1562,15 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     n_popResponseQueue;
   }
 
-  transition(S, Data_All_Tokens, M) {
-    w_assertIncomingDataAndCacheDataMatch;
-    q_updateTokensFromResponse;
-    n_popResponseQueue;
-  }
-
-  transition(S, Writeback_All_Tokens,  M) {
-    w_assertIncomingDataAndCacheDataMatch;
-    q_updateTokensFromResponse;
-    h_updateFilterFromL1HintOrWB;
+  transition(S, {Data_Shared}) {
+    q_updateTokensFromResponse; // Updates cache_entry.TokensSec0/1
+    u_writeDataToCache;         // Updates cache_entry.ValidSectors [cite: 378]
+    cl2_checkL2Accumulation;    // Fires trigger if entry is now complete
     n_popResponseQueue;
   }
 
   transition(S, L1_GETX, I) {
+    rm_updateRequestedMask;
     a_broadcastLocalRequest;
     tt_sendLocalAckWithCollectedTokens;
     r_markNewSharer;
@@ -1963,20 +1582,13 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
 
   transition(S, L1_GETS) {
     k_dataFromL2CacheToL1Requestor;
+    rm_updateRequestedMask;
     r_markNewSharer;
     r_setMRU;
     uu_profileHit;
     o_popL1RequestQueue;
   }
 
-  transition(S, L1_GETS_Last_Token, I) {
-
-    k_dataFromL2CacheToL1Requestor;
-    r_markNewSharer;
-    r_setMRU;
-    uu_profileHit;
-    o_popL1RequestQueue;
-  }
 
   // Transitions from Owned
 
@@ -1992,31 +1604,10 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     m_popRequestQueue;
   }
 
-  transition(O, Persistent_GETX, I_L) {
-    ee_sendDataWithAllTokens;
-    l_popPersistentQueue;
-  }
-
-  transition(O, Persistent_GETS, S_L) {
-    ff_sendDataWithAllButOneTokens;
-    l_popPersistentQueue;
-  }
-
-  transition(O, Persistent_GETS_Last_Token, I_L) {
-    fa_sendDataWithAllTokens;
-    l_popPersistentQueue;
-  }
-
   transition(O, Transient_GETS) {
     // send multiple tokens
     r_clearExclusive;
     d_sendDataWithTokens;
-    m_popRequestQueue;
-  }
-
-  transition(O, Transient_GETS_Last_Token) {
-    // WAIT FOR IT TO GO PERSISTENT
-    r_clearExclusive;
     m_popRequestQueue;
   }
 
@@ -2025,14 +1616,11 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     n_popResponseQueue;
   }
 
-  transition(O, Ack_All_Tokens, M) {
-    q_updateTokensFromResponse;
-    n_popResponseQueue;
-  }
-
-  transition(O, Data_Shared) {
+  transition(O, {Data_Shared, Data_Owner}) {
     w_assertIncomingDataAndCacheDataMatch;
     q_updateTokensFromResponse;
+    u_writeDataToCache;
+    cl2_checkL2Accumulation;
     n_popResponseQueue;
   }
 
@@ -2044,20 +1632,9 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     n_popResponseQueue;
   }
 
-  transition(O, Data_All_Tokens, M) {
-    w_assertIncomingDataAndCacheDataMatch;
-    q_updateTokensFromResponse;
-    n_popResponseQueue;
-  }
-
-  transition(O, Writeback_All_Tokens, M) {
-    w_assertIncomingDataAndCacheDataMatch;
-    q_updateTokensFromResponse;
-    h_updateFilterFromL1HintOrWB;
-    n_popResponseQueue;
-  }
-
   transition(O, L1_GETS) {
+    z_resetAccumulationFlag;
+    rm_updateRequestedMask;
     k_dataFromL2CacheToL1Requestor;
     r_markNewSharer;
     r_setMRU;
@@ -2065,15 +1642,10 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     o_popL1RequestQueue;
   }
 
-  transition(O, L1_GETS_Last_Token, I) {
-    k_dataOwnerFromL2CacheToL1Requestor;
-    r_markNewSharer;
-    r_setMRU;
-    uu_profileHit;
-    o_popL1RequestQueue;
-  }
 
   transition(O, L1_GETX, I) {
+    z_resetAccumulationFlag;
+    rm_updateRequestedMask;
     a_broadcastLocalRequest;
     k_dataAndAllTokensFromL2CacheToL1Requestor;
     r_markNewSharer;
@@ -2085,6 +1657,7 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
   // Transitions from M
 
   transition(M, L2_Replacement, I) {
+    z_resetAccumulationFlag;
     cc_dirtyReplacement;
     rr_deallocateL2CacheBlock;
   }
@@ -2096,13 +1669,8 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     m_popRequestQueue;
   }
 
-  transition(M, {Persistent_GETS, Persistent_GETX}, I_L) {
-    ee_sendDataWithAllTokens;
-    l_popPersistentQueue;
-  }
-
-
   transition(M, L1_GETS, O) {
+    z_resetAccumulationFlag;
     k_dataFromL2CacheToL1Requestor;
     r_markNewSharer;
     r_setMRU;
@@ -2111,6 +1679,7 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
   }
 
   transition(M, L1_GETX, I) {
+    z_resetAccumulationFlag;
     k_dataAndAllTokensFromL2CacheToL1Requestor;
     r_markNewSharer;
     r_setMRU;
@@ -2118,95 +1687,9 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     o_popL1RequestQueue;
   }
 
-
-  //Transitions from locked states
-
-  transition({I_L, S_L}, Ack) {
-    gg_bounceResponseToStarver;
-    n_popResponseQueue;
-  }
-
-  transition({I_L, S_L}, {Data_Shared, Data_Owner, Data_All_Tokens}) {
-    gg_bounceResponseToStarver;
-    n_popResponseQueue;
-  }
-
-  transition({I_L, S_L}, {Writeback_Tokens, Writeback_Shared_Data}) {
-    gg_bounceWBSharedToStarver;
-    h_updateFilterFromL1HintOrWB;
-    n_popResponseQueue;
-  }
-
-  transition({I_L, S_L}, {Writeback_Owned, Writeback_All_Tokens}) {
-    gg_bounceWBOwnedToStarver;
-    h_updateFilterFromL1HintOrWB;
-    n_popResponseQueue;
-  }
-
-  transition(S_L, L2_Replacement, I) {
-    c_cleanReplacement;
-    rr_deallocateL2CacheBlock;
-  }
-
-  transition(I_L, L2_Replacement, I) {
-    rr_deallocateL2CacheBlock;
-  }
-
-  transition(I_L, Own_Lock_or_Unlock, I) {
-    l_popPersistentQueue;
-  }
-
-  transition(S_L, Own_Lock_or_Unlock, S) {
-    l_popPersistentQueue;
-  }
-
-  transition({I_L, S_L}, {Transient_GETS_Last_Token, Transient_GETS, Transient_GETX}) {
-    r_clearExclusive;
-    m_popRequestQueue;
-  }
-
-  transition(I_L, {L1_GETX, L1_GETS}) {
-    a_broadcastLocalRequest;
-    r_markNewSharer;
-    uu_profileMiss;
-    o_popL1RequestQueue;
-  }
-
-  transition(S_L, L1_GETX, I_L) {
-    a_broadcastLocalRequest;
-    tt_sendLocalAckWithCollectedTokens;
-    r_markNewSharer;
-    r_setMRU;
-    uu_profileMiss;
-    o_popL1RequestQueue;
-  }
-
-  transition(S_L, L1_GETS) {
-    k_dataFromL2CacheToL1Requestor;
-    r_markNewSharer;
-    r_setMRU;
-    uu_profileHit;
-    o_popL1RequestQueue;
-  }
-
-  transition(S_L, L1_GETS_Last_Token, I_L) {
-    k_dataFromL2CacheToL1Requestor;
-    r_markNewSharer;
-    r_setMRU;
-    uu_profileHit;
-    o_popL1RequestQueue;
-  }
-
-  transition(S_L, Persistent_GETX, I_L) {
-    e_sendAckWithCollectedTokens;
-    l_popPersistentQueue;
-  }
-
-  transition(S_L, {Persistent_GETS, Persistent_GETS_Last_Token}) {
-    l_popPersistentQueue;
-  }
-
-  transition(I_L, {Persistent_GETX, Persistent_GETS}) {
-    l_popPersistentQueue;
+  transition({S, O}, L2_Accumulation_Done, M) {
+    z_resetAccumulationFlag;
+    rc_clearRequestedMask;
+    t_popTriggerQueue;
   }
 }
