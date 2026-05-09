@@ -105,7 +105,6 @@ machine(MachineType:Directory, "Token protocol")
     Data_Owner, desc="Data arrive";
     Data_Shared,  desc="Data from a sharer";
     Ack_Owner, desc="Owner token arrived without data because it was clean";
-   // Ack_Owner_All_Tokens, desc="All tokens including owner arrived without data because it was clean";
     Tokens, desc="Tokens arrive";
     Request_Timeout, desc="A DMA request has timed out";
 
@@ -116,16 +115,14 @@ machine(MachineType:Directory, "Token protocol")
     // DMA requests
     DMA_READ, desc="A DMA Read memory request";
     DMA_WRITE, desc="A DMA Write memory request";
-
     GETS_Owner_Pull, desc="The Owner is requesting raw data for a missing sector";
 
-    // --- ADD THESE TWO INTERNAL TRIGGERS ---
+    // TWO INTERNAL TRIGGERS ---
     Write_Complete,  desc="Internal trigger: All data and tokens for a write are accumulated";
     Read_Complete,   desc="Internal trigger: All data for a read is accumulated";
   }
 
   // TYPES
-
   // DirectoryEntry
   structure(Entry, desc="...", interface="AbstractCacheEntry", main="false") {
     State DirectoryState,          desc="Directory state";
@@ -139,11 +136,6 @@ machine(MachineType:Directory, "Token protocol")
     int RequestedSectorMask, default="0", desc="AMTC requested sector mask for outstanding directory transaction";
     int ReceivedSectorMask, default="0", desc="AMTC sectors received for outstanding directory transaction";
     int LastSectorID, default="0", desc="AMTC primary sector id for outstanding transaction";
-
-    // The following state is provided to allow for bandwidth
-    // efficient directory-like operation.  However all of this state
-    // is 'soft state' that does not need to be correct (as long as
-    // you're eventually willing to resort to broadcast.)
 
     Set Owner,                     desc="Probable Owner of the line.  More accurately, the set of processors who need to see a GetS or GetO.  We use a Set for convenience, but only one bit is set at a time.";
     Set Sharers,                   desc="Probable sharers of the line.  More accurately, the set of processors who need to see a GetX";
@@ -461,6 +453,10 @@ machine(MachineType:Directory, "Token protocol")
     return amtc_hasRequestedData(tbe) && amtc_hasRequestedTokens(tbe);
   }
 
+  void amtc_assertTokenBounds(int tokens) {
+    assert(tokens >= 0);
+    assert(tokens <= (max_tokens() / 2));
+  }
 
   // ** OUT_PORTS **
   out_port(responseNetwork_out, ResponseMsg, responseFromDir);

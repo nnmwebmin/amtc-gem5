@@ -26,6 +26,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+
 machine(MachineType:L2Cache, "Token protocol")
  : CacheMemory * L2cache;
    int N_tokens;
@@ -491,6 +492,11 @@ machine(MachineType:L2Cache, "Token protocol")
         return false;
     }
     return true;
+  }
+
+  void amtc_assertTokenBounds(int tokens) {
+    assert(tokens >= 0);
+    assert(tokens <= (max_tokens() / 2));
   }
 
   // ** OUT_PORTS **
@@ -1005,6 +1011,9 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
         send_mask := amtc_unionMasks(send_mask, 2);
     }
 
+    amtc_assertTokenBounds(send_t0);
+    amtc_assertTokenBounds(send_t1);
+
     // PHASE 2 ASSERT: We must be sending tokens for at least one sector!
     assert(send_t0 > 0 || send_t1 > 0);
 
@@ -1188,6 +1197,9 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
       // Route tokens to specific sectors
       cache_entry.TokensSec0 := cache_entry.TokensSec0 + in_msg.TokensSec0;
       cache_entry.TokensSec1 := cache_entry.TokensSec1 + in_msg.TokensSec1;
+      // Protect
+      amtc_assertTokenBounds(cache_entry.TokensSec0);
+      amtc_assertTokenBounds(cache_entry.TokensSec1);
 
       cache_entry.ValidSectors := amtc_unionMasks(cache_entry.ValidSectors, in_msg.valid_sector_mask);
 
