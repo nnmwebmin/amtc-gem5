@@ -60,44 +60,41 @@ machine(MachineType:Directory, "Token protocol")
    MessageBuffer * triggerQueue;
 {
   // STATES
-  state_declaration(State, desc="Directory states", default="Directory_State_O") {
-    // Base states
-    O, AccessPermission:Read_Only, desc="Owner, memory has valid data, but not necessarily all the tokens";
-    NO, AccessPermission:Maybe_Stale, desc="Not Owner";
-    L, AccessPermission:Busy, desc="Locked";
+  state_declaration(State, desc="Directory states", default="Directory_State_I") {
+    // --- STABLE DOMAIN STATES ---
+    I,   AccessPermission:Invalid,    desc="Dir owns all tokens, no caching";
+    CS,  AccessPermission:Read_Only,  desc="CPU Shared (Dir holds remainder)";
+    GS,  AccessPermission:Read_Only,  desc="GPU Shared (Dir holds remainder)";
+    CGS, AccessPermission:Read_Only,  desc="CPU+GPU Shared (Dir holds remainder)";
+    CE,  AccessPermission:Read_Write, desc="CPU Exclusive (CPU holds ALL tokens)";
+    GE,  AccessPermission:Read_Write, desc="GPU Exclusive (GPU holds ALL tokens)";
+    CE_XFER, AccessPermission:Read_Write, desc="CPU ownership transition state";
+    GE_XFER, AccessPermission:Read_Write, desc="GPU ownership transition state";
 
-    // Memory wait states - can block all messages including persistent requests
-    O_W, AccessPermission:Busy, desc="transitioning to Owner, waiting for memory write";
-    L_O_W, AccessPermission:Busy, desc="transitioning to Locked, waiting for memory read, could eventually return to O";
-    L_NO_W, AccessPermission:Busy, desc="transitioning to Locked, waiting for memory read, eventually return to NO";
-    DR_L_W, AccessPermission:Busy, desc="transitioning to Locked underneath a DMA read, waiting for memory data";
-    DW_L_W, AccessPermission:Busy, desc="transitioning to Locked underneath a DMA write, waiting for memory ack";
-    NO_W, AccessPermission:Busy, desc="transitioning to Not Owner, waiting for memory read";
-    O_DW_W, AccessPermission:Busy, desc="transitioning to Owner, waiting for memory before DMA ack";
-    O_DR_W, AccessPermission:Busy, desc="transitioning to Owner, waiting for memory before DMA data";
+    // --- TRANSIENT MEMORY WAITS ---
+    CS_W,  AccessPermission:Busy, desc="Fetching memory for CPU Shared";
+    GS_W,  AccessPermission:Busy, desc="Fetching memory for GPU Shared";
+    CE_W,  AccessPermission:Busy, desc="Fetching memory for CPU Exclusive";
+    GE_W,  AccessPermission:Busy, desc="Fetching memory for GPU Exclusive";
+    CGS_W, AccessPermission:Busy, desc="Fetching memory to add domain to Shared";
 
-    // DMA request transient states - must respond to persistent requests
-    O_DW, AccessPermission:Busy, desc="issued GETX for DMA write, waiting for all tokens";
-    NO_DW, AccessPermission:Busy, desc="issued GETX for DMA write, waiting for all tokens";
-    NO_DR, AccessPermission:Busy, desc="issued GETS for DMA read, waiting for data";
+    // --- TRANSIENT UPGRADES & MIGRATIONS ---
+    MIG_C2G,     AccessPermission:Busy, desc="Migrating CE to GE";
+    MIG_G2C,     AccessPermission:Busy, desc="Migrating GE to CE";
+    CGS_CPU_UPG, AccessPermission:Busy, desc="Upgrading CGS to CE (waiting on GPU Ack)";
+    CGS_GPU_UPG, AccessPermission:Busy, desc="Upgrading CGS to GE (waiting on CPU Ack)";
 
-    // DMA request in progress - competing with a CPU persistent request
-    DW_L, AccessPermission:Busy, desc="issued GETX for DMA write, CPU persistent request must complete first";
-    DR_L, AccessPermission:Busy, desc="issued GETS for DMA read, CPU persistent request must complete first";
-
-    NO_W_DataOnly, AccessPermission:Busy, "NO_W_DataOnly", desc="Not Owner, fetching memory for partial fill without tokens";
-
-    // --- ADD THE NEW ACCUMULATOR STATES HERE ---
-    NO_DW_ACCUM, AccessPermission:Busy, desc="Accumulating data and tokens for DMA write";
-    NO_DR_ACCUM, AccessPermission:Busy, desc="Waiting for DMA Read tokens and data from sharers/owner"; // <--- ADD THIS LINE
-    // O_DW_ACCUM, AccessPermission:Busy, desc="Accumulating data and tokens for DMA write (Owner)";
-
+    CE_W_DataOnly, AccessPermission:Busy, desc="Fetching data-only for CPU Owner Pull";
+    GE_W_DataOnly, AccessPermission:Busy, desc="Fetching data-only for GPU Owner Pull";
   }
 
   // Events
   enumeration(Event, desc="Directory events") {
-    GETX, desc="A GETX arrives";
-    GETS, desc="A GETS arrives";
+    CPU_GETS, desc="A GETS from the CPU domain";
+    GPU_GETS, desc="A GETS from the GPU domain";
+    CPU_GETX, desc="A GETX from the CPU domain";
+    GPU_GETX, desc="A GETX from the GPU domain";
+
     Lockdown, desc="A lockdown request arrives";
     Unlockdown, desc="An un-lockdown request arrives";
     Own_Lock_or_Unlock, desc="own lock or unlock";
@@ -109,13 +106,15 @@ machine(MachineType:Directory, "Token protocol")
     Request_Timeout, desc="A DMA request has timed out";
 
     // Memory Controller
-    Memory_Data, desc="Fetched data from memory arrives";
+    Memory_Data, desc="Data from memory arrives";
+    Tokens_Ack,  desc="Tokens returned from an invalidation";
     Memory_Ack, desc="Writeback Ack from memory arrives";
 
     // DMA requests
     DMA_READ, desc="A DMA Read memory request";
     DMA_WRITE, desc="A DMA Write memory request";
     GETS_Owner_Pull, desc="The Owner is requesting raw data for a missing sector";
+
 
     // TWO INTERNAL TRIGGERS ---
     Write_Complete,  desc="Internal trigger: All data and tokens for a write are accumulated";
@@ -125,7 +124,7 @@ machine(MachineType:Directory, "Token protocol")
   // TYPES
   // DirectoryEntry
   structure(Entry, desc="...", interface="AbstractCacheEntry", main="false") {
-    State DirectoryState,          desc="Directory state";
+    //State DirectoryState,          desc="Directory state";
     //int Tokens, default="max_tokens()", desc="Number of tokens for the line we're holding";
     int TokensSec0, default="max_tokens() / 2", desc="AMTC token count for sector 0";
     int TokensSec1, default="max_tokens() / 2", desc="AMTC token count for sector 1";
@@ -139,15 +138,27 @@ machine(MachineType:Directory, "Token protocol")
 
     Set Owner,                     desc="Probable Owner of the line.  More accurately, the set of processors who need to see a GetS or GetO.  We use a Set for convenience, but only one bit is set at a time.";
     Set Sharers,                   desc="Probable sharers of the line.  More accurately, the set of processors who need to see a GetX";
+
+    State DirectoryState,          desc="Directory state";
+  DataBlock DataBlk,             desc="data for the block";
+
+  // --- PHASE 1: DOMAIN METADATA ---
+  bool cpu_shared, default="false";
+  bool gpu_shared, default="false";
+  bool cpu_dirty,  default="false";
+  bool gpu_dirty,  default="false";
+  MachineID last_cpu_owner;
+  MachineID last_gpu_owner;
   }
+
 
   // TBE entries for DMA requests
   structure(TBE, desc="TBE entries for outstanding DMA requests") {
-    Addr PhysicalAddress, desc="physical address";
-    State TBEState,        desc="Transient State";
-    DataBlock DataBlk,     desc="Current view of the associated address range";
-    int Len,               desc="...";
-    MachineID DmaRequestor, desc="DMA requestor";
+    //Addr PhysicalAddress, desc="physical address";
+    //State TBEState,        desc="Transient State";
+    //DataBlock DataBlk,     desc="Current view of the associated address range";
+    //int Len,               desc="...";
+    //MachineID DmaRequestor, desc="DMA requestor";
     MachineID OriginalRequestorMachId;
     bool WentPersistent,   desc="Did the DMA request require a persistent request";
     int RequestedSectorMask, default="3", desc="AMTC requested sector mask for outstanding directory transaction";
@@ -156,6 +167,17 @@ machine(MachineType:Directory, "Token protocol")
     int LastSectorID, default="0", desc="AMTC primary sector id for outstanding transaction";
     bool FromGPU, default="false", desc="AMTC transaction originated from GPU-side controller";
     bool IsSyncRequest, default="false", desc="AMTC transaction requires coherent sync semantics";
+
+    Addr PhysicalAddress,   desc="Physical address for this TBE";
+  State TBEState,        desc="Transient state";
+  DataBlock DataBlk,     desc="Data block";
+  int Len,               desc="Data block length";
+  MachineID DmaReqDest,  desc="DMA requestor";
+  // ADD THIS LINE HERE
+  MachineID last_requestor, desc="ID of the original requestor for domain tracking";
+
+  // --- PHASE 1: TBE EXTENSION ---
+  bool req_from_cpu,     default="false";
   }
 
   structure(TBETable, external="yes") {
@@ -195,6 +217,13 @@ machine(MachineType:Directory, "Token protocol")
   // Full-line mask is 3. Old full-line mask values such as 15 are sanitized
   // to 3 so untrimmed controllers cannot accidentally re-enable 4 sectors.
   // -------------------------------------------------------------------------
+
+  // Helper to determine origin domain
+  bool is_cpu_domain(MachineID mach) {
+    // Use machineIDToMachineType to extract the enum for comparison
+    return (machineIDToMachineType(mach) == MachineType:L2Cache ||
+            machineIDToMachineType(mach) == MachineType:L1Cache);
+  }
   int amtc_maskFromSector(int sid) {
     if (sid == 0) {
       return 1;
@@ -361,29 +390,45 @@ machine(MachineType:Directory, "Token protocol")
     }
   }
 
- void setState(TBE tbe, Addr addr, State state) {
+  void setState(TBE tbe, Addr addr, State state) {
     if (is_valid(tbe)) {
       tbe.TBEState := state;
     }
     getDirectoryEntry(addr).DirectoryState := state;
     Entry dir_entry := getDirectoryEntry(addr);
 
-    if (state == State:L || state == State:DW_L || state == State:DR_L) {
-      assert(dir_entry.TokensSec0 == 0);
-      assert(dir_entry.TokensSec1 == 0);
-    }
-
     assert((dir_entry.Owner.count() == 0) || (dir_entry.Owner.count() == 1));
 
-    // Tokens cannot exceed the per-sector maximum
+    // 1. ABSOLUTE BOUNDS: Tokens can never be negative or exceed the maximum
     assert(dir_entry.TokensSec0 >= 0);
     assert(dir_entry.TokensSec0 <= (max_tokens() / 2));
     assert(dir_entry.TokensSec1 >= 0);
     assert(dir_entry.TokensSec1 <= (max_tokens() / 2));
 
-    if (state == State:O || state == State:O_W || state == State:O_DW) {
-      // Must hold at least one token across the whole line to be considered the Owner
-      assert((dir_entry.TokensSec0 + dir_entry.TokensSec1) >= 1);
+    // ====================================================================
+    // 2. PHASE 1 DOMAIN INVARIANTS
+    // ====================================================================
+
+    // INVARIANT A: Invalid & Initialization Wait States
+    // If no cache holds the line, OR we are waiting for memory before sending
+    // the first response, the Directory MUST hold exactly 100% of the tokens.
+    if (state == State:I || state == State:CS_W || state == State:CE_W || state == State:GS_W || state == State:GE_W) {
+      assert(dir_entry.TokensSec0 == (max_tokens() / 2));
+      assert(dir_entry.TokensSec1 == (max_tokens() / 2));
+    }
+
+    // INVARIANT B: Stable Exclusive
+    // If a domain has stable exclusive write access, the Directory MUST hold 0 tokens.
+    if (state == State:CE || state == State:GE || state == State:CE_W_DataOnly || state == State:GE_W_DataOnly) {
+      assert(dir_entry.TokensSec0 == 0);
+      assert(dir_entry.TokensSec1 == 0);
+    }
+
+    // INVARIANT C: Shared & In-Flight Upgrades
+    // If the line is shared, the Directory must have given away at least 1 token.
+    if (state == State:CS || state == State:GS || state == State:CGS || state == State:CGS_W) {
+      assert((dir_entry.TokensSec0 < (max_tokens() / 2)) ||
+             (dir_entry.TokensSec1 < (max_tokens() / 2)));
     }
   }
 
@@ -531,15 +576,22 @@ machine(MachineType:Directory, "Token protocol")
       peek(requestNetwork_in, RequestMsg) {
         assert(in_msg.Destination.isElement(machineID));
 
+        // --- DOMAIN-AWARE EVENT SPLITTING ---
         if (in_msg.Type == CoherenceRequestType:GETS) {
-            // CRITICAL FIX: Trust the L1's flag explicitly!
             if (in_msg.is_owner_pull) {
+                // Intercept Owner Pulls here!
                 trigger(Event:GETS_Owner_Pull, in_msg.addr, TBEs[in_msg.addr]);
+            } else if (is_cpu_domain(in_msg.Requestor)) {
+                trigger(Event:CPU_GETS, in_msg.addr, TBEs[in_msg.addr]);
             } else {
-                trigger(Event:GETS, in_msg.addr, TBEs[in_msg.addr]);
+                trigger(Event:GPU_GETS, in_msg.addr, TBEs[in_msg.addr]);
             }
         } else if (in_msg.Type == CoherenceRequestType:GETX) {
-            trigger(Event:GETX, in_msg.addr, TBEs[in_msg.addr]);
+            if (is_cpu_domain(in_msg.Requestor)) {
+                trigger(Event:CPU_GETX, in_msg.addr, TBEs[in_msg.addr]);
+            } else {
+                trigger(Event:GPU_GETX, in_msg.addr, TBEs[in_msg.addr]);
+            }
         } else {
             error("Invalid message");
         }
@@ -810,7 +862,7 @@ machine(MachineType:Directory, "Token protocol")
     enqueue(memQueue_out, MemoryMsg, to_memory_controller_latency) {
       out_msg.addr := address;
       out_msg.Type := MemoryRequestType:MEMORY_WB;
-      out_msg.Sender := tbe.DmaRequestor;
+      //out_msg.Sender := tbe.DmaRequestor;
       out_msg.OriginalRequestorMachId := tbe.OriginalRequestorMachId;
       out_msg.MessageSize := MessageSizeType:Writeback_Data;
       out_msg.DataBlk := tbe.DataBlk;
@@ -840,14 +892,9 @@ machine(MachineType:Directory, "Token protocol")
       tbe.DataBlk := in_msg.DataBlk;
       tbe.PhysicalAddress := in_msg.PhysicalAddress;
       tbe.Len := in_msg.Len;
-      tbe.DmaRequestor := in_msg.Requestor;
+      //tbe.DmaRequestor := in_msg.Requestor;
       tbe.WentPersistent := false;
     }
-  }
-
-  action(s_deallocateTBE, "s", desc="Deallocate TBE") {
-    TBEs.deallocate(address);
-    unset_tbe();
   }
 
   action(rd_recordDataInTbe, "rd", desc="Record data in TBE") {
@@ -928,7 +975,7 @@ machine(MachineType:Directory, "Token protocol")
       out_msg.PhysicalAddress := address;
       out_msg.LineAddress := address;
       out_msg.Type := DMAResponseType:ACK;
-      out_msg.Destination.add(tbe.DmaRequestor);
+      //out_msg.Destination.add(tbe.DmaRequestor);
       out_msg.MessageSize := MessageSizeType:Writeback_Control;
     }
   }
@@ -944,7 +991,7 @@ machine(MachineType:Directory, "Token protocol")
         // split it up if need be
         //
         out_msg.DataBlk := in_msg.DataBlk;
-        out_msg.Destination.add(tbe.DmaRequestor);
+        //out_msg.Destination.add(tbe.DmaRequestor);
         out_msg.MessageSize := MessageSizeType:Response_Data;
       }
     }
@@ -961,7 +1008,7 @@ machine(MachineType:Directory, "Token protocol")
         // split it up if need be
         //
         out_msg.DataBlk := in_msg.DataBlk;
-        out_msg.Destination.add(tbe.DmaRequestor);
+        //out_msg.Destination.add(tbe.DmaRequestor);
         out_msg.MessageSize := MessageSizeType:Response_Data;
       }
     }
@@ -1038,7 +1085,7 @@ action(d_sendMemoryDataWithoutTokens, "d_nt", desc="Send requested sector data w
       out_msg.LineAddress := address;
       out_msg.Type := DMAResponseType:DATA;
       out_msg.DataBlk := tbe.DataBlk;
-      out_msg.Destination.add(tbe.DmaRequestor);
+      //out_msg.Destination.add(tbe.DmaRequestor);
       out_msg.MessageSize := MessageSizeType:Response_Data;
     }
   }
@@ -1105,227 +1152,825 @@ action(d_sendMemoryDataWithoutTokens, "d_nt", desc="Send requested sector data w
     triggerQueue_in.dequeue(clockEdge());
   }
 
+  // ====================================================================
+  // PHASE 1 ACTIONS: METADATA & LOCALITY ROUTING
+  // ====================================================================
+
+  // Action to save the requestor ID into the TBE (Call this first in your transition)
+  //action(st_saveRequestor, "stsr", desc="Save requestor in TBE") {
+  //  assert(is_valid(tbe));
+  //  tbe.last_requestor := tbe.last_requestor;
+  //}
+
+  // ====================================================================
+  // PHASE 1 ACTIONS: METADATA & LOCALITY ROUTING
+  // ====================================================================
+
+  action(u_set_cpu_shared, "scs", desc="Set CPU shared metadata") {
+    MachineID requestor;
+    if (is_valid(tbe)) {
+      requestor := tbe.last_requestor;
+    } else {
+      peek(requestNetwork_in, RequestMsg) { requestor := in_msg.Requestor; }
+    }
+    getDirectoryEntry(address).cpu_shared := true;
+    getDirectoryEntry(address).last_cpu_owner := requestor;
+  }
+
+  action(u_set_gpu_shared, "sgs", desc="Set GPU shared metadata") {
+    MachineID requestor;
+    if (is_valid(tbe)) {
+      requestor := tbe.last_requestor;
+    } else {
+      peek(requestNetwork_in, RequestMsg) { requestor := in_msg.Requestor; }
+    }
+    getDirectoryEntry(address).gpu_shared := true;
+    getDirectoryEntry(address).last_gpu_owner := requestor;
+  }
+
+  action(u_set_cpu_exclusive, "sce", desc="Set CPU exclusive metadata") {
+    MachineID requestor;
+    if (is_valid(tbe)) {
+      requestor := tbe.last_requestor;
+    } else {
+      peek(requestNetwork_in, RequestMsg) { requestor := in_msg.Requestor; }
+    }
+    getDirectoryEntry(address).cpu_shared := true;
+    getDirectoryEntry(address).cpu_dirty  := true;
+    getDirectoryEntry(address).gpu_shared := false;
+    getDirectoryEntry(address).gpu_dirty  := false;
+    getDirectoryEntry(address).last_cpu_owner := requestor;
+  }
+
+  action(u_set_gpu_exclusive, "sge", desc="Set GPU exclusive metadata") {
+    MachineID requestor;
+    if (is_valid(tbe)) {
+      requestor := tbe.last_requestor;
+    } else {
+      peek(requestNetwork_in, RequestMsg) { requestor := in_msg.Requestor; }
+    }
+    getDirectoryEntry(address).gpu_shared := true;
+    getDirectoryEntry(address).gpu_dirty  := true;
+    getDirectoryEntry(address).cpu_shared := false;
+    getDirectoryEntry(address).cpu_dirty  := false;
+    getDirectoryEntry(address).last_gpu_owner := requestor;
+  }
+
+  action(a_fwd_gets_locality_aware, "fwdS", desc="Locality-aware GETS routing") {
+    assert(is_valid(tbe));
+    Entry e := getDirectoryEntry(address);
+    bool from_cpu := is_cpu_domain(tbe.last_requestor);
+
+    if (from_cpu) {
+      if (!e.gpu_shared && !e.gpu_dirty) {
+        // FAST PATH: GPU doesn't have it.
+        // FIX: Using responseNetwork_out (your defined port)
+        enqueue(responseNetwork_out, ResponseMsg, to_memory_controller_latency) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceResponseType:DATA_SHARED;
+          out_msg.Sender := machineID;
+          out_msg.Destination.add(tbe.last_requestor);
+          out_msg.TokensSec0 := (max_tokens() / 2);
+          out_msg.TokensSec1 := (max_tokens() / 2);
+          out_msg.MessageSize := MessageSizeType:Response_Data;
+          out_msg.DataBlk := e.DataBlk;
+        }
+      } else if (e.gpu_dirty) {
+        // GPU holds modified data.
+        // FIX: Using requestNetwork_out (your defined port for forwards)
+        enqueue(requestNetwork_out, RequestMsg, directory_latency) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceRequestType:GETS;
+          out_msg.Requestor := tbe.last_requestor;
+          out_msg.Destination.add(e.last_gpu_owner);
+          out_msg.MessageSize := MessageSizeType:Forwarded_Control;
+          out_msg.is_owner_pull := false;
+        }
+      }
+    } else {
+      // SYMMETRIC GPU LOGIC
+      if (!e.cpu_shared && !e.cpu_dirty) {
+        // FAST PATH: Stay in GPU domain.
+        // FIX: Using responseNetwork_out
+        enqueue(responseNetwork_out, ResponseMsg, to_memory_controller_latency) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceResponseType:DATA_SHARED;
+          out_msg.Sender := machineID;
+          out_msg.Destination.add(tbe.last_requestor);
+          out_msg.TokensSec0 := (max_tokens() / 2);
+          out_msg.TokensSec1 := (max_tokens() / 2);
+          out_msg.MessageSize := MessageSizeType:Response_Data;
+          out_msg.DataBlk := e.DataBlk;
+        }
+      } else if (e.cpu_dirty) {
+        // FIX: Using requestNetwork_out
+        enqueue(requestNetwork_out, RequestMsg, directory_latency) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceRequestType:GETS;
+          out_msg.Requestor := tbe.last_requestor;
+          out_msg.Destination.add(e.last_cpu_owner);
+          out_msg.MessageSize := MessageSizeType:Forwarded_Control;
+          out_msg.is_owner_pull := false;
+        }
+      }
+    }
+  }
+
+action(a_inv_remote_domain_on_getx, "invR", desc="Invalidate remote domain on upgrade") {
+    assert(is_valid(tbe));
+    Entry e := getDirectoryEntry(address);
+    bool from_cpu := is_cpu_domain(tbe.last_requestor);
+
+    if (from_cpu && e.gpu_shared) {
+        enqueue(requestNetwork_out, RequestMsg, directory_latency) {
+            out_msg.addr := address;
+            // Use GETX as the token-reclaim/invalidation signal
+            out_msg.Type := CoherenceRequestType:GETX;
+            out_msg.Requestor := tbe.last_requestor;
+            out_msg.Destination.add(e.last_gpu_owner);
+            out_msg.MessageSize := MessageSizeType:Forwarded_Control;
+
+            // Ensure AMTC metadata is set for a full-line invalidate
+            out_msg.sector_mask := amtc_fullMask();
+            out_msg.requested_sector_mask := amtc_fullMask();
+        }
+    } else if (!from_cpu && e.cpu_shared) {
+        enqueue(requestNetwork_out, RequestMsg, directory_latency) {
+            out_msg.addr := address;
+            out_msg.Type := CoherenceRequestType:GETX;
+            out_msg.Requestor := tbe.last_requestor;
+            out_msg.Destination.add(e.last_cpu_owner);
+            out_msg.MessageSize := MessageSizeType:Forwarded_Control;
+
+            out_msg.sector_mask := amtc_fullMask();
+            out_msg.requested_sector_mask := amtc_fullMask();
+        }
+    }
+  }
+
+// --- TBE MANAGEMENT ---
+  action(v_allocateTBE, "v", desc="Allocate TBE on transient entry") {
+    peek(requestNetwork_in, RequestMsg) {
+      if (is_invalid(tbe)) {
+        TBEs.allocate(address);
+        set_tbe(TBEs[address]);
+        tbe.last_requestor := in_msg.Requestor;
+      }
+    }
+  }
+
+  action(s_deallocateTBE, "s", desc="Deallocate TBE on stable entry") {
+    TBEs.deallocate(address);
+    unset_tbe();
+  }
+
+  action(d_send_mem_and_1_token_cpu, "s1c", desc="Send memory and 1 token to CPU") {
+    peek(memQueue_in, MemoryMsg) {
+      assert(getDirectoryEntry(address).TokensSec0 >= 1);
+      getDirectoryEntry(address).DataBlk := in_msg.DataBlk;
+
+      enqueue(responseNetwork_out, ResponseMsg, to_memory_controller_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA_SHARED;
+
+        out_msg.Sender := machineID; // <--- ADD THIS LINE
+
+        out_msg.Destination.add(tbe.last_requestor);
+        out_msg.DataBlk := in_msg.DataBlk;
+        out_msg.TokensSec0 := 1;
+        out_msg.TokensSec1 := 1;
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+        out_msg.sector_mask := amtc_fullMask();
+        out_msg.requested_sector_mask := amtc_fullMask();
+        out_msg.token_sector_mask := amtc_fullMask();
+        out_msg.valid_sector_mask := amtc_fullMask();
+      }
+      getDirectoryEntry(address).TokensSec0 := getDirectoryEntry(address).TokensSec0 - 1;
+      getDirectoryEntry(address).TokensSec1 := getDirectoryEntry(address).TokensSec1 - 1;
+    }
+  }
+
+  action(d_send_mem_and_all_tokens_cpu, "sac", desc="Send memory and ALL tokens to CPU") {
+    peek(memQueue_in, MemoryMsg) {
+      Entry dir_entry := getDirectoryEntry(address);
+      getDirectoryEntry(address).DataBlk := in_msg.DataBlk;
+
+      enqueue(responseNetwork_out, ResponseMsg, to_memory_controller_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA_OWNER;
+
+        out_msg.Sender := machineID; // <--- ADD THIS LINE
+
+        out_msg.Destination.add(tbe.last_requestor);
+        out_msg.DataBlk := in_msg.DataBlk;
+        out_msg.TokensSec0 := dir_entry.TokensSec0;
+        out_msg.TokensSec1 := dir_entry.TokensSec1;
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+        out_msg.sector_mask := amtc_fullMask();
+        out_msg.requested_sector_mask := amtc_fullMask();
+        out_msg.token_sector_mask := amtc_fullMask();
+        out_msg.valid_sector_mask := amtc_fullMask();
+      }
+      dir_entry.TokensSec0 := 0;
+      dir_entry.TokensSec1 := 0;
+    }
+  }
+
+  action(fwd_req_to_gpu, "fr2g", desc="Forward request to GPU Owner") {
+    peek(requestNetwork_in, RequestMsg) {
+      // Anti-Loop Check
+      if (getDirectoryEntry(address).last_gpu_owner != in_msg.Requestor) {
+        enqueue(requestNetwork_out, RequestMsg, directory_latency) {
+          out_msg.addr := address;
+          out_msg.Type := in_msg.Type; // Preserve exact type
+          out_msg.Requestor := in_msg.Requestor;
+          out_msg.Destination.add(getDirectoryEntry(address).last_gpu_owner);
+          out_msg.MessageSize := MessageSizeType:Forwarded_Control;
+          out_msg.is_owner_pull := false;
+        }
+      }
+    }
+  }
+
+
+  action(fwd_inv_to_gpu, "fi2g", desc="Forward Invalidations to GPU sharers") {
+    peek(requestNetwork_in, RequestMsg) {
+      enqueue(requestNetwork_out, RequestMsg, directory_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:GETX;
+        out_msg.Requestor := in_msg.Requestor;
+        out_msg.Destination.add(getDirectoryEntry(address).last_gpu_owner);
+        out_msg.MessageSize := MessageSizeType:Forwarded_Control;
+        out_msg.sector_mask := amtc_fullMask();
+        out_msg.requested_sector_mask := amtc_fullMask();
+        out_msg.is_owner_pull := false;
+      }
+    }
+  }
+
+  action(fwd_inv_to_cpu, "fi2c", desc="Forward Invalidations to CPU sharers") {
+    peek(requestNetwork_in, RequestMsg) {
+      enqueue(requestNetwork_out, RequestMsg, directory_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:GETX;
+        out_msg.Requestor := in_msg.Requestor;
+        out_msg.Destination.add(getDirectoryEntry(address).last_cpu_owner);
+        out_msg.MessageSize := MessageSizeType:Forwarded_Control;
+        out_msg.sector_mask := amtc_fullMask();
+        out_msg.requested_sector_mask := amtc_fullMask();
+        out_msg.is_owner_pull := false;
+      }
+    }
+  }
+
+  action(d_send_mem_and_1_token_gpu, "s1g", desc="Send memory and 1 token to GPU") {
+    peek(memQueue_in, MemoryMsg) {
+      assert(getDirectoryEntry(address).TokensSec0 >= 1);
+
+      enqueue(responseNetwork_out, ResponseMsg, to_memory_controller_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA_SHARED;
+        out_msg.Destination.add(tbe.last_requestor);
+        out_msg.DataBlk := in_msg.DataBlk;
+        out_msg.TokensSec0 := 1;
+        out_msg.TokensSec1 := 1;
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+        out_msg.sector_mask := amtc_fullMask();
+        out_msg.requested_sector_mask := amtc_fullMask();
+        out_msg.token_sector_mask := amtc_fullMask();
+        out_msg.valid_sector_mask := amtc_fullMask();
+      }
+      getDirectoryEntry(address).TokensSec0 := getDirectoryEntry(address).TokensSec0 - 1;
+      getDirectoryEntry(address).TokensSec1 := getDirectoryEntry(address).TokensSec1 - 1;
+    }
+  }
+
+  action(d_send_mem_and_all_tokens_gpu, "sag", desc="Send memory and ALL tokens to GPU") {
+    peek(memQueue_in, MemoryMsg) {
+      Entry dir_entry := getDirectoryEntry(address);
+
+      enqueue(responseNetwork_out, ResponseMsg, to_memory_controller_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA_OWNER;
+        out_msg.Destination.add(tbe.last_requestor);
+        out_msg.DataBlk := in_msg.DataBlk;
+        out_msg.TokensSec0 := dir_entry.TokensSec0;
+        out_msg.TokensSec1 := dir_entry.TokensSec1;
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+        out_msg.sector_mask := amtc_fullMask();
+        out_msg.requested_sector_mask := amtc_fullMask();
+        out_msg.token_sector_mask := amtc_fullMask();
+        out_msg.valid_sector_mask := amtc_fullMask();
+      }
+      dir_entry.TokensSec0 := 0;
+      dir_entry.TokensSec1 := 0;
+    }
+  }
+
+  // --- UPGRADE TOKEN RELEASES ---
+
+  action(d_send_remaining_tokens_cpu, "src", desc="Give remaining tokens to CPU for upgrade") {
+    peek(requestNetwork_in, RequestMsg) {
+      Entry dir_entry := getDirectoryEntry(address);
+      enqueue(responseNetwork_out, ResponseMsg, directory_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:ACK;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor); // Send directly to the requesting CPU
+        out_msg.TokensSec0 := dir_entry.TokensSec0;
+        out_msg.TokensSec1 := dir_entry.TokensSec1;
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+        out_msg.sector_mask := amtc_fullMask();
+        out_msg.requested_sector_mask := amtc_fullMask();
+        out_msg.token_sector_mask := amtc_fullMask();
+      }
+      dir_entry.TokensSec0 := 0;
+      dir_entry.TokensSec1 := 0;
+    }
+  }
+
+  action(d_send_remaining_tokens_gpu, "srg", desc="Give remaining tokens to GPU for upgrade/migration") {
+    peek(requestNetwork_in, RequestMsg) {
+      Entry dir_entry := getDirectoryEntry(address);
+      enqueue(responseNetwork_out, ResponseMsg, directory_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:ACK;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor); // Send directly to the requesting GPU
+        out_msg.TokensSec0 := dir_entry.TokensSec0;
+        out_msg.TokensSec1 := dir_entry.TokensSec1;
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+        out_msg.sector_mask := amtc_fullMask();
+        out_msg.requested_sector_mask := amtc_fullMask();
+        out_msg.token_sector_mask := amtc_fullMask();
+      }
+      dir_entry.TokensSec0 := 0;
+      dir_entry.TokensSec1 := 0;
+    }
+  }
+
+  // --- DIRECTORY-DIRECT REPLIES (For Shared States) ---
+
+  action(d_send_dir_data_and_1_token_cpu, "sdd1c", desc="Send Dir data and 1 token to CPU") {
+    peek(requestNetwork_in, RequestMsg) {
+      assert(getDirectoryEntry(address).TokensSec0 >= 1);
+      enqueue(responseNetwork_out, ResponseMsg, directory_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA_SHARED;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor); // Send straight back to requestor
+        out_msg.DataBlk := getDirectoryEntry(address).DataBlk; // Use Directory's saved copy
+        out_msg.TokensSec0 := 1;
+        out_msg.TokensSec1 := 1;
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+        out_msg.sector_mask := amtc_fullMask();
+        out_msg.requested_sector_mask := amtc_fullMask();
+        out_msg.token_sector_mask := amtc_fullMask();
+        out_msg.valid_sector_mask := amtc_fullMask();
+      }
+      getDirectoryEntry(address).TokensSec0 := getDirectoryEntry(address).TokensSec0 - 1;
+      getDirectoryEntry(address).TokensSec1 := getDirectoryEntry(address).TokensSec1 - 1;
+    }
+  }
+
+  action(d_send_dir_data_and_1_token_gpu, "sdd1g", desc="Send Dir data and 1 token to GPU") {
+    peek(requestNetwork_in, RequestMsg) {
+      assert(getDirectoryEntry(address).TokensSec0 >= 1);
+      enqueue(responseNetwork_out, ResponseMsg, directory_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA_SHARED;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.DataBlk := getDirectoryEntry(address).DataBlk;
+        out_msg.TokensSec0 := 1;
+        out_msg.TokensSec1 := 1;
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+        out_msg.sector_mask := amtc_fullMask();
+        out_msg.requested_sector_mask := amtc_fullMask();
+        out_msg.token_sector_mask := amtc_fullMask();
+        out_msg.valid_sector_mask := amtc_fullMask();
+      }
+      getDirectoryEntry(address).TokensSec0 := getDirectoryEntry(address).TokensSec0 - 1;
+      getDirectoryEntry(address).TokensSec1 := getDirectoryEntry(address).TokensSec1 - 1;
+    }
+  }
+
+  action(d_send_mem_data_only_cpu, "sdoc", desc="Send memory data only to CPU") {
+    peek(memQueue_in, MemoryMsg) {
+      enqueue(responseNetwork_out, ResponseMsg, to_memory_controller_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA_SHARED;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(tbe.last_requestor);
+        out_msg.DataBlk := in_msg.DataBlk;
+
+        // Zero Tokens Sent!
+        out_msg.TokensSec0 := 0;
+        out_msg.TokensSec1 := 0;
+
+        // Dynamic Sector Awareness Optimization
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+        out_msg.sector_mask := tbe.RequestedSectorMask;
+        out_msg.requested_sector_mask := tbe.RequestedSectorMask;
+        out_msg.token_sector_mask := 0;
+      }
+    }
+  }
+
+  action(d_send_mem_data_only_gpu, "sdog", desc="Send memory data only to GPU") {
+    peek(memQueue_in, MemoryMsg) {
+      enqueue(responseNetwork_out, ResponseMsg, to_memory_controller_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA_SHARED;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(tbe.last_requestor);
+        out_msg.DataBlk := in_msg.DataBlk;
+        out_msg.TokensSec0 := 0;
+        out_msg.TokensSec1 := 0;
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+        out_msg.sector_mask := tbe.RequestedSectorMask;
+        out_msg.requested_sector_mask := tbe.RequestedSectorMask;
+        out_msg.token_sector_mask := 0;
+      }
+    }
+  }
+
+  action(d_forward_tokens_to_cpu, "ft2c", desc="Forward loose tokens to the CPU Owner") {
+    peek(responseNetwork_in, ResponseMsg) {
+      if (in_msg.TokensSec0 > 0 || in_msg.TokensSec1 > 0) {
+        enqueue(responseNetwork_out, ResponseMsg, directory_latency) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceResponseType:ACK;
+          out_msg.Sender := machineID;
+          out_msg.Destination.add(getDirectoryEntry(address).last_cpu_owner);
+
+          // Blindly forward the tokens (No TBE access!)
+          out_msg.TokensSec0 := in_msg.TokensSec0;
+          out_msg.TokensSec1 := in_msg.TokensSec1;
+
+          out_msg.MessageSize := MessageSizeType:Response_Control;
+          out_msg.sector_mask := amtc_fullMask();
+          out_msg.requested_sector_mask := amtc_fullMask();
+          out_msg.token_sector_mask := in_msg.token_sector_mask;
+        }
+      }
+    }
+  }
+
+
+
+  // (Ensure your d_forward_tokens_to_gpu is updated to match this exactly!)
+
+  // NOTE: Apply the EXACT SAME logic to d_forward_tokens_to_gpu,
+  // just changing 'last_cpu_owner' to 'last_gpu_owner' in the enqueue block!
+
+  action(d_forward_tokens_to_gpu, "ft2g", desc="Forward loose tokens to the GPU Owner") {
+    peek(responseNetwork_in, ResponseMsg) {
+      // Only bother sending if there are actually tokens to send
+      if (in_msg.TokensSec0 > 0 || in_msg.TokensSec1 > 0) {
+        enqueue(responseNetwork_out, ResponseMsg, directory_latency) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceResponseType:ACK;
+          out_msg.Sender := machineID;
+
+          // CRITICAL DIFFERENCE: Route to GPU owner
+          out_msg.Destination.add(getDirectoryEntry(address).last_gpu_owner);
+
+          out_msg.TokensSec0 := in_msg.TokensSec0;
+          out_msg.TokensSec1 := in_msg.TokensSec1;
+
+          out_msg.MessageSize := MessageSizeType:Response_Control;
+          out_msg.sector_mask := amtc_fullMask();
+          out_msg.requested_sector_mask := amtc_fullMask();
+          out_msg.token_sector_mask := in_msg.token_sector_mask;
+        }
+      }
+    }
+  }
+
+  action(f_forwardRequestToSharers, "\f", desc="Forward request to the node with data") {
+    peek(requestNetwork_in, RequestMsg) {
+      // Enqueue the forwarded request onto the outgoing request network
+      enqueue(requestNetwork_out, RequestMsg, directory_latency) {
+        out_msg.addr := address;
+
+        // Pass the exact same request type along (GETS or GETS_Owner_Pull)
+        out_msg.Type := in_msg.Type;
+
+        // Keep the original requestor so the data goes straight to the L1
+        out_msg.Requestor := in_msg.Requestor;
+
+        // Route it to the cache that downgraded but kept the valid data
+        out_msg.Destination.add(getDirectoryEntry(address).last_cpu_owner);
+
+        out_msg.MessageSize := MessageSizeType:Request_Control;
+
+        // Forward the sector masks so the sharer knows exactly which bytes to send
+        out_msg.sector_id := in_msg.sector_id;
+        out_msg.sector_mask := in_msg.sector_mask;
+        out_msg.requested_sector_mask := in_msg.requested_sector_mask;
+        out_msg.is_owner_pull := in_msg.is_owner_pull;
+      }
+    }
+  }
+
   // ============================================================================
-  // TRANSITIONS FROM 'O' (Directory holds Tokens)
+  // NEW & MODIFIED ACTIONS
   // ============================================================================
 
-  // GETS (Read): Give 1 token per sector. Directory keeps the rest.
-  // Because Directory still holds tokens, it safely transitions to O_W.
-  transition(O, GETS,  O_W) {
-    a_sendTokens;
-    qf_queueMemoryFetchRequest;
-    j_popIncomingRequestQueue;
+  action(st_saveRequestor, "\st", desc="Save pending requestor") {
+    peek(requestNetwork_in, RequestMsg) {
+      TBEs.allocate(address);
+      set_tbe(TBEs[address]);
+      tbe.last_requestor := in_msg.Requestor;
+    }
   }
 
-  // GETX (Write): Give ALL tokens. Directory drops to 0 tokens.
-  // Because Directory now has 0 tokens, it MUST transition to NO_W.
-  transition(O, GETX, NO_W) {
-    a_sendTokens;
-    qf_queueMemoryFetchRequest;
-    j_popIncomingRequestQueue;
+  action(f_commitTransferredOwner, "\fcto", desc="Commit transferred ownership") {
+    Entry dir_entry := getDirectoryEntry(address);
+    dir_entry.last_cpu_owner := tbe.last_requestor;
+    dir_entry.cpu_shared := true;
+    dir_entry.cpu_dirty := true;
+    dir_entry.gpu_shared := false;
+    dir_entry.gpu_dirty := false;
+    TBEs.deallocate(address);
+    unset_tbe();
   }
 
-  // Owner Pull: Directory already gave tokens earlier, just fetch the data.
-  transition(O, GETS_Owner_Pull, O_W) {
-    qf_queueMemoryFetchRequest;
-    j_popIncomingRequestQueue;
+  action(fwd_req_to_cpu, "fr2c", desc="Forward request to CPU Owner") {
+    peek(requestNetwork_in, RequestMsg) {
+      if (getDirectoryEntry(address).last_cpu_owner != in_msg.Requestor &&
+          getDirectoryEntry(address).last_cpu_owner != machineID) {
+        enqueue(requestNetwork_out, RequestMsg, directory_latency) {
+          out_msg.addr := address;
+          out_msg.Type := in_msg.Type;
+          out_msg.Requestor := in_msg.Requestor;
+          out_msg.Destination.add(getDirectoryEntry(address).last_cpu_owner);
+          out_msg.MessageSize := MessageSizeType:Forwarded_Control;
+          out_msg.is_owner_pull := false;
+        }
+      } else {
+        // ALWAYS respond with ACK_OWNER to prevent sequencer deadlock
+        enqueue(responseNetwork_out, ResponseMsg, directory_latency) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceResponseType:ACK_OWNER;
+          out_msg.Sender := machineID;
+          out_msg.Destination.add(in_msg.Requestor);
+          out_msg.MessageSize := MessageSizeType:Response_Control;
+          out_msg.TokensSec0 := 0;
+          out_msg.TokensSec1 := 0;
+          out_msg.sector_mask := amtc_fullMask();
+          out_msg.requested_sector_mask := amtc_fullMask();
+          out_msg.token_sector_mask := 0;
+          out_msg.valid_sector_mask := 0;
+        }
+      }
+    }
   }
 
-  transition(O, {Tokens, Data_Owner }) {
-    f_incrementTokens;
-    k_popIncomingResponseQueue;
-  }
 
   // ============================================================================
-  // TRANSITIONS FROM 'NO' (Directory has 0 Tokens)
+  // PHASE 1: MEMORY DATA RESOLUTION FOR DOMAIN STATES
   // ============================================================================
 
-  // GETX or normal GETS: We have 0 tokens to give, just fetch the data.
-  transition(NO, {GETS, GETX}, NO_W) {
-    a_sendTokens;               // Will safely send 0 and do nothing
-    qf_queueMemoryFetchRequest;
-    j_popIncomingRequestQueue;
-  }
-
-  // Owner Pull: Special data-only fetch path
-  transition(NO, GETS_Owner_Pull, NO_W_DataOnly) {
-    qf_queueMemoryFetchRequest;
-    j_popIncomingRequestQueue;
-  }
-
-  transition(NO, Ack_Owner, O) {
-    f_incrementTokens;
-    k_popIncomingResponseQueue;
-  }
-
-  transition(NO, Tokens) {
-      f_incrementTokens;
-      k_popIncomingResponseQueue;
-  }
-
-  transition(NO, Data_Owner) {
-      f_incrementTokens;
-      rd_recordDataInTbe;
-      k_popIncomingResponseQueue;
-  }
-
-  // -------------------------------------------------------------------------
-  // THE ACCUMULATOR: Loop silently in this state as responses arrive
-  // -------------------------------------------------------------------------
-// Receives BOTH data payload and tokens
-  transition(NO_DW_ACCUM, Data_Owner) {
-    f_incrementTokens;
-    rd_recordDataInTbe;         // Safe: Data_Owner carries a DataBlk
-    rb_recordReceivedSectors;   // Safe: Data_Owner carries sector masks
-    rt_recordTokenSectors;
-    ccw_checkWriteCompletion;   // Will enqueue Write_Complete if true
-    k_popIncomingResponseQueue;
-  }
-
-  // Receives ONLY tokens (no data payload)
-  transition(NO_DW_ACCUM, Tokens) {
-    f_incrementTokens;
-    rt_recordTokenSectors;      // Safe: Tokens message carries token masks
-    ccw_checkWriteCompletion;   // Will enqueue Write_Complete if true
-    k_popIncomingResponseQueue;
-  }
-
-  // -------------------------------------------------------------------------
-  // THE EXIT: Transition only occurs when all requirements are met
-  // -------------------------------------------------------------------------
-  transition(NO_DW_ACCUM, Write_Complete, O_DW_W) {
-    l_writeTbeDataToMemory;
-    tq_popTriggerQueue;
-  }
-
-  transition(O_DW_W, Memory_Ack, NO) {
-    da_sendDmaAck;
-    ut_unsetReissueTimer;
-    s_deallocateTBE;
-    l_popMemQueue;
-    qw_wakeUpDependents;
-  }
-
-  // ============================================================================
-  // MEMORY DATA RESOLUTION (Unblocking the waiting states)
-  // ============================================================================
-
-  // Return to O
-  // If it's just a writeback acknowledgment, just pop the queue.
-  transition(O_W, Memory_Ack, O) {
-    l_popMemQueue;
-    qw_wakeUpDependents;
-  }
-
-  // CRITICAL FIX: If it's actual data from DRAM, send it to the L1!
-  transition(O_W, Memory_Data, O) {
-    d_sendMemoryDataWithoutTokens; // <--- The action that actually sends the payload
-    l_popMemQueue;
-    qw_wakeUpDependents;
-  }
-
-  // Return to NO (Tokens were sent via ACK)
-  transition(NO_W, Memory_Data, NO) {
-    d_sendMemoryDataOwnerResponse;
-    l_popMemQueue;
-    qw_wakeUpDependents;
-  }
-
-  // Return to NO (Data Only, no tokens to send)
-  transition(NO_W_DataOnly, Memory_Data, NO) {
+  // When memory returns data for a CPU Shared request
+  transition(CS, Memory_Data) {
+    // Send data to the CPU requester (saved in TBE)
     d_sendMemoryDataWithoutTokens;
     l_popMemQueue;
     qw_wakeUpDependents;
   }
 
-  // ============================================================================
-  // DMA / PERSISTENT REQUESTS
-  // ============================================================================
-
-  transition(O, DMA_WRITE, O_DW) {
-    vd_allocateDmaRequestInTBE;
-    bw_broadcastWrite;
-    st_scheduleTimeout;
-    p_popDmaRequestQueue;
-  }
-
-  transition(O, DMA_READ, O_DR_W) {
-    vd_allocateDmaRequestInTBE;
-    fd_memoryDma;
-    st_scheduleTimeout;
-    p_popDmaRequestQueue;
-  }
-
-  transition(NO, DMA_WRITE, NO_DW_ACCUM) {
-    vd_allocateDmaRequestInTBE;
-    bw_broadcastWrite;
-    st_scheduleTimeout;
-    p_popDmaRequestQueue;
-  }
-
-  transition(NO, DMA_READ, NO_DR_ACCUM) {
-    vd_allocateDmaRequestInTBE;
-    br_broadcastRead;
-    st_scheduleTimeout;
-    p_popDmaRequestQueue;
-  }
-
-  // DMA Wait State Resolutions
-  transition(O_DR_W, Memory_Data, O) {
-    dm_sendMemoryDataToDma;
-    ut_unsetReissueTimer;
-    s_deallocateTBE;
+  // When memory returns data for a GPU Shared request
+  transition(GS, Memory_Data) {
+    d_sendMemoryDataWithoutTokens;
     l_popMemQueue;
+    qw_wakeUpDependents;
   }
 
-  // Accumulate from Sharers or Owner
-  transition(NO_DR_ACCUM, {Data_Owner, Data_Shared}) {
-    f_incrementTokens;
-    rd_recordDataInTbe;
-    rb_recordReceivedSectors;
-    rt_recordTokenSectors;
-    crc_checkReadComplete;
-    k_popIncomingResponseQueue;
+  // When memory returns data for a joint Shared request
+  transition(CGS, Memory_Data) {
+    d_sendMemoryDataWithoutTokens;
+    l_popMemQueue;
+    qw_wakeUpDependents;
   }
 
-  transition(NO_DR_ACCUM, Tokens) {
-    f_incrementTokens;
-    rt_recordTokenSectors;
-    crc_checkReadComplete;
-    k_popIncomingResponseQueue;
+  // When memory returns data for an Exclusive request (CE/GE)
+  // Note: These usually need to send tokens along with the data
+  transition(CE, Memory_Data) {
+    // If the request was a GETX, we use the OwnerResponse to send tokens
+    d_sendMemoryDataOwnerResponse;
+    l_popMemQueue;
+    qw_wakeUpDependents;
   }
 
-  transition(NO_DR_ACCUM, Read_Complete, O_DR_W) {
-    dt_sendTbeDataToDma;
-    lt_queueTbeWritebackToMemory;
-    tq_popTriggerQueue;
-  }
-
-  transition(O_DR_W, Memory_Ack, O) {
-    ut_unsetReissueTimer;
-    s_deallocateTBE;
+  transition(GE, Memory_Data) {
+    d_sendMemoryDataOwnerResponse;
     l_popMemQueue;
     qw_wakeUpDependents;
   }
 
   // ============================================================================
-  // BLOCKED STATES (Safely recycle requests while DRAM is fetching)
+  // 1. INITIALIZATION (From Invalid)
+  // ============================================================================
+  transition(I, CPU_GETS, CS_W) { v_allocateTBE; qf_queueMemoryFetchRequest; j_popIncomingRequestQueue; }
+  transition(I, GPU_GETS, GS_W) { v_allocateTBE; qf_queueMemoryFetchRequest; j_popIncomingRequestQueue; }
+  transition(I, CPU_GETX, CE_W) { v_allocateTBE; qf_queueMemoryFetchRequest; j_popIncomingRequestQueue; }
+  transition(I, GPU_GETX, GE_W) { v_allocateTBE; qf_queueMemoryFetchRequest; j_popIncomingRequestQueue; }
+
+
+  // Memory Returns for Initialization
+  transition(CS_W, Memory_Data, CS) { d_send_mem_and_1_token_cpu; u_set_cpu_shared; s_deallocateTBE; l_popMemQueue; qw_wakeUpDependents; }
+  transition(CE_W, Memory_Data, CE) { d_send_mem_and_all_tokens_cpu; u_set_cpu_exclusive; s_deallocateTBE; l_popMemQueue; qw_wakeUpDependents; }
+  // (Symmetric Memory_Data transitions for GS_W -> GS, GE_W -> GE)
+
+  // ============================================================================
+  // 2. CPU SHARED (CS)
+  // ============================================================================
+  transition(CS, CPU_GETS) {
+    // Directory holds tokens and data. Reply directly.
+    d_send_dir_data_and_1_token_cpu; u_set_cpu_shared; j_popIncomingRequestQueue;
+  }
+  transition(CS, GPU_GETS, CGS) {
+    // Cross-domain: Directory already has the data! No need to fetch from memory.
+    d_send_dir_data_and_1_token_gpu; u_set_gpu_shared; j_popIncomingRequestQueue;
+  }
+  transition(CS, CPU_GETX, CE) {
+    d_send_remaining_tokens_cpu; u_set_cpu_exclusive; j_popIncomingRequestQueue;
+  }
+  transition(CS, GPU_GETX, MIG_C2G) {
+    v_allocateTBE; fwd_inv_to_cpu; j_popIncomingRequestQueue;
+  }
+
+  transition(CGS_W, Memory_Data, CGS) {
+    // Fulfill the GPU's request to join the shared state
+    d_send_mem_and_1_token_gpu; u_set_gpu_shared; s_deallocateTBE; l_popMemQueue; qw_wakeUpDependents;
+  }
+
+  // ============================================================================
+  // CE → CE_XFER → CE TRANSITIONS
   // ============================================================================
 
-  transition({NO_W, O_W, L_O_W, L_NO_W, DR_L_W, DW_L_W, O_DW_W, O_DR_W, O_DW, NO_DW, NO_DR, NO_W_DataOnly}, {GETX, GETS, GETS_Owner_Pull}) {
+  transition(CE, CPU_GETX, CE_XFER) {
+    st_saveRequestor;
+    fwd_req_to_cpu;
+    j_popIncomingRequestQueue;
+  }
+
+  transition(CE_XFER, Data_Owner, CE) {
+    f_commitTransferredOwner;
+    k_popIncomingResponseQueue;
+  }
+
+  transition(CE_XFER, Ack_Owner, CE) {
+    f_commitTransferredOwner;
+    k_popIncomingResponseQueue;
+  }
+
+  // ============================================================================
+  // 3. CPU+GPU SHARED (CGS)
+  // ============================================================================
+  transition(GS, GPU_GETS) {
+    d_send_dir_data_and_1_token_gpu; u_set_gpu_shared; j_popIncomingRequestQueue;
+  }
+  transition(GS, CPU_GETS, CGS) {
+    d_send_dir_data_and_1_token_cpu; u_set_cpu_shared; j_popIncomingRequestQueue;
+  }
+
+  transition(CGS, CPU_GETS) {
+    d_send_dir_data_and_1_token_cpu; j_popIncomingRequestQueue;
+  }
+  transition(CGS, GPU_GETS) {
+    d_send_dir_data_and_1_token_gpu; j_popIncomingRequestQueue;
+  }
+
+  transition(CGS, CPU_GETX, CGS_CPU_UPG) {
+    v_allocateTBE; fwd_inv_to_gpu; j_popIncomingRequestQueue;
+  }
+  transition(CGS_CPU_UPG, Tokens_Ack, CE) {
+    // Upgrade complete when GPU returns its tokens
+    f_incrementTokens; d_send_remaining_tokens_cpu; u_set_cpu_exclusive; s_deallocateTBE; k_popIncomingResponseQueue; qw_wakeUpDependents;
+  }
+
+  // ============================================================================
+  // 4. CPU EXCLUSIVE (CE)
+  // ============================================================================
+  transition(CE, CPU_GETS) { fwd_req_to_cpu; j_popIncomingRequestQueue; }
+
+  // FIX: Forward the GETX safely, and update the Directory's owner record
+  //transition(CE, CPU_GETX) { fwd_req_to_cpu; u_set_cpu_exclusive; j_popIncomingRequestQueue; }
+
+  transition(CE, GPU_GETS, CGS) {
+    fwd_req_to_cpu; u_set_gpu_shared; j_popIncomingRequestQueue;
+  }
+  transition(CE, GPU_GETX, MIG_C2G) {
+    v_allocateTBE; fwd_inv_to_cpu; j_popIncomingRequestQueue;
+  }
+
+  transition(MIG_C2G, Tokens_Ack, GE) {
+    f_incrementTokens; d_send_remaining_tokens_gpu; u_set_gpu_exclusive; s_deallocateTBE; k_popIncomingResponseQueue; qw_wakeUpDependents;
+  }
+
+  // ============================================================================
+  // 5. GPU EXCLUSIVE (GE)
+  // ============================================================================
+  transition(GE, GPU_GETS) { fwd_req_to_gpu; j_popIncomingRequestQueue; }
+
+  // FIX: Safe forward and update owner
+  transition(GE, GPU_GETX) { fwd_req_to_gpu; u_set_gpu_exclusive; j_popIncomingRequestQueue; }
+
+  transition(GE, CPU_GETS, CGS) {
+    fwd_req_to_gpu; u_set_cpu_shared; j_popIncomingRequestQueue;
+  }
+  transition(GE, CPU_GETX, MIG_G2C) {
+    v_allocateTBE; fwd_inv_to_gpu; j_popIncomingRequestQueue;
+  }
+
+//============================================================================
+  // 5. STALLS
+  // ============================================================================
+
+  // Stall all standard requests during memory waits, migrations, and transfers
+  transition({CS_W, GS_W, CE_W, GE_W, CGS_W, MIG_C2G, MIG_G2C, CGS_CPU_UPG, CGS_GPU_UPG, CE_XFER, GE_XFER}, {CPU_GETS, GPU_GETS, CPU_GETX, GPU_GETX, GETS_Owner_Pull}) {
     z_stallAndWaitRequest;
   }
 
-  transition({NO_W, O_W, L_O_W, L_NO_W, DR_L_W, DW_L_W, O_DW_W, O_DR_W, O_DW, NO_DW, NO_DR, L, DW_L, DR_L, NO_W_DataOnly}, {DMA_READ, DMA_WRITE }) {
-    y_stallAndWaitDmaRequest;
+  // CRITICAL FIX: Stall all requests (including retries) during Data-Only pulls
+  transition({CE_W_DataOnly, GE_W_DataOnly}, {CPU_GETS, GPU_GETS, CPU_GETX, GPU_GETX, GETS_Owner_Pull}) {
+    z_stallAndWaitRequest;
   }
 
-  transition({NO_W, O_W, L_O_W, L_NO_W, DR_L_W, DW_L_W, O_DW_W, O_DR_W, NO_W_DataOnly}, {Data_Owner, Ack_Owner, Tokens}) {
-    kz_stallAndWaitResponse;
+  // ============================================================================
+  // 2. CPU SHARED (CS)
+  // ============================================================================
+  // Handle normal reads AND owner pulls exactly the same way: reply with data
+  transition(CS, {GETS_Owner_Pull}) {
+    f_forwardRequestToSharers;
+    j_popIncomingRequestQueue;
   }
 
-  transition({O_DW_W, O_DR_W}, Request_Timeout) {
-    rs_resetScheduleTimeout;
+  // ============================================================================
+  // 3. GPU SHARED (GS)
+  // ============================================================================
+  transition(GS, {GETS_Owner_Pull}) {
+    d_send_dir_data_and_1_token_gpu;
+    u_set_gpu_shared;
+    j_popIncomingRequestQueue;
   }
+
+  // ============================================================================
+  // 4. CPU+GPU SHARED (CGS)
+  // ============================================================================
+  transition(CGS, {GETS_Owner_Pull}) {
+    d_send_dir_data_and_1_token_cpu;
+    j_popIncomingRequestQueue;
+  }
+
+  // Note: Since GETS_Owner_Pull doesn't distinguish between CPU and GPU in the event name,
+  // we route it based on the domain. We need a GPU variant for CGS.
+  // Assuming you have an event like GPU_GETS_Owner_Pull or you route it inside the in_port.
+  // If you only have one GETS_Owner_Pull event, you might need to handle it based on the
+  // requestor's domain inside the action or the in_port.
+
+  // Transitions for Owner Pulling partial data
+  transition(CE, GETS_Owner_Pull, CE_W_DataOnly) {
+    v_allocateTBE; qf_queueMemoryFetchRequest; j_popIncomingRequestQueue;
+  }
+  transition(GE, GETS_Owner_Pull, GE_W_DataOnly) {
+    v_allocateTBE; qf_queueMemoryFetchRequest; j_popIncomingRequestQueue;
+  }
+
+  // Resolution from Memory
+  transition(CE_W_DataOnly, Memory_Data, CE) {
+    d_send_mem_data_only_cpu; s_deallocateTBE; l_popMemQueue; qw_wakeUpDependents;
+  }
+  transition(GE_W_DataOnly, Memory_Data, GE) {
+    d_send_mem_data_only_gpu; s_deallocateTBE; l_popMemQueue; qw_wakeUpDependents;
+  }
+
+  transition(CE_W_DataOnly, Tokens) {
+    d_forward_tokens_to_cpu;
+    k_popIncomingResponseQueue;
+  }
+
+  transition(GE_W_DataOnly, Tokens) {
+    d_forward_tokens_to_gpu; // Assuming you made the symmetric GPU action
+    k_popIncomingResponseQueue;
+  }
+
+  // Inside your CE (CPU Exclusive) block:
+  transition(CE, Tokens) {
+    d_forward_tokens_to_cpu;
+    k_popIncomingResponseQueue; // Assuming 'j' is your action to pop the response network
+  }
+
+  // Inside your CS (CPU Shared) block:
+  // (In CS, the L1 is the active reader, so it should get the loose tokens to eventually upgrade)
+  transition(CS, Tokens) {
+    d_forward_tokens_to_cpu;
+    k_popIncomingResponseQueue;
+  }
+
+
 
 }

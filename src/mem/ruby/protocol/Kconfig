@@ -58,5 +58,8 @@ config RUBY_PROTOCOL_Garnet_standalone
 config RUBY_PROTOCOL_AMTC
     bool "AMTC"
     depends on RUBY
+config RUBY_PROTOCOL_APU_AMTC
+    bool "APU_AMTC"
+    depends on RUBY
 
 rsource "chi/Kconfig"

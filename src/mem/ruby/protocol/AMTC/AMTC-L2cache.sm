@@ -528,24 +528,29 @@ machine(MachineType:L2Cache, "Token protocol")
 
   in_port(L1requestNetwork_in, RequestMsg, L1RequestToL2Cache) {
     if (L1requestNetwork_in.isReady(clockEdge())) {
-      peek(L1requestNetwork_in, RequestMsg) {
+      peek(L1requestNetwork_in, RequestMsg, block_on="addr") {
         assert(in_msg.Destination.isElement(machineID));
         Entry cache_entry := getCacheEntry(in_msg.addr);
-
-        bool is_home_l2 := (mapAddressToMachine(in_msg.addr, MachineType:L2Cache) == machineID);
         State current_state := getState(cache_entry, in_msg.addr);
 
-        if (!is_home_l2 && (current_state == State:NP || current_state == State:I)) {
-            // We don't have the data, and we aren't the home bank. Drop the broadcast.
+        // --- DOMAIN-AWARE FILTERING ---
+        // Use machineIDToMachineType to extract the enum for comparison
+        bool from_gpu := (machineIDToMachineType(in_msg.Requestor) == MachineType:TCC ||
+                  machineIDToMachineType(in_msg.Requestor) == MachineType:TCP);
+
+        // If the request is from the GPU domain but the L2 is in an Invalid state,
+        // it means the CPU domain does not share this line. Drop it.
+        if (from_gpu && current_state == State:I) {
             L1requestNetwork_in.dequeue(clockEdge());
-        } else {
-            // We have the data, OR we are the home bank responsible for fetching it.
+        }
+        // --- END FILTERING ---
+        else {
             if (in_msg.Type == CoherenceRequestType:GETX) {
-              trigger(Event:L1_GETX, in_msg.addr, cache_entry);
+                trigger(Event:L1_GETX, in_msg.addr, cache_entry);
             } else if (in_msg.Type == CoherenceRequestType:GETS) {
                 trigger(Event:L1_GETS, in_msg.addr, cache_entry);
             } else {
-              error("Unexpected message");
+                error("Unexpected message");
             }
         }
       }
@@ -609,50 +614,65 @@ machine(MachineType:L2Cache, "Token protocol")
 
   // ACTIONS
 
-  action(a_broadcastLocalRequest, "a", desc="broadcast local request globally") {
+  action(a_broadcastLocalRequest, "a",
+       desc="Send request only to directory") {
 
     peek(L1requestNetwork_in, RequestMsg) {
 
-     // if this is a retry or no local sharers, broadcast normally
-        enqueue(globalRequestNetwork_out, RequestMsg, l2_request_latency) {
+        enqueue(globalRequestNetwork_out,
+                RequestMsg,
+                l2_request_latency) {
+
            out_msg.addr := in_msg.addr;
            out_msg.Type := in_msg.Type;
            out_msg.Requestor := in_msg.Requestor;
            out_msg.RetryNum := in_msg.RetryNum;
 
-           //
-           // If a statically shared L2 cache, then no other L2 caches can
-           // store the block
-           //
-           //out_msg.Destination.broadcast(MachineType:L2Cache);
-           //out_msg.Destination.addNetDest(getAllPertinentL2Banks(address));
-           //out_msg.Destination.remove(map_L1CacheMachId_to_L2Cache(address, in_msg.Requestor));
+           // =====================================================
+           // TEMP FIX:
+           // Disable recursive L2 broadcasts
+           // =====================================================
 
+           out_msg.Destination.add(
+               mapAddressToMachine(address,
+                                   MachineType:Directory));
 
-           out_msg.Destination.broadcast(MachineType:L2Cache);
-           out_msg.Destination.remove(machineID);
-           out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
-           out_msg.sector_id := in_msg.sector_id;
-           out_msg.sector_mask := amtc_normalizeMask(in_msg.sector_mask, in_msg.sector_id);
-           out_msg.requested_sector_mask := amtc_normalizeMask(in_msg.requested_sector_mask, in_msg.sector_id);
+           out_msg.sector_id :=
+               in_msg.sector_id;
+
+           out_msg.sector_mask :=
+               amtc_normalizeMask(
+                   in_msg.sector_mask,
+                   in_msg.sector_id);
+
+           out_msg.requested_sector_mask :=
+               amtc_normalizeMask(
+                   in_msg.requested_sector_mask,
+                   in_msg.sector_id);
+
            out_msg.is_gpu := in_msg.is_gpu;
            out_msg.is_sync := in_msg.is_sync;
            out_msg.is_bypass := in_msg.is_bypass;
            out_msg.is_atomic := in_msg.is_atomic;
            out_msg.is_signal := in_msg.is_signal;
            out_msg.merged_req := in_msg.merged_req;
-           DPRINTF(RubySlicc, "AMTC_L2_FORWARD_MASK addr=%#x sid=%d mask=%d req_mask=%d\n",
-                   address, out_msg.sector_id, out_msg.sector_mask, out_msg.requested_sector_mask);
-           out_msg.MessageSize := MessageSizeType:Request_Control;
+
+           out_msg.MessageSize :=
+               MessageSizeType:Request_Control;
+
            out_msg.AccessMode := in_msg.AccessMode;
            out_msg.Prefetch := in_msg.Prefetch;
-           out_msg.is_owner_pull := in_msg.is_owner_pull;
-        } //enqueue
-      // } // if
 
-         //profile_filter_action(0);
-    } // peek
-  } //action
+           // Never propagate stale owner pulls
+           out_msg.is_owner_pull := false;
+
+           DPRINTF(RubySlicc,
+                   "AMTC_L2_DIR_ONLY addr=%#x mask=%d\n",
+                   address,
+                   out_msg.sector_mask);
+        }
+    }
+}
 
 
   action(bb_bounceResponse, "\b", desc="Bounce tokens and data to memory") {
@@ -1072,7 +1092,7 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
            out_msg.is_atomic := in_msg.is_atomic;
            out_msg.is_signal := in_msg.is_signal;
            out_msg.merged_req := in_msg.merged_req;
-           out_msg.is_owner_pull := true;
+           out_msg.is_owner_pull := false ;
         }
       }
     }
@@ -1168,7 +1188,7 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
            out_msg.is_atomic := in_msg.is_atomic;
            out_msg.is_signal := in_msg.is_signal;
            out_msg.merged_req := in_msg.merged_req;
-           out_msg.is_owner_pull := true;
+           out_msg.is_owner_pull := false ;
         }
       }
 

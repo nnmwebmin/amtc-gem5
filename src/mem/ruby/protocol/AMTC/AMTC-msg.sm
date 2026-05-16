@@ -121,6 +121,9 @@ structure(RequestMsg, desc="...", interface="Message") {
     // No data in request messages
     return false;
   }
+   //these re status fields for GPU
+  bool isGLCSet, default="false", desc="Bypass L1 Cache";
+  bool isSLCSet, default="false", desc="Bypass L2 Cache";
 }
 
 
@@ -155,6 +158,10 @@ structure(ResponseMsg, desc="...", interface="Message") {
     // No check required since all messages are written.
     return testAndWrite(addr, DataBlk, pkt);
   }
+
+  //these re status fields for GPU
+  bool isGLCSet, default="false", desc="Bypass L1 Cache";
+  bool isSLCSet, default="false", desc="Bypass L2 Cache";
 }
 
 

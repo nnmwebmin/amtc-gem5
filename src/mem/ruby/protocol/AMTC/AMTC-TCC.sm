@@ -1,0 +1,854 @@
+/*
+ * Copyright (c) 2010-2015 Advanced Micro Devices, Inc.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ * this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from this
+ * software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *
+ * Author: Blake Hechtman
+ */
+
+machine(MachineType:TCC, "TCC Cache")
+ : CacheMemory * L2cache;
+   bool WB; /*is this cache Writeback?*/
+   Cycles l2_request_latency := 50;
+   Cycles l2_response_latency := 20;
+   Cycles glc_atomic_latency := 0;
+
+  // From the TCPs or SQCs
+  MessageBuffer * requestFromTCP, network="From", virtual_network="3", vnet_type="request";
+  MessageBuffer * L1RequestToL2Cache, network="From", virtual_network="1", vnet_type="request";
+
+
+  // To the Cores. TCC deals only with TCPs/SQCs.
+  MessageBuffer * responseToCore, network="To", virtual_network="3", vnet_type="response";
+  // From the NB
+  MessageBuffer * probeFromNB, network="From", virtual_network="0", vnet_type="request";
+  MessageBuffer * responseFromNB, network="From", virtual_network="2", vnet_type="response";
+  // To the NB
+  MessageBuffer * requestToNB, network="To", virtual_network="0", vnet_type="request";
+  MessageBuffer * responseToNB, network="To", virtual_network="2", vnet_type="response";
+  MessageBuffer * unblockToNB, network="To", virtual_network="4", vnet_type="unblock";
+
+  MessageBuffer * triggerQueue;
+
+{
+  // EVENTS
+  enumeration(Event, desc="AMTC TCC Events") {
+
+    // Requests (from TCP / L1)
+    GETS,            desc="Read request";
+    GETX,            desc="Write / atomic request";
+
+    // Responses (from Directory / Memory / L2)
+    Data,            desc="Data response (DATA_SHARED / DATA_OWNER)";
+    Ack,             desc="Completion / ACK";
+
+    // Internal cache behavior
+    L2_Repl,         desc="Cache replacement";
+    Flush,           desc="Writeback / flush handling";
+
+    // Optional (keep only if used)
+    Inv,             desc="Invalidate request";
+    Bypass,          desc="Bypass L2 (GPU/SLC path)";
+  }
+
+  // STATES
+  state_declaration(State, desc="TCC State", default="TCC_State_I") {
+    M, AccessPermission:Read_Write, desc="Modified(dirty cache only)";
+    W, AccessPermission:Read_Write, desc="Written(dirty cache only)";
+    V, AccessPermission:Read_Only,  desc="Valid";
+    I, AccessPermission:Invalid,    desc="Invalid";
+    IV, AccessPermission:Busy,      desc="Waiting for Data";
+    WI, AccessPermission:Busy,      desc="Waiting on Writethrough Ack";
+    WIB, AccessPermission:Busy,     desc="Waiting on Writethrough Ack; Will be Bypassed";
+    A, AccessPermission:Busy,       desc="Invalid waiting on atomici Data";
+  }
+
+  enumeration(RequestType, desc="To communicate stats from transitions to recordStats") {
+    DataArrayRead,    desc="Read the data array";
+    DataArrayWrite,   desc="Write the data array";
+    TagArrayRead,     desc="Read the data array";
+    TagArrayWrite,    desc="Write the data array";
+    AtomicALUOperation,  desc="Atomic ALU operation";
+  }
+
+
+  // STRUCTURES
+
+  structure(Entry, desc="...", interface="AbstractCacheEntry") {
+    State CacheState,           desc="cache state";
+    bool Dirty,                 desc="Is the data dirty (diff from memory?)";
+    DataBlock DataBlk,          desc="Data for the block";
+    WriteMask writeMask,        desc="Dirty byte mask";
+  }
+
+  structure(TBE, desc="...") {
+    State TBEState,                  desc="Transient state";
+    DataBlock DataBlk,               desc="data for the block";
+    bool Dirty,                      desc="Is the data dirty?";
+    bool Shared,                     desc="Victim hit by shared probe";
+    MachineID From,                  desc="Waiting for writeback from...";
+    NetDest Destination,             desc="Data destination";
+    int numPending,                  desc="num pending requests";
+    int numPendingDirectoryAtomics,  desc="number of pending atomics to be performed in directory";
+    int atomicDoneCnt,               desc="number AtomicDones triggered";
+    bool atomicDataReturn,           desc="Got Atomic op and need return value?", default="false";
+    bool atomicDataNoReturn,         desc="Got Atomic op and don't need return value?", default="false";
+    bool isGLCSet,                   desc="Bypass L1 Cache";
+    bool isSLCSet,                   desc="Bypass L1 and L2 Cache";
+    WriteMask atomicWriteMask,       desc="Atomic write mask";
+  }
+
+  structure(TBETable, external="yes") {
+    TBE lookup(Addr);
+    void allocate(Addr);
+    void deallocate(Addr);
+    bool isPresent(Addr);
+  }
+
+  TBETable TBEs, template="<TCC_TBE>", constructor="m_number_of_TBEs";
+
+  void set_cache_entry(AbstractCacheEntry b);
+  void unset_cache_entry();
+  void set_tbe(TBE b);
+  void unset_tbe();
+  void wakeUpAllBuffers();
+  void wakeUpBuffers(Addr a);
+  void wakeUpAllBuffers(Addr a);
+
+  MachineID mapAddressToMachine(Addr addr, MachineType mtype);
+
+  // FUNCTION DEFINITIONS
+  Tick clockEdge();
+
+  int getSector(Addr addr) {
+	  Addr offset;
+
+	offset := addr % 128;
+
+	if (offset < 32) {
+		return 0;
+	} else if (offset < 64) {
+		return 1;
+	} else if (offset < 96) {
+		return 2;
+	} else {
+		return 3;
+	}
+  }
+
+  Entry getCacheEntry(Addr addr), return_by_pointer="yes" {
+    return static_cast(Entry, "pointer", L2cache.lookup(addr));
+  }
+
+  DataBlock getDataBlock(Addr addr), return_by_ref="yes" {
+    return getCacheEntry(addr).DataBlk;
+  }
+
+  bool presentOrAvail(Addr addr) {
+    return L2cache.isTagPresent(addr) || L2cache.cacheAvail(addr);
+  }
+
+  State getState(TBE tbe, Entry cache_entry, Addr addr) {
+    if (is_valid(tbe)) {
+      return tbe.TBEState;
+    } else if (is_valid(cache_entry)) {
+      return cache_entry.CacheState;
+    }
+    return State:I;
+  }
+
+  void setState(TBE tbe, Entry cache_entry, Addr addr, State state) {
+    if (is_valid(tbe)) {
+        tbe.TBEState := state;
+    }
+
+    if (is_valid(cache_entry)) {
+        cache_entry.CacheState := state;
+    }
+  }
+
+  void functionalRead(Addr addr, Packet *pkt) {
+    TBE tbe := TBEs.lookup(addr);
+    Entry cache_entry := getCacheEntry(addr);
+    if(is_valid(tbe)) {
+      testAndRead(addr, tbe.DataBlk, pkt);
+    } else if (is_valid(cache_entry)) {
+      testAndRead(addr, cache_entry.DataBlk, pkt);
+    } else {
+      functionalMemoryRead(pkt);
+    }
+  }
+
+  int functionalWrite(Addr addr, Packet *pkt) {
+    int num_functional_writes := 0;
+    TBE tbe := TBEs.lookup(addr);
+    if(is_valid(tbe)) {
+      num_functional_writes := num_functional_writes +
+            testAndWrite(addr, tbe.DataBlk, pkt);
+    }
+
+    num_functional_writes := num_functional_writes +
+        functionalMemoryWrite(pkt);
+    return num_functional_writes;
+  }
+
+  AccessPermission getAccessPermission(Addr addr) {
+    TBE tbe := TBEs.lookup(addr);
+    if(is_valid(tbe)) {
+      return TCC_State_to_permission(tbe.TBEState);
+    }
+
+    Entry cache_entry := getCacheEntry(addr);
+    if(is_valid(cache_entry)) {
+      return TCC_State_to_permission(cache_entry.CacheState);
+    }
+
+    return AccessPermission:NotPresent;
+  }
+
+  void setAccessPermission(Entry cache_entry, Addr addr, State state) {
+    if (is_valid(cache_entry)) {
+      cache_entry.changePermission(TCC_State_to_permission(state));
+    }
+  }
+
+  void recordRequestType(RequestType request_type, Addr addr) {
+    if (request_type == RequestType:DataArrayRead) {
+        L2cache.recordRequestType(CacheRequestType:DataArrayRead, addr);
+    } else if (request_type == RequestType:DataArrayWrite) {
+        L2cache.recordRequestType(CacheRequestType:DataArrayWrite, addr);
+    } else if (request_type == RequestType:TagArrayRead) {
+        L2cache.recordRequestType(CacheRequestType:TagArrayRead, addr);
+    } else if (request_type == RequestType:TagArrayWrite) {
+        L2cache.recordRequestType(CacheRequestType:TagArrayWrite, addr);
+    } else if (request_type == RequestType:AtomicALUOperation) {
+        L2cache.recordRequestType(CacheRequestType:AtomicALUOperation, addr);
+    }
+  }
+
+  bool checkResourceAvailable(RequestType request_type, Addr addr) {
+    if (request_type == RequestType:DataArrayRead) {
+      return L2cache.checkResourceAvailable(CacheResourceType:DataArray, addr);
+    } else if (request_type == RequestType:DataArrayWrite) {
+      return L2cache.checkResourceAvailable(CacheResourceType:DataArray, addr);
+    } else if (request_type == RequestType:TagArrayRead) {
+      return L2cache.checkResourceAvailable(CacheResourceType:TagArray, addr);
+    } else if (request_type == RequestType:TagArrayWrite) {
+      return L2cache.checkResourceAvailable(CacheResourceType:TagArray, addr);
+    } else if (request_type == RequestType:AtomicALUOperation) {
+      return L2cache.checkResourceAvailable(CacheResourceType:AtomicALUArray, addr);
+    } else {
+      error("Invalid RequestType type in checkResourceAvailable");
+      return true;
+    }
+  }
+
+  State getState(Entry cache_entry, Addr addr) {
+    if (is_valid(cache_entry)) {
+      return cache_entry.CacheState;
+    } else {
+      return State:I;
+    }
+  }
+
+  // ** OUT_PORTS **
+
+  // Three classes of ports
+  // Class 1: downward facing network links to NB
+  out_port(requestToNB_out, RequestMsg, requestToNB);
+  out_port(responseToNB_out, ResponseMsg, responseToNB);
+  out_port(unblockToNB_out, ResponseMsg, unblockToNB);
+
+  // Class 2: upward facing ports to GPU cores
+  out_port(responseToCore_out, ResponseMsg, responseToCore);
+
+  //out_port(triggerQueue_out, ResponseMsg, triggerQueue);
+  //
+  // request queue going to NB
+  //
+
+  // ** IN_PORTS **
+
+  // handle responses from directory here
+  in_port(responseFromNB_in, ResponseMsg, responseFromNB) {
+    if (responseFromNB_in.isReady(clockEdge())) {
+      peek(responseFromNB_in, ResponseMsg, block_on="addr") {
+        TBE tbe := TBEs.lookup(in_msg.addr);
+        Entry cache_entry := getCacheEntry(in_msg.addr);
+        /*
+          MOESI_AMD_Base-dir acts as the directory, and it always passes
+          SLC information back to L2 because of races at L2 with requests
+          from different CUs sending requests to same cache line in parallel.
+          If these requests have different GLC/SLC settings, the L2 TBE may
+          not have the correct GLC/SLC information for a given request.
+         */
+        bool is_slc_set := in_msg.isSLCSet;
+
+        // Whether the SLC bit is set or not, WB acks should invoke the
+        // WBAck event. For cases where a read response will follow a
+        // WBAck (A read bypass evict on a dirty line), the line's TLB
+        // will not be deallocated on WBAck, and the SLC bit will be
+        // checked when the read response is received.
+        if (in_msg.Type == CoherenceResponseType:ACK) {
+          trigger(Event:Ack, in_msg.addr, cache_entry, tbe);
+        } else if(in_msg.Type == CoherenceResponseType:DATA_SHARED ||
+          in_msg.Type == CoherenceResponseType:DATA_OWNER){
+          // If the SLC bit is set or the cache is write-through and
+          // we're receiving modified data (such as from an atomic),
+          // the response needs to bypass the cache and should not be
+          // allocated an entry.
+          if (is_slc_set || in_msg.Type == CoherenceResponseType:DATA_OWNER)  {
+            trigger(Event:Bypass, in_msg.addr, cache_entry, tbe);
+          } else {
+            if(presentOrAvail(in_msg.addr)) {
+              // Responses with atomic data will only reach here if the
+              // SLC bit isn't set and the cache is WB
+              trigger(Event:Data, in_msg.addr, cache_entry, tbe);
+            } else {
+              Addr victim :=  L2cache.cacheProbe(in_msg.addr);
+              trigger(Event:L2_Repl, victim, getCacheEntry(victim), TBEs.lookup(victim));
+            }
+          }
+        } else {
+          error("Unexpected Response Message to Core");
+        }
+      }
+    }
+  }
+
+  in_port(coreRequestNetwork_in, RequestMsg, L1RequestToL2Cache, rank=0) {
+    if (coreRequestNetwork_in.isReady(clockEdge())) {
+      peek(coreRequestNetwork_in, RequestMsg, block_on="addr") {
+        TBE tbe := TBEs.lookup(in_msg.addr);
+        Entry cache_entry := getCacheEntry(in_msg.addr);
+        State current_state := getState(cache_entry, in_msg.addr);
+
+        // --- DOMAIN-AWARE FILTERING ---
+        // Use the same helper here for the CPU domain check
+        bool from_cpu := (machineIDToMachineType(in_msg.Requestor) == MachineType:L1Cache ||
+                  machineIDToMachineType(in_msg.Requestor) == MachineType:L2Cache);
+
+        // If a CPU request arrives but the TCC is Invalid,
+        // the GPU domain has no interest in this line.
+        if (from_cpu && current_state == State:I) {
+            coreRequestNetwork_in.dequeue(clockEdge());
+        }
+        // --- END FILTERING ---
+        else {
+            if (in_msg.Type == CoherenceRequestType:GETS) {
+                if (in_msg.isSLCSet) {
+                    trigger(Event:Bypass, in_msg.addr, cache_entry, tbe);
+                } else {
+                    trigger(Event:GETS, in_msg.addr, cache_entry, tbe);
+                }
+            } else if (in_msg.Type == CoherenceRequestType:GETX) {
+                trigger(Event:GETX, in_msg.addr, cache_entry, tbe);
+            } else {
+                error("Unexpected Request Message to TCC");
+            }
+        }
+      }
+    }
+  }
+
+  // BEGIN ACTIONS
+
+  action(i_invL2, "i", desc="invalidate TCC cache block") {
+    if (is_valid(cache_entry)) {
+        L2cache.deallocate(address);
+    }
+    unset_cache_entry();
+  }
+
+  action(ir_invL2Resp, "ir", desc="send L2 invalidate ack") {
+    peek(coreRequestNetwork_in, RequestMsg) {
+      enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:ACK;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+        out_msg.sector_id := in_msg.sector_id;
+        DPRINTF(RubySlicc, "%s\n", out_msg);
+      }
+    }
+  }
+
+  action(sd_sendData, "sd", desc="send Shared response") {
+    peek(coreRequestNetwork_in, RequestMsg) {
+      enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA_SHARED;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.DataBlk := cache_entry.DataBlk;
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+        out_msg.Dirty := false;
+        out_msg.isGLCSet := in_msg.isGLCSet;
+        out_msg.isSLCSet := in_msg.isSLCSet;
+        out_msg.sector_id := in_msg.sector_id;
+        DPRINTF(RubySlicc, "%s\n", out_msg);
+      }
+    }
+  }
+
+
+  action(sdr_sendDataResponse, "sdr", desc="send Shared response") {
+    enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+      out_msg.addr := address;
+      out_msg.Type := CoherenceResponseType:DATA_SHARED;
+      out_msg.Sender := machineID;
+      out_msg.MessageSize := MessageSizeType:Response_Data;
+      out_msg.Dirty := false;
+      peek(responseFromNB_in, ResponseMsg) {
+        // if line state is Invalid, then we must be doing the transition(I, Data)
+        // so use the DataBlk from the incoming message
+        if ((getAccessPermission(address) == AccessPermission:NotPresent) ||
+	      (getAccessPermission(address) == AccessPermission:Invalid)) {
+          out_msg.DataBlk := in_msg.DataBlk;
+        } else {
+          out_msg.DataBlk := cache_entry.DataBlk;
+        }
+        out_msg.isGLCSet := in_msg.isGLCSet;
+        out_msg.isSLCSet := in_msg.isSLCSet;
+        // reuse CURequestor/Sender field to allow multiple concurrent loads and
+        // track where they should go back to (since TBE can't distinguish
+        // destinations)
+        out_msg.Destination.clear();
+        out_msg.Destination.add(in_msg.Sender);
+        out_msg.sector_id := in_msg.sector_id;
+      }
+      DPRINTF(RubySlicc, "%s\n", out_msg);
+    }
+  }
+
+  action(rb_bypassDone, "rb", desc="bypass L2 of read access") {
+    peek(responseFromNB_in, ResponseMsg) {
+        enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceResponseType:DATA_SHARED;
+          out_msg.Sender := machineID;
+          // reuse CURequestor field to allow multiple concurrent loads and
+          // track where they should go back to (since TBE can't distinguish
+          // destinations)
+          out_msg.Destination.clear();
+          out_msg.Destination.add(in_msg.Sender);
+          out_msg.DataBlk := in_msg.DataBlk;
+          out_msg.MessageSize := MessageSizeType:Response_Data;
+          out_msg.Dirty := false;
+          out_msg.isGLCSet := in_msg.isGLCSet;
+          out_msg.isSLCSet := in_msg.isSLCSet;
+          out_msg.sector_id := in_msg.sector_id;
+          DPRINTF(RubySlicc, "%s\n", out_msg);
+        }
+    }
+  }
+
+  action(rd_requestData, "r", desc="Miss in L2, pass on") {
+    peek(coreRequestNetwork_in, RequestMsg) {
+      DPRINTF(RubySlicc, "in_msg: %s\n", in_msg);
+      enqueue(requestToNB_out, RequestMsg, l2_request_latency) {
+        out_msg.addr := address;
+        out_msg.Type := in_msg.Type;
+        out_msg.Requestor := machineID;
+        /*
+          To allow multiple concurrent requests from different CUs, we pass
+          the orgin information along to the directory, which stores it in its
+          TBE as appropriate before passing it back to the TCC on the return
+          path.
+         */
+        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+        out_msg.MessageSize := in_msg.MessageSize;
+        out_msg.isGLCSet := in_msg.isGLCSet;
+        out_msg.isSLCSet := in_msg.isSLCSet;
+        out_msg.sector_id := in_msg.sector_id;
+        DPRINTF(RubySlicc, "out_msg: %s\n", out_msg);
+      }
+    }
+  }
+
+  action(w_sendResponseWBAck, "w", desc="send WB Ack") {
+    peek(responseFromNB_in, ResponseMsg) {
+      enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:ACK;
+        out_msg.Destination.clear();
+        out_msg.Destination.add(in_msg.Sender);
+        out_msg.Sender := machineID;
+        out_msg.MessageSize := MessageSizeType:Writeback_Control;
+
+        out_msg.sector_id := in_msg.sector_id;
+      }
+    }
+  }
+
+  action(swb_sendWBAck, "swb", desc="send WB Ack") {
+    peek(coreRequestNetwork_in, RequestMsg) {
+      enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:ACK;
+        out_msg.Destination.clear();
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.Sender := machineID;
+        out_msg.MessageSize := MessageSizeType:Writeback_Control;
+
+        out_msg.sector_id := in_msg.sector_id;
+      }
+    }
+  }
+
+  action(fw_sendFlushResponse, "fw", desc="send Flush Response") {
+    peek(coreRequestNetwork_in, RequestMsg) {
+      enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:ACK;
+        out_msg.Destination.clear();
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.Sender := machineID;
+        out_msg.MessageSize := MessageSizeType:Writeback_Control;
+
+        out_msg.sector_id := in_msg.sector_id;
+      }
+    }
+  }
+
+  action(ar_sendAtomicResponse, "ar", desc="send Atomic Ack") {
+    peek(coreRequestNetwork_in, RequestMsg) {
+        enqueue(responseToCore_out, ResponseMsg, l2_response_latency + glc_atomic_latency, true) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceResponseType:DATA_SHARED;
+          out_msg.Destination.clear();
+          out_msg.Destination.add(in_msg.Requestor);
+          out_msg.Sender := machineID;
+          out_msg.MessageSize := MessageSizeType:Response_Data;
+
+          out_msg.DataBlk := cache_entry.DataBlk;
+          out_msg.isGLCSet := in_msg.isGLCSet;
+          out_msg.isSLCSet := in_msg.isSLCSet;
+        }
+    }
+    cache_entry.DataBlk.clearAtomicLogEntries();
+  }
+
+  action(baplr_sendBypassedAtomicPerformedLocallyResponse, "barplr", desc="send locally-performed bypassed Atomic Ack") {
+    peek(responseFromNB_in, ResponseMsg) {
+        enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceResponseType:DATA_SHARED;
+          out_msg.Destination.add(in_msg.Sender);
+          out_msg.Sender := machineID;
+          out_msg.MessageSize := in_msg.MessageSize;
+          out_msg.DataBlk := cache_entry.DataBlk;
+          out_msg.isGLCSet := tbe.isGLCSet;
+          out_msg.isSLCSet := tbe.isSLCSet;
+          out_msg.sector_id := in_msg.sector_id;
+        }
+    }
+    cache_entry.DataBlk.clearAtomicLogEntries();
+  }
+
+  action(bapdr_sendBypassedAtomicPerformedInDirectoryResponse, "bapdr", desc="send bypassed Atomic Ack") {
+    peek(responseFromNB_in, ResponseMsg) {
+        enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceResponseType:DATA_SHARED;
+          out_msg.Destination.add(in_msg.Sender);
+          out_msg.Sender := machineID;
+          out_msg.MessageSize := in_msg.MessageSize;
+          out_msg.DataBlk := in_msg.DataBlk;
+          out_msg.isGLCSet := in_msg.isGLCSet;
+          out_msg.isSLCSet := in_msg.isSLCSet;
+        }
+    }
+  }
+
+  action(a_allocateBlock, "a", desc="allocate TCC block") {
+    if (is_invalid(cache_entry)) {
+      set_cache_entry(L2cache.allocate(address, new Entry));
+      cache_entry.writeMask.clear();
+    }
+  }
+
+  action(p_profileMiss, "pm", desc="Profile cache miss") {
+      L2cache.profileDemandMiss();
+      DPRINTF(RubyHitMiss, "in TCC miss at %#lx\n", address);
+  }
+
+  action(p_profileHit, "ph", desc="Profile cache hit") {
+      L2cache.profileDemandHit();
+      DPRINTF(RubyHitMiss, "in TCC hit at %#lx\n", address);
+  }
+
+  action(t_allocateTBE, "t", desc="allocate TBE Entry") {
+    if (is_invalid(tbe)) {
+      check_allocate(TBEs);
+      TBEs.allocate(address);
+      set_tbe(TBEs.lookup(address));
+      tbe.Destination.clear();
+      tbe.numPendingDirectoryAtomics := 0;
+      tbe.atomicDoneCnt := 0;
+      tbe.numPending := 0;
+    }
+    // each pending requests increments this count by 1
+    tbe.numPending := tbe.numPending + 1;
+    if (coreRequestNetwork_in.isReady(clockEdge())) {
+      peek(coreRequestNetwork_in, RequestMsg) {
+        if (in_msg.Type == CoherenceRequestType:GETS ||
+            in_msg.Type == CoherenceRequestType:GETX) {
+            tbe.Destination.add(in_msg.Requestor);
+        }
+        /*
+          If there are multiple concurrent requests to the same cache line, each
+          one will overwrite the previous ones GLC/SLC information here.
+          If these requests have different GLC/SLC information, this causes
+          a segfault.  Hence, currently the support relies on the directory to
+          pass back the GLC/SLC information instead of relying on L2 TBE to be
+          correct.
+
+          This message is left here as an FYI for future developers.
+         */
+        tbe.isGLCSet := in_msg.isGLCSet;
+        tbe.isSLCSet := in_msg.isSLCSet;
+
+      }
+    }
+  }
+
+  action(dt_deallocateTBE, "dt", desc="Deallocate TBE entry") {
+    // since we may have multiple destinations, can't deallocate if we aren't
+    // last one
+    tbe.numPending := tbe.numPending - 1;
+    if (tbe.numPending == 0) {
+      tbe.Destination.clear();
+      TBEs.deallocate(address);
+      unset_tbe();
+    }
+  }
+
+  action(wcb_writeCacheBlock, "wcb", desc="write data to TCC") {
+    peek(responseFromNB_in, ResponseMsg) {
+      cache_entry.DataBlk := in_msg.DataBlk;
+      DPRINTF(RubySlicc, "Writing to TCC: %s\n", in_msg);
+    }
+  }
+
+  action(wdb_writeDirtyBytes, "wdb", desc="write data to TCC") {
+    peek(coreRequestNetwork_in, RequestMsg) {
+      DPRINTF(RubySlicc, "Writing to TCC: %s\n", in_msg);
+    }
+  }
+
+  action(wardb_writeAtomicResponseDirtyBytes, "wardb", desc="write data to TCC") {
+    peek(responseFromNB_in, ResponseMsg) {
+      cache_entry.DataBlk := in_msg.DataBlk;
+      cache_entry.writeMask.orMask(tbe.atomicWriteMask);
+      DPRINTF(RubySlicc, "Writing to TCC: %s\n", in_msg);
+    }
+  }
+
+
+action(at_atomicThrough, "at", desc="forward atomic as GETX") {
+
+  peek(coreRequestNetwork_in, RequestMsg) {
+
+    enqueue(requestToNB_out, RequestMsg, l2_request_latency) {
+
+      out_msg.addr := address;
+      out_msg.Requestor := machineID;
+
+      out_msg.Destination.add(
+          mapAddressToMachine(address, MachineType:Directory));
+
+      out_msg.MessageSize := MessageSizeType:Control;
+
+      // atomic → GETX
+      out_msg.Type := CoherenceRequestType:GETX;
+
+      out_msg.isGLCSet := in_msg.isGLCSet;
+      out_msg.isSLCSet := in_msg.isSLCSet;
+      out_msg.sector_id := in_msg.sector_id;
+    }
+  }
+}
+
+  // ------------------------------------------------------------
+// ❌ REMOVED:
+//   - Probe response actions (pd, pi)
+//   - Trigger queue actions
+//   - Atomic counters (inpa, dnpa, dadc)
+//   - writeMask usage
+//   - AtomicReturn / AtomicNoReturn
+// ------------------------------------------------------------
+
+
+// ------------------------------------------------------------
+// ✔ Cache management
+// ------------------------------------------------------------
+action(ut_updateTag, "ut", desc="update Tag (MRU)") {
+  L2cache.setMRU(address);
+}
+
+
+// ------------------------------------------------------------
+// ✔ Queue handling
+// ------------------------------------------------------------
+action(p_popRequestQueue, "p", desc="pop request queue") {
+  coreRequestNetwork_in.dequeue(clockEdge());
+}
+
+action(pr_popResponseQueue, "pr", desc="pop response queue") {
+  responseFromNB_in.dequeue(clockEdge());
+}
+
+
+// ------------------------------------------------------------
+// ✔ Stall / Wakeup (safe + required)
+// ------------------------------------------------------------
+action(st_stallAndWaitRequest, "st", desc="stall and wait") {
+  stall_and_wait(coreRequestNetwork_in, address);
+}
+
+action(wada_wakeUpAllDependentsAddr, "wada", desc="wake dependents") {
+  wakeUpAllBuffers(address);
+}
+
+
+// ------------------------------------------------------------
+// ✔ Atomic handling (AMTC simplified)
+// ------------------------------------------------------------
+action(pa_performAtomic, "pa", desc="Perform atomic (AMTC)") {
+
+  // AMTC model:
+  // Atomic = GETX + full-line update
+  // No writeMask, no partial updates, no return/no-return split
+
+  if (responseFromNB_in.isReady(clockEdge())) {
+    peek(responseFromNB_in, ResponseMsg) {
+      cache_entry.DataBlk := in_msg.DataBlk;
+    }
+  }
+}
+
+  // END ACTIONS
+
+  // BEGIN TRANSITIONS
+  // transitions from base
+  // Assumptions for ArrayRead/Write
+  // TBE checked before tags
+  // Data Read/Write requires Tag Read
+
+  // Stalling transitions do NOT check the tag array...and if they do,
+  // they can cause a resource stall deadlock!
+
+  // -------------------------
+// GETS (Read request)
+// -------------------------
+
+transition({M, V}, GETS) {TagArrayRead, DataArrayRead} {
+  ut_updateTag;
+  sdr_sendDataResponse;
+  p_popRequestQueue;
+}
+
+transition(I, GETS) {TagArrayRead} {
+  t_allocateTBE;
+  rd_requestData;     // send GETS to directory
+  p_popRequestQueue;
+}
+
+transition({A}, GETS) {
+  st_stallAndWaitRequest;
+}
+// -------------------------
+// GETX (Write / Atomic)
+// -------------------------
+
+transition({M}, GETX) {TagArrayRead, DataArrayWrite} {
+  ut_updateTag;
+  pa_performAtomic;
+  sdr_sendDataResponse;
+  p_popRequestQueue;
+}
+
+transition({V}, GETX) {TagArrayRead} {
+  t_allocateTBE;
+  rd_requestData;   // upgrade via GETX
+  p_popRequestQueue;
+}
+
+transition(I, GETX) {TagArrayRead} {
+  t_allocateTBE;
+  rd_requestData;
+  p_popRequestQueue;
+}
+
+transition(A, GETX) {
+  st_stallAndWaitRequest;
+}
+// -------------------------
+// DATA response handling
+// -------------------------
+
+transition({I}, Data, V) {TagArrayWrite, DataArrayWrite} {
+  a_allocateBlock;
+  wcb_writeCacheBlock;
+  sdr_sendDataResponse;
+  wada_wakeUpAllDependentsAddr;
+  dt_deallocateTBE;
+  pr_popResponseQueue;
+}
+
+transition({V}, Data) {TagArrayWrite, DataArrayWrite} {
+  ut_updateTag;
+  wcb_writeCacheBlock;
+  sdr_sendDataResponse;
+  wada_wakeUpAllDependentsAddr;
+  dt_deallocateTBE;
+  pr_popResponseQueue;
+}
+
+transition({A}, Data, M) {TagArrayWrite, DataArrayWrite} {
+  a_allocateBlock;
+  wcb_writeCacheBlock;
+  pa_performAtomic;
+  sdr_sendDataResponse;
+  wada_wakeUpAllDependentsAddr;
+  dt_deallocateTBE;
+  pr_popResponseQueue;
+}
+
+transition({M, V}, L2_Repl, I) {TagArrayRead} {
+  i_invL2;
+}
+
+transition(I, L2_Repl) {
+  // no-op
+}
+
+
+}
