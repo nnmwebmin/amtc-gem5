@@ -544,35 +544,43 @@ machine(MachineType:Directory, "Token protocol")
             assert(in_msg.Destination.isElement(machineID));
 
             if (in_msg.Type == CoherenceResponseType:DATA_OWNER) {
-
-                trigger(Event:Data_Owner,
-                        in_msg.addr,
-                        TBEs[in_msg.addr]);
+                trigger(Event:Data_Owner, in_msg.addr, TBEs[in_msg.addr]);
 
             } else if (in_msg.Type == CoherenceResponseType:DATA_SHARED) {
                 trigger(Event:Data_Shared, in_msg.addr, TBEs[in_msg.addr]);
-            } else if (in_msg.Type == CoherenceResponseType:ACK_OWNER) {
 
-                trigger(Event:Ack_Owner,
-                        in_msg.addr,
-                        TBEs[in_msg.addr]);
+            } else if (in_msg.Type == CoherenceResponseType:ACK_OWNER) {
+                trigger(Event:Ack_Owner, in_msg.addr, TBEs[in_msg.addr]);
 
             } else if (in_msg.Type == CoherenceResponseType:ACK) {
+                trigger(Event:Tokens, in_msg.addr, TBEs[in_msg.addr]);
+            }
+            // =================================================================
+            // CRITICAL FIX: L2 Cache Capacity Eviction Handlers
+            // =================================================================
+            else if (in_msg.Type == CoherenceResponseType:WB_TOKENS) {
+                // The L2 is returning tokens without data.
+                // Route this to your existing 'Tokens' event (just like an ACK).
+                trigger(Event:Tokens, in_msg.addr, TBEs[in_msg.addr]);
 
-                trigger(Event:Tokens,
-                        in_msg.addr,
-                        TBEs[in_msg.addr]);
-
-            } else {
-
+            } else if (in_msg.Type == CoherenceResponseType:WB_OWNED ||
+                       in_msg.Type == CoherenceResponseType:WB_SHARED_DATA) {
+                // The L2 is returning dirty or clean physical data alongside tokens.
+                // Route this to your existing 'Data_Owner' event.
+                // (Note: If your Directory has a specific event like Event:Writeback
+                // defined in its enumeration, use that instead of Data_Owner here).
+                trigger(Event:Data_Owner, in_msg.addr, TBEs[in_msg.addr]);
+            }
+            // =================================================================
+            else {
+                DPRINTF(RubySlicc, "Invalid response type: %s\n", in_msg.Type);
                 error("Invalid response type");
-
             }
         }
     }
-}
+  }
 
-in_port(requestNetwork_in, RequestMsg, requestToDir) {
+  in_port(requestNetwork_in, RequestMsg, requestToDir) {
     if (requestNetwork_in.isReady(clockEdge())) {
       peek(requestNetwork_in, RequestMsg) {
         assert(in_msg.Destination.isElement(machineID));

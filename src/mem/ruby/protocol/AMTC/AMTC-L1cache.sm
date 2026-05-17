@@ -1453,11 +1453,15 @@ action(a_issueReadRequest, "a", desc="Issue GETS") {
         out_msg.Type := in_msg.Type;
         out_msg.Sender := machineID;
         out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
-        out_msg.TokensSec0 := cache_entry.TokensSec0;
-        out_msg.TokensSec1 := cache_entry.TokensSec1;
+        out_msg.TokensSec0 := in_msg.TokensSec0;
+        out_msg.TokensSec1 := in_msg.TokensSec1;
         out_msg.MessageSize := in_msg.MessageSize;
         out_msg.DataBlk := in_msg.DataBlk;
         out_msg.Dirty := in_msg.Dirty;
+        //Preserve the AMTC sector masks so the Directory knows what it is receiving
+        out_msg.valid_sector_mask := in_msg.valid_sector_mask;
+        out_msg.token_sector_mask := in_msg.token_sector_mask;
+        out_msg.requested_sector_mask := in_msg.requested_sector_mask;
       }
     }
   }
