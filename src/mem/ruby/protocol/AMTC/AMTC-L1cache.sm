@@ -99,6 +99,10 @@ machine(MachineType:L1Cache, "Token protocol")
     SM_L, AccessPermission:Busy, "SM^L", desc="Shared, Locked, trying to go to Modified";
     IS_L, AccessPermission:Busy, "IS^L", desc="Invalid, Locked, trying to go to Shared";
 
+    // ADD THESE MISSING TRANSIENT STATES:
+    S_IM, AccessPermission:Busy, "S^IM",desc="Shared, waiting for tokens/data to upgrade to Modified";
+
+
     // Transient States for Sector Misses
     S_IS, AccessPermission:Busy, "S_IS", desc="Shared, waiting for sector GETS";
     O_IS, AccessPermission:Busy, "O_IS", desc="Owned, waiting for sector GETS";
@@ -137,6 +141,7 @@ machine(MachineType:L1Cache, "Token protocol")
 
     // Triggers
     Request_Timeout,         desc="Timeout";
+    Request_Timeout_Owner,   desc="Timeout when we already hold the tokens";
     Use_TimeoutStarverX,             desc="Timeout";
     Use_TimeoutStarverS,             desc="Timeout";
     Use_TimeoutNoStarvers,             desc="Timeout";
@@ -150,6 +155,10 @@ machine(MachineType:L1Cache, "Token protocol")
     // ADD THESE PHASE 2 EVENTS:
     Ack_Owner,              desc="Received an owner ack message (no data)";
     Ack_Owner_All_Tokens,   desc="Received an owner ack, we now have all tokens";
+    Load_Hit,   desc="Load hits locally";
+    Load_Miss,  desc="Load misses locally";
+    Store_Hit,  desc="Store hits locally";
+    Store_Miss, desc="Store misses locally";
 
   }
 
@@ -159,7 +168,7 @@ machine(MachineType:L1Cache, "Token protocol")
   structure(Entry, desc="...", interface="AbstractCacheEntry") {
     State CacheState,        desc="cache state";
     bool Dirty,              desc="Is the data dirty (different than memory)?";
-    int Tokens,              desc="The number of tokens we're holding for the line";
+    //int Tokens,              desc="The number of tokens we're holding for the line";
     DataBlock DataBlk,       desc="data for the block";
 
     // AMTC per-sector metadata for a 64B Ruby line split into 2 x 32B sectors.
@@ -213,6 +222,10 @@ machine(MachineType:L1Cache, "Token protocol")
     Cycles IssueTime,                       desc="Time the request was issued";
     RubyAccessMode AccessMode,    desc="user/supervisor access type";
     PrefetchBit Prefetch,         desc="Is this a prefetch request";
+
+    int TargetMask,        desc="The original mask the CPU requested";
+    int CompletedMask,     desc="The mask of sectors we have successfully written";
+    DataBlock PendingData, desc="Temporary buffer to hold CPU data while waiting";
   }
 
   structure(TBETable, external="yes") {
@@ -310,18 +323,6 @@ machine(MachineType:L1Cache, "Token protocol")
   Entry getL1ICacheEntry(Addr addr), return_by_pointer="yes" {
     Entry L1Icache_entry := static_cast(Entry, "pointer", L1Icache.lookup(addr));
     return L1Icache_entry;
-  }
-
-  int getTokens(Entry cache_entry, int sid) {
-    if (is_valid(cache_entry)) {
-      if (sid == 0) {
-        return cache_entry.TokensSec0;
-      }
-      if (sid == 1) {
-        return cache_entry.TokensSec1;
-      }
-    }
-    return 0;
   }
 
   // ----------------------------------------------------------------------
@@ -485,9 +486,17 @@ machine(MachineType:L1Cache, "Token protocol")
 
   MessageSizeType amtc_getSizeFromDirtyMask(int mask) {
     int active := amtc_countSectors(mask);
-    if (active == 1) {
+
+    if (active == 0) {
+      // No data payload! Just a network header.
+      return MessageSizeType:Response_Control;
+    }
+    else if (active == 1) {
+      // Half-line payload
       return MessageSizeType:Response_Sector2_Data;
     }
+
+    // Full-line payload (active == 2)
     return MessageSizeType:Response_Data;
   }
 
@@ -496,6 +505,46 @@ machine(MachineType:L1Cache, "Token protocol")
     return amtc_maskHasSector(valid_mask, req_sid);
   }
 
+  int getTokens(Entry cache_entry, int mask) {
+    if (is_valid(cache_entry)) {
+      int total := 0;
+      if (amtc_maskHasSector(mask, 0)) {
+        total := total + cache_entry.TokensSec0;
+      }
+      if (amtc_maskHasSector(mask, 1)) {
+        total := total + cache_entry.TokensSec1;
+      }
+      return total;
+    }
+    return 0;
+  }
+
+  // -------------------------------------------------------------------------
+  // Calculate which sectors a CPU memory request actually touches.
+  // Sector 0 = Bytes 0 to 31. Sector 1 = Bytes 32 to 63.
+  // -------------------------------------------------------------------------
+  int amtc_getRequiredSectorMask(Addr line_addr, Addr phys_addr, int size) {
+    int offset := getOffset(phys_addr);
+    int end_byte := offset + size - 1;
+    int mask := 0;
+
+    // Does the request start before byte 32? It needs Sector 0.
+    if (offset < 32) {
+      mask := mask + 1;
+    }
+
+    // Does the request end at or after byte 32? It needs Sector 1.
+    if (end_byte >= 32) {
+      mask := mask + 2;
+    }
+
+    // Failsafe: If something goes weird with size=0, request the whole line.
+    if (mask == 0) {
+      mask := 3;
+    }
+
+    return mask;
+  }
 
   State getState(TBE tbe, Entry cache_entry, Addr addr) {
     if (is_valid(tbe)) {
@@ -584,13 +633,15 @@ machine(MachineType:L1Cache, "Token protocol")
 
         if (amtc_maskHasSector(cache_entry.ValidSectors, 0)) {
             // Only assert if we actually intended to be modified for Sector 0
-            if (cache_entry.TokensSec0 > 1) {
+            assert(cache_entry.TokensSec0 > 0);
+            if (amtc_maskHasSector(cache_entry.DirtySectors, 0)) {
                 assert(cache_entry.TokensSec0 == tokens_per_sector);
             }
         }
         if (amtc_maskHasSector(cache_entry.ValidSectors, 1)) {
              // Only assert if we actually intended to be modified for Sector 1
-            if (cache_entry.TokensSec1 > 1) {
+             assert(cache_entry.TokensSec1 > 0);
+            if (amtc_maskHasSector(cache_entry.DirtySectors, 1)){
                 assert(cache_entry.TokensSec1 == tokens_per_sector);
             }
         }
@@ -748,12 +799,22 @@ machine(MachineType:L1Cache, "Token protocol")
   }
 
   // Reissue Timer
+  // Reissue Timer
   in_port(reissueTimerTable_in, Addr, reissueTimerTable, rank=4) {
     Tick current_time := clockEdge();
     if (reissueTimerTable_in.isReady(current_time)) {
       Addr addr := reissueTimerTable.nextAddress();
-      trigger(Event:Request_Timeout, addr, getCacheEntry(addr),
-              L1_TBEs.lookup(addr));
+      Entry cache_entry := getCacheEntry(addr);
+      TBE tbe := L1_TBEs.lookup(addr);
+
+      // CRITICAL FIX: Evaluate tokens BEFORE triggering the state machine!
+      if (is_valid(cache_entry) && (getTokens(cache_entry, amtc_fullMask()) >= (max_tokens() / 2))) {
+          // We have the tokens! Trigger the special Owner Pull timeout.
+          trigger(Event:Request_Timeout_Owner, addr, cache_entry, tbe);
+      } else {
+          // We don't have tokens. Trigger the standard timeout.
+          trigger(Event:Request_Timeout, addr, cache_entry, tbe);
+      }
     }
   }
 
@@ -843,105 +904,104 @@ machine(MachineType:L1Cache, "Token protocol")
         }
 
         // =====================================================================
-        // 2. SECTOR COMPLETION CHECK (AMTC Architecture)
+        // 2. SECTOR COMPLETION CHECK (Data Bytes)
         // =====================================================================
         bool is_complete := true;
         if (is_valid(tbe)) {
             int current_valid := 0;
-            if (is_valid(cache_entry)) {
-                current_valid := cache_entry.ValidSectors;
+            if (is_valid(cache_entry)) { current_valid := cache_entry.ValidSectors; }
+
+            // CRITICAL FIX: ACKs NEVER carry valid data bytes!
+            // We only trust the mask if it is a true DATA packet.
+            int incoming_valid := 0;
+            if (in_msg.Type == CoherenceResponseType:DATA_SHARED || in_msg.Type == CoherenceResponseType:DATA_OWNER) {
+                incoming_valid := amtc_intersectMasks(in_msg.valid_sector_mask, tbe.RequestedSectorMask);
             }
 
-            // What requested bytes did this specific packet bring?
-            int incoming_valid := amtc_intersectMasks(in_msg.valid_sector_mask, tbe.RequestedSectorMask);
-
-            // What will our cache hold after we merge it?
             int future_valid := amtc_unionMasks(current_valid, incoming_valid);
-
-            // Have we satisfied every sector the CPU asked for?
             if (amtc_intersectMasks(future_valid, tbe.RequestedSectorMask) != tbe.RequestedSectorMask) {
                 is_complete := false;
             }
         }
 
-// =====================================================================
-        // 3. TRUE SECTOR TOKEN COUNTING & EVENT ROUTING (Phase 2 Upgrade)
         // =====================================================================
-        bool is_effectively_all_tokens := true;
-
+        // 3. SHARED TOKEN CHECK (>= 1 token)
+        // =====================================================================
+        bool has_shared_tokens := true;
         if (is_valid(tbe)) {
-            // Step A: Predict exactly how many tokens we will hold after merging
             int future_t0 := in_msg.TokensSec0;
             int future_t1 := in_msg.TokensSec1;
-
             if (is_valid(cache_entry)) {
                 future_t0 := future_t0 + cache_entry.TokensSec0;
                 future_t1 := future_t1 + cache_entry.TokensSec1;
             }
-
-            // Step B: In this architecture, max_tokens() is the whole line.
-            // Therefore, 100% ownership of ONE sector is exactly (max_tokens() / 2).
-            int required_per_sector := max_tokens() / 2;
-
-            // Step C: Strictly evaluate ONLY the sectors the CPU requested
-            if (amtc_maskHasSector(tbe.RequestedSectorMask, 0)) {
-                if (future_t0 < required_per_sector) {
-                    is_effectively_all_tokens := false;
-                }
+            if (amtc_maskHasSector(tbe.RequestedSectorMask, 0) && future_t0 == 0) {
+                has_shared_tokens := false;
             }
-
-            if (amtc_maskHasSector(tbe.RequestedSectorMask, 1)) {
-                if (future_t1 < required_per_sector) {
-                    is_effectively_all_tokens := false;
-                }
+            if (amtc_maskHasSector(tbe.RequestedSectorMask, 1) && future_t1 == 0) {
+                has_shared_tokens := false;
             }
         } else {
-            // If there's no TBE, this is a stale or background packet.
-            // We safely route it to standard Ack/Data_Shared for absorption.
+            has_shared_tokens := false;
+        }
+
+        // =====================================================================
+        // 4. EXCLUSIVE TOKEN CHECK (512 tokens)
+        // =====================================================================
+        bool is_effectively_all_tokens := true;
+        if (is_valid(tbe)) {
+            int future_t0 := in_msg.TokensSec0;
+            int future_t1 := in_msg.TokensSec1;
+            if (is_valid(cache_entry)) {
+                future_t0 := future_t0 + cache_entry.TokensSec0;
+                future_t1 := future_t1 + cache_entry.TokensSec1;
+            }
+            int required_per_sector := max_tokens() / 2;
+            if (amtc_maskHasSector(tbe.RequestedSectorMask, 0) && future_t0 < required_per_sector) {
+                is_effectively_all_tokens := false;
+            }
+            if (amtc_maskHasSector(tbe.RequestedSectorMask, 1) && future_t1 < required_per_sector) {
+                is_effectively_all_tokens := false;
+            }
+        } else {
             is_effectively_all_tokens := false;
         }
 
         // =====================================================================
-        // EVENT ROUTING (Unchanged, but now protected by true sector math!)
+        // 5. BULLETPROOF EVENT ROUTING
         // =====================================================================
-        if (in_msg.Type == CoherenceResponseType:ACK) {
-          if (is_effectively_all_tokens) {
-            trigger(Event:Ack_All_Tokens, in_msg.addr, cache_entry, tbe);
-          } else {
-            trigger(Event:Ack, in_msg.addr, cache_entry, tbe);
-          }
+        if (in_msg.Type == CoherenceResponseType:ACK ||
+            in_msg.Type == CoherenceResponseType:ACK_OWNER ||
+            in_msg.Type == CoherenceResponseType:DATA_OWNER ||
+            in_msg.Type == CoherenceResponseType:DATA_SHARED) {
 
-        } else if (in_msg.Type == CoherenceResponseType:ACK_OWNER) {
-          // MISSING BRANCH ADDED HERE
-          if (is_effectively_all_tokens) {
-            trigger(Event:Ack_Owner_All_Tokens, in_msg.addr, cache_entry, tbe);
-          } else {
-            trigger(Event:Ack_Owner, in_msg.addr, cache_entry, tbe);
-          }
-
-        } else if (in_msg.Type == CoherenceResponseType:DATA_OWNER ||
-                   in_msg.Type == CoherenceResponseType:DATA_SHARED) {
-
-          if (!is_complete) {
-            if (in_msg.Type == CoherenceResponseType:DATA_OWNER) {
-              trigger(Event:Data_Owner_Partial, in_msg.addr, cache_entry, tbe);
-            } else {
-              trigger(Event:Data_Shared_Partial, in_msg.addr, cache_entry, tbe);
+            // IF THE TRANSACTION IS NOW FINISHED:
+            if (is_complete && is_effectively_all_tokens) {
+                // Force a completion event for Writes
+                trigger(Event:Data_All_Tokens, in_msg.addr, cache_entry, tbe);
             }
-          } else if (is_effectively_all_tokens) {
-            // Mathematical Perfection: The data is complete AND we independently
-            // secured all tokens for every requested sector! Wake the CPU!
-            trigger(Event:Data_All_Tokens, in_msg.addr, cache_entry, tbe);
-          } else {
-            if (in_msg.Type == CoherenceResponseType:DATA_OWNER) {
-              trigger(Event:Data_Owner, in_msg.addr, cache_entry, tbe);
-            } else {
-              trigger(Event:Data_Shared, in_msg.addr, cache_entry, tbe);
+            else if (is_complete && has_shared_tokens) {
+                // Force a completion event for Reads to wake the CPU!
+                if (in_msg.Type == CoherenceResponseType:DATA_OWNER || in_msg.Type == CoherenceResponseType:ACK_OWNER) {
+                    trigger(Event:Data_Owner, in_msg.addr, cache_entry, tbe);
+                } else {
+                    trigger(Event:Data_Shared, in_msg.addr, cache_entry, tbe);
+                }
             }
-          }
-
+            // IF THE TRANSACTION IS STILL PENDING (Partial):
+            else {
+                if (in_msg.Type == CoherenceResponseType:ACK) {
+                    trigger(Event:Ack, in_msg.addr, cache_entry, tbe);
+                } else if (in_msg.Type == CoherenceResponseType:ACK_OWNER) {
+                    trigger(Event:Ack_Owner, in_msg.addr, cache_entry, tbe);
+                } else if (in_msg.Type == CoherenceResponseType:DATA_OWNER) {
+                    trigger(Event:Data_Owner_Partial, in_msg.addr, cache_entry, tbe);
+                } else {
+                    trigger(Event:Data_Shared_Partial, in_msg.addr, cache_entry, tbe);
+                }
+            }
         } else {
-          error("Unexpected message type received in L1 response network");
+            error("Unexpected message type received in L1 response network");
         }
       }
     }
@@ -1000,24 +1060,31 @@ machine(MachineType:L1Cache, "Token protocol")
       peek(mandatoryQueue_in, RubyRequest, block_on="LineAddress") {
 
         TBE tbe := L1_TBEs[in_msg.LineAddress];
-        int req_offset := getOffset(in_msg.PhysicalAddress);
-        int needed_mask := amtc_calculateNeededMask(req_offset, in_msg.Size);
+        //int req_offset := getOffset(in_msg.PhysicalAddress);
 
+        // Use the function you defined for mask calculation
+        // THE FIX
+        int needed_mask := amtc_getRequiredSectorMask(in_msg.LineAddress, in_msg.PhysicalAddress, in_msg.Size);
+
+        // ===================================================================
+        // 1. INSTRUCTION FETCH
+        // ===================================================================
         if (in_msg.Type == RubyRequestType:IFETCH) {
           Entry L1Icache_entry := getL1ICacheEntry(in_msg.LineAddress);
           if (is_valid(L1Icache_entry)) {
-            // SECTOR AWARE: Check if ALL requested bytes reside in valid sectors
-            if (amtc_intersectMasks(L1Icache_entry.ValidSectors, needed_mask) != needed_mask) {
+            bool has_data := (amtc_intersectMasks(L1Icache_entry.ValidSectors, needed_mask) == needed_mask);
+            bool has_tokens := true;
+            if (amtc_maskHasSector(needed_mask, 0) && L1Icache_entry.TokensSec0 == 0) { has_tokens := false; }
+            if (amtc_maskHasSector(needed_mask, 1) && L1Icache_entry.TokensSec1 == 0) { has_tokens := false; }
+
+            if (!has_data || !has_tokens) {
               trigger(Event:Load_Sector_Miss, in_msg.LineAddress, L1Icache_entry, tbe);
             } else {
               trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.LineAddress, L1Icache_entry, tbe);
             }
           } else {
-            // Standard Line Miss Logic (Unchanged)
             Entry L1Dcache_entry := getL1DCacheEntry(in_msg.LineAddress);
-            if (is_valid(L1Dcache_entry)) {
-                trigger(Event:L1_Replacement, in_msg.LineAddress, L1Dcache_entry, tbe);
-            }
+            if (is_valid(L1Dcache_entry)) { trigger(Event:L1_Replacement, in_msg.LineAddress, L1Dcache_entry, tbe); }
             if (L1Icache.cacheAvail(in_msg.LineAddress)) {
               trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.LineAddress, L1Icache_entry, tbe);
             } else {
@@ -1025,26 +1092,26 @@ machine(MachineType:L1Cache, "Token protocol")
               trigger(Event:L1_Replacement, victim, getL1ICacheEntry(victim), L1_TBEs[victim]);
             }
           }
-        } else {
-          // DATA BRANCH (LD, ST, ATOMIC)
+        }
+        // ===================================================================
+        // 2. DATA LOADS & READS
+        // ===================================================================
+        else if (in_msg.Type == RubyRequestType:LD || in_msg.Type == RubyRequestType:Locked_RMW_Read) {
           Entry L1Dcache_entry := getL1DCacheEntry(in_msg.LineAddress);
           if (is_valid(L1Dcache_entry)) {
-            // CRITICAL FIX: Use needed_mask here too to prevent unaligned access bugs!
-            if (amtc_intersectMasks(L1Dcache_entry.ValidSectors, needed_mask) != needed_mask) {
-                if (in_msg.Type == RubyRequestType:LD) {
-                    trigger(Event:Load_Sector_Miss, in_msg.LineAddress, L1Dcache_entry, tbe);
-                } else {
-                    trigger(Event:Store_Sector_Miss, in_msg.LineAddress, L1Dcache_entry, tbe);
-                }
+            bool has_data := (amtc_intersectMasks(L1Dcache_entry.ValidSectors, needed_mask) == needed_mask);
+            bool has_tokens := true;
+            if (amtc_maskHasSector(needed_mask, 0) && L1Dcache_entry.TokensSec0 == 0) { has_tokens := false; }
+            if (amtc_maskHasSector(needed_mask, 1) && L1Dcache_entry.TokensSec1 == 0) { has_tokens := false; }
+
+            if (!has_data || !has_tokens) {
+                trigger(Event:Load_Sector_Miss, in_msg.LineAddress, L1Dcache_entry, tbe);
             } else {
                 trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.LineAddress, L1Dcache_entry, tbe);
             }
           } else {
-            // Standard Line Miss Logic (Unchanged)
             Entry L1Icache_entry := getL1ICacheEntry(in_msg.LineAddress);
-            if (is_valid(L1Icache_entry)) {
-              trigger(Event:L1_Replacement, in_msg.LineAddress, L1Icache_entry, tbe);
-            }
+            if (is_valid(L1Icache_entry)) { trigger(Event:L1_Replacement, in_msg.LineAddress, L1Icache_entry, tbe); }
             if (L1Dcache.cacheAvail(in_msg.LineAddress)) {
               trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.LineAddress, L1Dcache_entry, tbe);
             } else {
@@ -1052,6 +1119,40 @@ machine(MachineType:L1Cache, "Token protocol")
               trigger(Event:L1_Replacement, victim, getL1DCacheEntry(victim), L1_TBEs[victim]);
             }
           }
+        }
+        // ===================================================================
+        // 3. STORES & ATOMICS
+        // ===================================================================
+        else if (in_msg.Type == RubyRequestType:ST || in_msg.Type == RubyRequestType:ATOMIC || in_msg.Type == RubyRequestType:Locked_RMW_Write) {
+          Entry L1Dcache_entry := getL1DCacheEntry(in_msg.LineAddress);
+          if (is_valid(L1Dcache_entry)) {
+            bool has_write_permission := true;
+            int tokens_per_sector := max_tokens() / 2;
+
+            if (amtc_maskHasSector(needed_mask, 0) && L1Dcache_entry.TokensSec0 < tokens_per_sector) { has_write_permission := false; }
+            if (amtc_maskHasSector(needed_mask, 1) && L1Dcache_entry.TokensSec1 < tokens_per_sector) { has_write_permission := false; }
+
+            if (!has_write_permission) {
+                trigger(Event:Store_Sector_Miss, in_msg.LineAddress, L1Dcache_entry, tbe);
+            } else {
+                trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.LineAddress, L1Dcache_entry, tbe);
+            }
+          } else {
+            Entry L1Icache_entry := getL1ICacheEntry(in_msg.LineAddress);
+            if (is_valid(L1Icache_entry)) { trigger(Event:L1_Replacement, in_msg.LineAddress, L1Icache_entry, tbe); }
+            if (L1Dcache.cacheAvail(in_msg.LineAddress)) {
+              trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.LineAddress, L1Dcache_entry, tbe);
+            } else {
+              Addr victim := L1Dcache.cacheProbe(in_msg.LineAddress);
+              trigger(Event:L1_Replacement, victim, getL1DCacheEntry(victim), L1_TBEs[victim]);
+            }
+          }
+        }
+        // ===================================================================
+        // 4. CATCH-ALL (Flushes, etc.)
+        // ===================================================================
+        else {
+           trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.LineAddress, getL1DCacheEntry(in_msg.LineAddress), tbe);
         }
       }
     }
@@ -1107,6 +1208,7 @@ action(a_issueReadRequest, "a", desc="Issue GETS") {
           } else {
             out_msg.MessageSize := MessageSizeType:Reissue_Control;
           }
+
           out_msg.Prefetch := tbe.Prefetch;
           out_msg.AccessMode := tbe.AccessMode;
           out_msg.sector_id := tbe.LastSectorID;
@@ -1139,7 +1241,8 @@ action(a_issueReadRequest, "a", desc="Issue GETS") {
 
           out_msg.RetryNum := tbe.IssueCount;
           out_msg.isLocal := true;
-          out_msg.MessageSize := MessageSizeType:Broadcast_Control;
+          out_msg.MessageSize := MessageSizeType:Request_Control;
+          //out_msg.MessageSize := MessageSizeType:Broadcast_Control;
           out_msg.Prefetch := tbe.Prefetch;
           out_msg.AccessMode := tbe.AccessMode;
           out_msg.sector_id := tbe.LastSectorID;
@@ -1318,6 +1421,30 @@ action(a_issueReadRequest, "a", desc="Issue GETS") {
       }
   }
 
+  action(b_issueUpgradeRequest, "bU", desc="Issue an upgrade request (tokens only)") {
+    peek(mandatoryQueue_in, RubyRequest) {
+      // Enqueue the request to the network
+      // (Note: Replace 'issue_latency' with whatever your standard latency variable is, e.g., 'l1_request_latency')
+      enqueue(requestNetwork_out, RequestMsg, l1_request_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:GETX;
+        out_msg.Requestor := machineID;
+
+        // Route to the Directory
+        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+
+        // Control message only, no data payload
+        out_msg.MessageSize := MessageSizeType:Request_Control;
+        out_msg.AccessMode := in_msg.AccessMode;
+        out_msg.Prefetch := in_msg.Prefetch;
+
+        // AMTC Specifics: Request tokens for the specific sector the CPU wants to write
+        out_msg.sector_mask := amtc_singleSectorMaskFromAddr(address);
+        out_msg.requested_sector_mask := amtc_singleSectorMaskFromAddr(address);
+      }
+    }
+  }
+
   action(bb_bounceResponse, "\b", desc="Bounce tokens and data to memory") {
     peek(responseNetwork_in, ResponseMsg) {
       // FIXME, should use a 3rd vnet
@@ -1340,33 +1467,32 @@ action(a_issueReadRequest, "a", desc="Issue GETS") {
     enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
       out_msg.addr := address;
       out_msg.Sender := machineID;
-      out_msg.Destination.add(mapAddressToRange(address,
-                                MachineType:L2Cache, l2_select_low_bit,
-                                l2_select_num_bits, intToID(0)));
+      out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache, l2_select_low_bit, l2_select_num_bits, intToID(0)));
 
-      // SECTOR AWARE: Prefer DirtySectors for the payload size.
-      // Fallback to ValidSectors if we are just doing a capacity eviction of clean data.
+      // STRICT ISOLATION: Only write back sectors we actually modified!
+      // This prevents overwriting the L2 with our stale clean data.
       int wb_mask := cache_entry.DirtySectors;
-      if (wb_mask == 0) {
-        wb_mask := cache_entry.ValidSectors;
-      }
-      if (wb_mask == 0) {
-        wb_mask := amtc_fullMask(); // Safety fallback
-      }
 
       out_msg.sector_id := amtc_primarySectorFromMask(wb_mask);
       out_msg.sector_mask := wb_mask;
-      out_msg.valid_sector_mask := wb_mask;
-      out_msg.token_sector_mask := wb_mask;
+      out_msg.token_sector_mask := amtc_fullMask(); // Send all tokens back
       out_msg.requested_sector_mask := wb_mask;
       out_msg.DataBlk := cache_entry.DataBlk;
-      out_msg.Dirty := cache_entry.Dirty;
-      out_msg.Type := CoherenceResponseType:WB_OWNED;
       out_msg.TokensSec0 := cache_entry.TokensSec0;
       out_msg.TokensSec1 := cache_entry.TokensSec1;
 
-      // SECTOR AWARE: Dynamically shrink the NoC packet!
-      out_msg.MessageSize := amtc_getSizeFromDirtyMask(wb_mask);
+      // If we didn't dirty anything, DO NOT send a data payload.
+      if (wb_mask == 0) {
+        out_msg.Dirty := false;
+        out_msg.Type := CoherenceResponseType:WB_TOKENS;
+        out_msg.valid_sector_mask := 0;
+        out_msg.MessageSize := MessageSizeType:Writeback_Control;
+      } else {
+        out_msg.Dirty := true;
+        out_msg.Type := CoherenceResponseType:WB_OWNED;
+        out_msg.valid_sector_mask := wb_mask;
+        out_msg.MessageSize := amtc_getSizeFromDirtyMask(wb_mask);
+      }
     }
     cache_entry.TokensSec0 := 0;
     cache_entry.TokensSec1 := 0;
@@ -1374,70 +1500,54 @@ action(a_issueReadRequest, "a", desc="Issue GETS") {
 
   action(cc_sharedReplacement, "\c", desc="Issue shared writeback") {
     assert(is_valid(cache_entry));
-    assert (cache_entry.Tokens > 0);
     enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
         out_msg.addr := address;
         out_msg.Sender := machineID;
-        out_msg.Destination.add(mapAddressToRange(address,
-                                  MachineType:L2Cache, l2_select_low_bit,
-                                  l2_select_num_bits, intToID(0)));
+        out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache, l2_select_low_bit, l2_select_num_bits, intToID(0)));
 
-        int wb_mask := cache_entry.ValidSectors;
-        if (wb_mask == 0) {
-          wb_mask := amtc_fullMask();
-        }
-
-        out_msg.sector_id := amtc_primarySectorFromMask(wb_mask);
-        out_msg.sector_mask := wb_mask;
-        out_msg.valid_sector_mask := wb_mask;
-        out_msg.token_sector_mask := wb_mask;
-        out_msg.requested_sector_mask := wb_mask;
-
-        // ADD THIS MISSING LINE:
+        // Shared evictions never carry physical data.
+        out_msg.Type := CoherenceResponseType:WB_TOKENS;
+        out_msg.valid_sector_mask := 0;
+        out_msg.token_sector_mask := amtc_fullMask();
         out_msg.DataBlk := cache_entry.DataBlk;
-
         out_msg.Dirty := false;
-        out_msg.Type := CoherenceResponseType:WB_SHARED_DATA;
-        out_msg.MessageSize := amtc_getSizeFromDirtyMask(wb_mask);
+        out_msg.MessageSize := MessageSizeType:Writeback_Control;
 
         out_msg.TokensSec0 := cache_entry.TokensSec0;
-      out_msg.TokensSec1 := cache_entry.TokensSec1;
+        out_msg.TokensSec1 := cache_entry.TokensSec1;
     }
-    cache_entry.Tokens := 0;
+    cache_entry.TokensSec0 := 0;
+    cache_entry.TokensSec1 := 0;
   }
 
   action(tr_tokenReplacement, "tr", desc="Issue token writeback") {
     assert(is_valid(cache_entry));
-    if (cache_entry.Tokens > 0) {
+    // CRITICAL FIX: Check the actual sector tokens!
+    if (cache_entry.TokensSec0 > 0 || cache_entry.TokensSec1 > 0) {
       enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
         out_msg.addr := address;
         out_msg.Sender := machineID;
-        out_msg.Destination.add(mapAddressToRange(address,
-                                  MachineType:L2Cache, l2_select_low_bit,
-                                  l2_select_num_bits, intToID(0)));
+        out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache, l2_select_low_bit, l2_select_num_bits, intToID(0)));
         out_msg.TokensSec0 := cache_entry.TokensSec0;
-      out_msg.TokensSec1 := cache_entry.TokensSec1;
+        out_msg.TokensSec1 := cache_entry.TokensSec1;
         out_msg.DataBlk := cache_entry.DataBlk;
         out_msg.Dirty := false;
 
-        // SECTOR AWARE: Track which sectors these returned tokens belong to
         int wb_mask := cache_entry.ValidSectors;
-        if (wb_mask == 0) {
-          wb_mask := amtc_fullMask();
-        }
+        if (wb_mask == 0) { wb_mask := amtc_fullMask(); }
 
         out_msg.sector_id := amtc_primarySectorFromMask(wb_mask);
         out_msg.sector_mask := wb_mask;
-        out_msg.valid_sector_mask := 0; // 0 because no data payload is sent
+        out_msg.valid_sector_mask := 0;
         out_msg.token_sector_mask := wb_mask;
         out_msg.requested_sector_mask := wb_mask;
-
-        // Maintain the tiny 8-byte control size
         out_msg.MessageSize := MessageSizeType:Writeback_Control;
         out_msg.Type := CoherenceResponseType:WB_TOKENS;
       }
     }
-    cache_entry.Tokens := 0;
+    // CRITICAL FIX: Zero out the actual sector tokens!
+    cache_entry.TokensSec0 := 0;
+    cache_entry.TokensSec1 := 0;
   }
 
 
@@ -1449,10 +1559,25 @@ action(a_issueReadRequest, "a", desc="Issue GETS") {
         out_msg.Type := CoherenceResponseType:DATA_SHARED;
         out_msg.Sender := machineID;
         out_msg.Destination.add(in_msg.Requestor);
-        //out_msg.Tokens := 1;
         out_msg.DataBlk := cache_entry.DataBlk;
-        // out_msg.Dirty := cache_entry.Dirty;
+        out_msg.valid_sector_mask := cache_entry.ValidSectors;
         out_msg.Dirty := false;
+
+        // Safely delegate exactly 1 token for requested sectors
+        if (amtc_maskHasSector(in_msg.requested_sector_mask, 0) && cache_entry.TokensSec0 > 1) {
+            out_msg.TokensSec0 := 1;
+            cache_entry.TokensSec0 := cache_entry.TokensSec0 - 1;
+        } else {
+            out_msg.TokensSec0 := 0;
+        }
+
+        if (amtc_maskHasSector(in_msg.requested_sector_mask, 1) && cache_entry.TokensSec1 > 1) {
+            out_msg.TokensSec1 := 1;
+            cache_entry.TokensSec1 := cache_entry.TokensSec1 - 1;
+        } else {
+            out_msg.TokensSec1 := 0;
+        }
+
         if (in_msg.isLocal) {
           out_msg.MessageSize := MessageSizeType:ResponseLocal_Data;
         } else {
@@ -1460,58 +1585,75 @@ action(a_issueReadRequest, "a", desc="Issue GETS") {
         }
       }
     }
-    cache_entry.Tokens := cache_entry.Tokens - 1;
-    assert(cache_entry.Tokens >= 1);
   }
 
-  action(d_sendDataWithNTokenIfAvail, "\dd", desc="Send data and a token from cache to requestor") {
+  action(d_sendDataWithNTokenIfAvail, "\dd", desc="Send data and N tokens from cache to requestor") {
     assert(is_valid(cache_entry));
     int tokens_per_sector := max_tokens() / 2;
+    int owner_limit := N_tokens + tokens_per_sector;
+
     peek(requestNetwork_in, RequestMsg) {
-      if (cache_entry.Tokens > (N_tokens + (max_tokens() / 2))) {
-        enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
-          out_msg.addr := address;
-          out_msg.Type := CoherenceResponseType:DATA_SHARED;
-          out_msg.Sender := machineID;
-          out_msg.Destination.add(in_msg.Requestor);
-          out_msg.TokensSec0 := cache_entry.TokensSec0;
-      out_msg.TokensSec1 := cache_entry.TokensSec1;
-          out_msg.DataBlk := cache_entry.DataBlk;
-          // out_msg.Dirty := cache_entry.Dirty;
-          out_msg.Dirty := false;
-          if (in_msg.isLocal) {
-            out_msg.MessageSize := MessageSizeType:ResponseLocal_Data;
-          } else {
-            out_msg.MessageSize := MessageSizeType:Response_Data;
-          }
-        }
-        cache_entry.TokensSec1 := cache_entry.TokensSec1 - 1;
-        cache_entry.TokensSec1 := cache_entry.TokensSec1 - N_tokens;
-        if (cache_entry.TokensSec1 < tokens_per_sector) {
-            cache_entry.ValidSectors := amtc_subtractMask(cache_entry.ValidSectors, 2);
+      int req_mask := in_msg.requested_sector_mask;
+      if (req_mask == 0) { req_mask := amtc_fullMask(); }
+      int send_mask := amtc_intersectMasks(req_mask, cache_entry.ValidSectors);
+
+      int send_t0 := 0;
+      int send_t1 := 0;
+
+      // Evaluate Sector 0
+      if (amtc_maskHasSector(send_mask, 0)) {
+        if (cache_entry.TokensSec0 > owner_limit) {
+            send_t0 := N_tokens;
+        } else if (cache_entry.TokensSec0 > 1) {
+            send_t0 := 1;
         }
       }
-      else if (cache_entry.Tokens > 1) {
+
+      // Evaluate Sector 1
+      if (amtc_maskHasSector(send_mask, 1)) {
+        if (cache_entry.TokensSec1 > owner_limit) {
+            send_t1 := N_tokens;
+        } else if (cache_entry.TokensSec1 > 1) {
+            send_t1 := 1;
+        }
+      }
+
+      // If we have any tokens to give, send the payload
+      if (send_t0 > 0 || send_t1 > 0) {
         enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
           out_msg.addr := address;
           out_msg.Type := CoherenceResponseType:DATA_SHARED;
           out_msg.Sender := machineID;
           out_msg.Destination.add(in_msg.Requestor);
-          out_msg.TokensSec0 := 1;
-      out_msg.TokensSec1 := 1;
-          out_msg.DataBlk := cache_entry.DataBlk;
-          // out_msg.Dirty := cache_entry.Dirty;
+          out_msg.TokensSec0 := send_t0;
+          out_msg.TokensSec1 := send_t1;
+
+          if (amtc_maskHasSector(send_mask, 0)) { out_msg.DataBlk.copyPartial(cache_entry.DataBlk, 0, 32); }
+          if (amtc_maskHasSector(send_mask, 1)) { out_msg.DataBlk.copyPartial(cache_entry.DataBlk, 32, 32); }
+
+          out_msg.valid_sector_mask := send_mask;
           out_msg.Dirty := false;
+
           if (in_msg.isLocal) {
             out_msg.MessageSize := MessageSizeType:ResponseLocal_Data;
           } else {
-            out_msg.MessageSize := MessageSizeType:Response_Data;
+            out_msg.MessageSize := amtc_getSizeFromDirtyMask(send_mask);
           }
         }
-        cache_entry.Tokens := cache_entry.Tokens - 1;
+
+        // Deduct tokens
+        cache_entry.TokensSec0 := cache_entry.TokensSec0 - send_t0;
+        cache_entry.TokensSec1 := cache_entry.TokensSec1 - send_t1;
+
+        // Downgrade ValidSectors if we lost our Owner status for that sector
+        if (cache_entry.TokensSec0 < tokens_per_sector) {
+            cache_entry.ValidSectors := amtc_clearSector(cache_entry.ValidSectors, 0);
+        }
+        if (cache_entry.TokensSec1 < tokens_per_sector) {
+            cache_entry.ValidSectors := amtc_clearSector(cache_entry.ValidSectors, 1);
+        }
       }
     }
-//    assert(cache_entry.Tokens >= 1);
   }
 
 action(dd_sendDataWithAllTokens, "\d", desc="Send data and all tokens") {
@@ -1541,251 +1683,287 @@ action(dd_sendDataWithAllTokens, "\d", desc="Send data and all tokens") {
         }
       }
     }
-    cache_entry.Tokens := 0;
+    cache_entry.TokensSec0 := 0;
+    cache_entry.TokensSec1 := 0;
   }
 
-  action(e_sendAckWithCollectedTokens, "e", desc="Send ack with the tokens we've collected thus far.") {
-    // assert(persistentTable.findSmallest(address) != id); // Make sure we never bounce tokens to ourself
+action(e_sendAckWithCollectedTokens, "e", desc="Send ack with the tokens we've collected thus far.") {
     assert(is_valid(cache_entry));
-    if (cache_entry.Tokens > 0) {
+
+    // Evaluate our sectored token pools directly
+    if (cache_entry.TokensSec0 > 0 || cache_entry.TokensSec1 > 0) {
       enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
         out_msg.addr := address;
-        int expected_tokens := amtc_expectedTokensForMask(cache_entry.ValidSectors);
-        if (cache_entry.Tokens > (expected_tokens / 2)){
-          out_msg.Type := CoherenceResponseType:DATA_OWNER;
-        } else {
-          out_msg.Type := CoherenceResponseType:ACK;
-        }
+
+        // This is an ACK action. We yield the tokens as a control message.
+        out_msg.Type := CoherenceResponseType:ACK;
+
         out_msg.Sender := machineID;
         out_msg.Destination.add(persistentTable.findSmallest(address));
-        assert(cache_entry.Tokens >= 1);
+
         out_msg.TokensSec0 := cache_entry.TokensSec0;
-      out_msg.TokensSec1 := cache_entry.TokensSec1;
+        out_msg.TokensSec1 := cache_entry.TokensSec1;
         out_msg.DataBlk := cache_entry.DataBlk;
         out_msg.MessageSize := MessageSizeType:Response_Control;
+
+        // AMTC Metadata: Dynamically flag which sectors these tokens belong to
+        int t_mask := 0;
+        if (cache_entry.TokensSec0 > 0) { t_mask := amtc_unionMasks(t_mask, 1); }
+        if (cache_entry.TokensSec1 > 0) { t_mask := amtc_unionMasks(t_mask, 2); }
+
+        out_msg.token_sector_mask := t_mask;
+        out_msg.valid_sector_mask := 0; // ACKs never carry valid data
       }
     }
-    cache_entry.Tokens := 0;
+
+    // Safely zero out local tokens
+    cache_entry.TokensSec0 := 0;
+    cache_entry.TokensSec1 := 0;
   }
 
-  action(ee_sendDataWithAllTokens, "\e", desc="Send data and all tokens from cache to starver") {
-    //assert(persistentTable.findSmallest(address) != id); // Make sure we never bounce tokens to ourself
+action(ee_sendDataWithAllTokens, "\e", desc="Send data and all tokens from cache to starver") {
     assert(is_valid(cache_entry));
-    assert(cache_entry.Tokens > 0);
+    assert(cache_entry.TokensSec0 > 0 || cache_entry.TokensSec1 > 0);
+
     enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
       out_msg.addr := address;
       out_msg.Type := CoherenceResponseType:DATA_OWNER;
       out_msg.Sender := machineID;
       out_msg.Destination.add(persistentTable.findSmallest(address));
-      int expected_tokens := amtc_expectedTokensForMask(cache_entry.ValidSectors);
-      assert(cache_entry.Tokens == expected_tokens);
+
       out_msg.TokensSec0 := cache_entry.TokensSec0;
       out_msg.TokensSec1 := cache_entry.TokensSec1;
       out_msg.DataBlk := cache_entry.DataBlk;
+
+      out_msg.valid_sector_mask := cache_entry.ValidSectors;
+      out_msg.token_sector_mask := cache_entry.ValidSectors;
       out_msg.Dirty := cache_entry.Dirty;
-      out_msg.MessageSize := MessageSizeType:Response_Data;
+
+      // Dynamic message sizing based on how many sectors are valid
+      out_msg.MessageSize := amtc_getSizeFromDirtyMask(cache_entry.ValidSectors);
     }
-    cache_entry.Tokens := 0;
+
+    // Safely zero out the sector token pools
+    cache_entry.TokensSec0 := 0;
+    cache_entry.TokensSec1 := 0;
   }
 
   action(f_sendAckWithAllButNorOneTokens, "f", desc="Send ack with all our tokens but one to starver.") {
-    //assert(persistentTable.findSmallest(address) != id); // Make sure we never bounce tokens to ourself
     assert(is_valid(cache_entry));
-    assert(cache_entry.Tokens > 0);
-    if (cache_entry.Tokens > 1) {
-      enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
-        out_msg.addr := address;
-        int expected_tokens := amtc_expectedTokensForMask(cache_entry.ValidSectors);
-        if ((cache_entry.Tokens > (expected_tokens / 2))) {
-          out_msg.Type := CoherenceResponseType:DATA_OWNER;
-        } else {
-          out_msg.Type := CoherenceResponseType:ACK;
-        }
-        out_msg.Sender := machineID;
-        out_msg.Destination.add(persistentTable.findSmallest(address));
-        assert(cache_entry.Tokens >= 1);
-        if (cache_entry.TokensSec0 > N_tokens) {
-          out_msg.TokensSec0 := cache_entry.TokensSec0 - N_tokens;
 
-      out_msg.TokensSec1 := cache_entry.TokensSec1 -N_tokens;
-        } else {
-          out_msg.TokensSec0 := cache_entry.TokensSec0 -1;
-      out_msg.TokensSec1 := cache_entry.TokensSec1 -1;
-        }
-        out_msg.DataBlk := cache_entry.DataBlk;
-        out_msg.MessageSize := MessageSizeType:Response_Control;
-      }
+    int send_t0 := 0;
+    int send_t1 := 0;
+
+    // Evaluate Sector 0: If we have > 1 token, keep 1 and send the rest.
+    if (cache_entry.TokensSec0 > 1) {
+        send_t0 := cache_entry.TokensSec0 - 1;
+        cache_entry.TokensSec0 := 1;
+    }
+    // Evaluate Sector 1: If we have > 1 token, keep 1 and send the rest.
+    if (cache_entry.TokensSec1 > 1) {
+        send_t1 := cache_entry.TokensSec1 - 1;
+        cache_entry.TokensSec1 := 1;
     }
 
+    if (send_t0 > 0 || send_t1 > 0) {
+      enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:ACK; // ACKs never carry data
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(persistentTable.findSmallest(address));
+
+        out_msg.TokensSec0 := send_t0;
+        out_msg.TokensSec1 := send_t1;
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+
+        // AMTC Metadata: Flag which sectors these tokens belong to
+        int t_mask := 0;
+        if (send_t0 > 0) { t_mask := amtc_unionMasks(t_mask, 1); }
+        if (send_t1 > 0) { t_mask := amtc_unionMasks(t_mask, 2); }
+
+        out_msg.token_sector_mask := t_mask;
+        out_msg.valid_sector_mask := 0;
+      }
+    }
   }
 
   action(ff_sendDataWithAllButNorOneTokens, "\f", desc="Send data and out tokens but one to starver") {
-    //assert(persistentTable.findSmallest(address) != id); // Make sure we never bounce tokens to ourself
     assert(is_valid(cache_entry));
-    assert(cache_entry.Tokens > ((max_tokens() / 2) + 1));
-    enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
-        out_msg.addr := address;
-        out_msg.Type := CoherenceResponseType:DATA_OWNER;
-        out_msg.Sender := machineID;
-        out_msg.Destination.add(persistentTable.findSmallest(address));
-out_msg.TokensSec0 := cache_entry.TokensSec0;
-out_msg.TokensSec1 := cache_entry.TokensSec1;
 
-        out_msg.DataBlk := cache_entry.DataBlk;
-        out_msg.Dirty := cache_entry.Dirty;
-        out_msg.MessageSize := MessageSizeType:Response_Data;
+    int send_t0 := 0;
+    int send_t1 := 0;
+    int send_mask := 0;
+
+    // Evaluate Sector 0
+    if (cache_entry.TokensSec0 > 1) {
+        send_t0 := cache_entry.TokensSec0 - 1;
+        cache_entry.TokensSec0 := 1;
+        send_mask := amtc_unionMasks(send_mask, 1);
     }
-    if (cache_entry.Tokens > (N_tokens + (max_tokens() / 2))) {
-      cache_entry.Tokens := N_tokens;
-    } else {
-      cache_entry.Tokens := 1;
+    // Evaluate Sector 1
+    if (cache_entry.TokensSec1 > 1) {
+        send_t1 := cache_entry.TokensSec1 - 1;
+        cache_entry.TokensSec1 := 1;
+        send_mask := amtc_unionMasks(send_mask, 2);
+    }
+
+    if (send_t0 > 0 || send_t1 > 0) {
+      enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceResponseType:DATA_OWNER;
+          out_msg.Sender := machineID;
+          out_msg.Destination.add(persistentTable.findSmallest(address));
+
+          out_msg.TokensSec0 := send_t0;
+          out_msg.TokensSec1 := send_t1;
+
+          // Sector-Aware Data Copy: Only send the bytes we are yielding
+          if (amtc_maskHasSector(send_mask, 0)) { out_msg.DataBlk.copyPartial(cache_entry.DataBlk, 0, 32); }
+          if (amtc_maskHasSector(send_mask, 1)) { out_msg.DataBlk.copyPartial(cache_entry.DataBlk, 32, 32); }
+
+          out_msg.valid_sector_mask := send_mask;
+          out_msg.token_sector_mask := send_mask;
+          out_msg.Dirty := cache_entry.Dirty;
+          out_msg.MessageSize := amtc_getSizeFromDirtyMask(send_mask);
+      }
     }
   }
 
   action(fo_sendDataWithOwnerToken, "fo", desc="Send data and owner tokens") {
     assert(is_valid(cache_entry));
-    assert(cache_entry.Tokens == ((max_tokens() / 2) + 1));
     enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
         out_msg.addr := address;
         out_msg.Type := CoherenceResponseType:DATA_OWNER;
         out_msg.Sender := machineID;
         out_msg.Destination.add(persistentTable.findSmallest(address));
-        out_msg.TokensSec0 := cache_entry.TokensSec0;
-out_msg.TokensSec1 := cache_entry.TokensSec1;
 
+        out_msg.TokensSec0 := cache_entry.TokensSec0;
+        out_msg.TokensSec1 := cache_entry.TokensSec1;
         out_msg.DataBlk := cache_entry.DataBlk;
+
+        out_msg.valid_sector_mask := cache_entry.ValidSectors;
+        out_msg.token_sector_mask := cache_entry.ValidSectors;
         out_msg.Dirty := cache_entry.Dirty;
-        out_msg.MessageSize := MessageSizeType:Response_Data;
+        out_msg.MessageSize := amtc_getSizeFromDirtyMask(cache_entry.ValidSectors);
     }
-    cache_entry.Tokens := 0;
+    cache_entry.TokensSec0 := 0;
+    cache_entry.TokensSec1 := 0;
   }
 
   action(g_bounceResponseToStarver, "g", desc="Redirect response to starving processor") {
-    // assert(persistentTable.isLocked(address));
-
     peek(responseNetwork_in, ResponseMsg) {
-      // assert(persistentTable.findSmallest(address) != id); // Make sure we never bounce tokens to ourself
-      // FIXME, should use a 3rd vnet in some cases
       enqueue(responseNetwork_out, ResponseMsg, 1) {
         out_msg.addr := address;
         out_msg.Type := in_msg.Type;
         out_msg.Sender := machineID;
         out_msg.Destination.add(persistentTable.findSmallest(address));
-       out_msg.TokensSec0 := cache_entry.TokensSec0;
-out_msg.TokensSec1 := cache_entry.TokensSec1;
+
+        // CRITICAL FIX: Combine incoming tokens with our local tokens!
+        if (is_valid(cache_entry)) {
+            out_msg.TokensSec0 := in_msg.TokensSec0 + cache_entry.TokensSec0;
+            out_msg.TokensSec1 := in_msg.TokensSec1 + cache_entry.TokensSec1;
+        } else {
+            out_msg.TokensSec0 := in_msg.TokensSec0;
+            out_msg.TokensSec1 := in_msg.TokensSec1;
+        }
+
         out_msg.DataBlk := in_msg.DataBlk;
+        out_msg.valid_sector_mask := in_msg.valid_sector_mask;
+        out_msg.token_sector_mask := in_msg.token_sector_mask;
         out_msg.Dirty := in_msg.Dirty;
         out_msg.MessageSize := in_msg.MessageSize;
       }
     }
+
+    // Safely zero out our local tokens since we just yielded them all
+    if (is_valid(cache_entry)) {
+        cache_entry.TokensSec0 := 0;
+        cache_entry.TokensSec1 := 0;
+    }
   }
 
-action(h_load_hit, "hd", desc="CPU load hit (sector-aware)") {
+  action(h_load_hit, "hd", desc="CPU load hit") {
+    // Always assert validity first!
     assert(is_valid(cache_entry));
 
-    // 1. Handle Callback: Is the SPECIFIC sector the CPU wants valid?
-    if (amtc_isSectorAvailable(cache_entry.ValidSectors, address)) {
-      L1Dcache.setMRU(cache_entry);
-      sequencer.readCallback(address, cache_entry.DataBlk, false,
-                             MachineType:L1Cache);
-    }
+    L1Dcache.setMRU(cache_entry);
 
-    // 2. Handle Missing Sectors: Is the rest of the line incomplete?
-    if (cache_entry.ValidSectors != amtc_fullMask()) {
-      DPRINTF(RubySlicc, "Partial valid sector hit. Requesting missing sectors for addr %#x\n", address);
-      // trigger(Event:LoadMiss, address, cache_entry, tbe);
-      // (Or enqueue a GETS for the missing mask here)
-    }
+    // Unconditional callback
+    sequencer.readCallback(address, cache_entry.DataBlk, false, MachineType:L1Cache);
   }
 
-  action(h_ifetch_hit, "hi", desc="CPU ifetch hit (sector-aware)") {
+ action(h_ifetch_hit, "hi", desc="CPU ifetch hit") {
     assert(is_valid(cache_entry));
 
-    // 1. Handle Callback
-    if (amtc_isSectorAvailable(cache_entry.ValidSectors, address)) {
-      L1Icache.setMRU(cache_entry);
-      sequencer.readCallback(address, cache_entry.DataBlk, false,
-                             MachineType:L1Cache);
-    }
+    L1Icache.setMRU(cache_entry);
 
-    // 2. Handle Missing Sectors
+    // Unconditional callback. We trust the in_port only fired Ifetch
+    // because the specific sector the CPU wants is actually here.
+    sequencer.readCallback(address, cache_entry.DataBlk, false, MachineType:L1Cache);
+
+    // --- OPTIONAL: AGGRESSIVE PREFETCHING ---
+    // If you want to fetch the rest of the line without stalling the CPU:
     if (cache_entry.ValidSectors != amtc_fullMask()) {
-      DPRINTF(RubySlicc, "Partial ifetch hit. Requesting missing sectors for addr %#x\n", address);
-      // trigger(Event:IfetchMiss, address, cache_entry, tbe);
+        DPRINTF(RubySlicc, "Partial ifetch hit. Issuing background fetch for addr %#x\n", address);
+
+        // Instead of a trigger, we directly enqueue a background GETS request for the missing mask
+        peek(mandatoryQueue_in, RubyRequest) {
+            enqueue(requestNetwork_out, RequestMsg, l1_request_latency) {
+                out_msg.addr := address;
+                out_msg.Type := CoherenceRequestType:GETS;
+                out_msg.Requestor := machineID;
+                out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+                out_msg.MessageSize := MessageSizeType:Request_Control;
+                out_msg.AccessMode := in_msg.AccessMode;
+                out_msg.Prefetch := in_msg.Prefetch;
+
+                // Ask for everything we don't currently have
+                out_msg.requested_sector_mask := amtc_subtractMask(amtc_fullMask(), cache_entry.ValidSectors);
+                out_msg.sector_mask := out_msg.requested_sector_mask;
+            }
+        }
     }
   }
 
-  action(hh_store_hit, "\\h", desc="CPU store hit (sector-aware)") {
-    assert(is_valid(cache_entry));
+action(hh_store_hit, "\\h", desc="CPU store hit") {
+  L1Dcache.setMRU(cache_entry);
+  sequencer.writeCallback(address, cache_entry.DataBlk, false, MachineType:L1Cache);
+  cache_entry.Dirty := true;
 
-    // 1. Handle Callback (Only write if we own the target sector)
-    if (amtc_isSectorAvailable(cache_entry.ValidSectors, address)) {
-      L1Dcache.setMRU(cache_entry);
-      sequencer.writeCallback(address, cache_entry.DataBlk, false,
-                              MachineType:L1Cache);
-      cache_entry.Dirty := true;
+  // Look directly into the CPU queue to get the UNSTRIPPED physical address
+  peek(mandatoryQueue_in, RubyRequest) {
+    int req_offset := getOffset(in_msg.PhysicalAddress);
+    int store_mask := amtc_calculateNeededMask(req_offset, in_msg.Size);
 
-      peek(mandatoryQueue_in, RubyRequest) {
-        int store_mask := amtc_singleSectorMaskFromAddr(in_msg.PhysicalAddress);
-        cache_entry.DirtySectors := amtc_unionMasks(cache_entry.DirtySectors, store_mask);
-      }
-    }
-
-    // 2. Handle Missing Sectors
-    if (cache_entry.ValidSectors != amtc_fullMask()) {
-      DPRINTF(RubySlicc, "Partial store hit. Requesting missing sectors for addr %#x\n", address);
-      // trigger(Event:StoreMiss, address, cache_entry, tbe);
-      // (Or enqueue a GETX for the missing mask here)
-    }
+    // Now we accurately dirty ONLY the sector the CPU actually wrote to!
+    cache_entry.DirtySectors := amtc_unionMasks(cache_entry.DirtySectors, store_mask);
   }
+}
 
-  action(x_external_load_hit, "x", desc="External load completion (sector-aware)") {
+
+
+action(x_external_load_hit, "x", desc="External load completion") {
+  peek(responseNetwork_in, ResponseMsg) {
+    L1Icache.setMRU(address);
+    L1Dcache.setMRU(address);
+    //sequencer.readCallback(address, cache_entry.DataBlk, true, machineIDToMachineType(in_msg.Sender));
+  }
+}
+
+action(xx_external_store_hit, "\\x", desc="External store completion (sector-aware)") {
     assert(is_valid(cache_entry));
 
     peek(responseNetwork_in, ResponseMsg) {
-
-      // 1. Wake the CPU if the response brought the sector we need
       if (amtc_isSectorAvailable(cache_entry.ValidSectors, address)) {
         L1Icache.setMRU(address);
         L1Dcache.setMRU(address);
 
-        sequencer.readCallback(address, cache_entry.DataBlk,
-                               isExternalHit(address, in_msg.Sender),
-                               machineIDToMachineType(in_msg.Sender));
-      }
-
-      // 2. Did this response leave us with remaining missing sectors?
-      if (cache_entry.ValidSectors != amtc_fullMask()) {
-        DPRINTF(RubySlicc, "External response still partial. Requesting missing sectors for %#x\n", address);
-        // trigger(Event:LoadMiss, address, cache_entry, tbe);
-      }
-    }
-  }
-
-  action(xx_external_store_hit, "\\x", desc="External store completion (sector-aware)") {
-    assert(is_valid(cache_entry));
-
-    peek(responseNetwork_in, ResponseMsg) {
-
-      // 1. Wake the CPU if the response brought the sector we need to write to
-      if (amtc_isSectorAvailable(cache_entry.ValidSectors, address)) {
-        L1Icache.setMRU(address);
-        L1Dcache.setMRU(address);
-
-        sequencer.writeCallback(address, cache_entry.DataBlk,
-                                isExternalHit(address, in_msg.Sender),
-                                machineIDToMachineType(in_msg.Sender));
+        //sequencer.writeCallback(address, cache_entry.DataBlk, true, machineIDToMachineType(in_msg.Sender));
 
         cache_entry.Dirty := true;
         if (is_valid(tbe)) {
           cache_entry.DirtySectors := amtc_unionMasks(cache_entry.DirtySectors, tbe.RequestedSectorMask);
         }
-      }
-
-      // 2. Do we still need to fetch other sectors for this line?
-      if (cache_entry.ValidSectors != amtc_fullMask()) {
-        DPRINTF(RubySlicc, "External store response still partial. Requesting missing sectors for %#x\n", address);
-        // trigger(Event:StoreMiss, address, cache_entry, tbe);
       }
     }
   }
@@ -1830,19 +2008,14 @@ action(i_allocateTBE, "i", desc="Allocate TBE") {
       // =========================================================
       // AMTC MIXED-MODE FETCH LOGIC
       // =========================================================
-      int req_offset := getOffset(in_msg.PhysicalAddress);
-      int req_mask := amtc_calculateNeededMask(req_offset, in_msg.Size);
-
-      if (in_msg.Type == RubyRequestType:IFETCH) {
-          req_mask := amtc_fullMask();
-      }
+      int req_mask := amtc_fullMask();
 
       tbe.RequestedSectorMask := req_mask;
       tbe.ReceivedSectorMask := 0;
       tbe.TokenReadySectorMask := 0;
       tbe.InstalledSectorMask := 0;
       tbe.RespondedSectorMask := 0;
-      tbe.LastSectorID := amtc_primarySectorFromMask(req_mask);
+      tbe.LastSectorID := 0; // Default to 0 for full line
       tbe.HasOutstandingRequest := true;
       tbe.CallbackIssued := false;
       tbe.FromGPU := false;
@@ -1854,6 +2027,7 @@ action(i_allocateTBE, "i", desc="Allocate TBE") {
       tbe.Wfid := 0;
       tbe.InstSeqNum := 0;
       tbe.IssueTime := curCycle();
+
     }
   }
 
@@ -1863,6 +2037,16 @@ action(i_allocateTBE, "i", desc="Allocate TBE") {
     }
   }
 
+  action(j_setReissueTimer, "ja", desc="Set the reissue timer for a persistent request") {
+    assert(is_valid(tbe));
+    // Example: Schedule a wakeup event after a certain latency
+    // This depends on how your specific gem5 version handles SLICC timers
+    // enqueue(node_wakeup_network_out, NodeWakeupMsg, reissue_timeout) { ... }
+
+    // Or if you use a direct timer table:
+    //reissueTimerTable.set(address, clockEdge() + reissue_timeout);
+  }
+
   action(j_unsetReissueTimer, "j", desc="Unset reissue timer.") {
     if (reissueTimerTable.isSet(address)) {
       reissueTimerTable.unset(address);
@@ -1870,7 +2054,9 @@ action(i_allocateTBE, "i", desc="Allocate TBE") {
   }
 
   action(jj_unsetUseTimer, "\j", desc="Unset use timer.") {
-    useTimerTable.unset(address);
+    if (useTimerTable.isSet(address)) {
+      useTimerTable.unset(address);
+    }
   }
 
   action(k_popMandatoryQueue, "k", desc="Pop mandatory queue.") {
@@ -1912,7 +2098,7 @@ out_msg.TokensSec1 := 0;
   action(q_updateTokensFromResponse, "q", desc="Update token count based on response") {
     peek(responseNetwork_in, ResponseMsg) {
       assert(is_valid(cache_entry));
-      int tokens_per_sector := max_tokens() / 2;
+//      int tokens_per_sector := max_tokens() / 2;
 
       // --- 1. Update tokens ---
       cache_entry.TokensSec0 := cache_entry.TokensSec0 + in_msg.TokensSec0;
@@ -1925,42 +2111,54 @@ out_msg.TokensSec1 := 0;
       }
 
       // --- 3. CRITICAL: Recompute ValidSectors from tokens ---
-      int new_valid := 0;
-
-      if (cache_entry.TokensSec0 == tokens_per_sector) {
-          new_valid := amtc_unionMasks(new_valid, 1);
-      }
-
-      if (cache_entry.TokensSec1 == tokens_per_sector) {
-          new_valid := amtc_unionMasks(new_valid, 2);
-      }
-
-      cache_entry.ValidSectors := new_valid;
+//      int new_valid := 0;
+//
+//      if (cache_entry.TokensSec0 == tokens_per_sector) {
+//          new_valid := amtc_unionMasks(new_valid, 1);
+//      }
+//
+//      if (cache_entry.TokensSec1 == tokens_per_sector) {
+//          new_valid := amtc_unionMasks(new_valid, 2);
+//      }
+//      cache_entry.ValidSectors := new_valid;
     }
   }
 
-action(amtc_completeIfAlreadyOwnsSector, "aco",
+  action(amtc_completeIfAlreadyOwnsSector, "aco",
        desc="Complete upgrade if sector tokens are already locally owned") {
     if (is_valid(cache_entry)) {
-      int expected := amtc_expectedTokensForMask(cache_entry.ValidSectors);
-      DPRINTF(RubySlicc,
-        "AMTC_L1_COMPLETE_OWNED_SECTOR addr=%#x tokens=%d valid=%d expected=%d\n",
-        address, cache_entry.Tokens, cache_entry.ValidSectors, expected);
 
-      // 1. CRITICAL FIX: Relax the token assertion for heterogeneous states
-      // assert(cache_entry.Tokens == expected);
-      assert(cache_entry.Tokens > 0);
-      assert(cache_entry.Tokens <= max_tokens());
+      // CRITICAL FIX: We no longer care about the monolithic cache_entry.Tokens.
+      // We only care if we have 512 tokens for the specifically requested sector(s).
 
-      // 2. CRITICAL FIX: Only upgrade the requested sector to Dirty!
-      // Do not accidentally mark read-only Shared sectors as dirty.
+      int tokens_per_sector := max_tokens() / 2;
       int upgrade_mask := cache_entry.ValidSectors;
+
       if (is_valid(tbe)) {
           upgrade_mask := amtc_intersectMasks(cache_entry.ValidSectors, tbe.RequestedSectorMask);
+
+          if (amtc_maskHasSector(tbe.RequestedSectorMask, 0)) {
+              assert(cache_entry.TokensSec0 == tokens_per_sector);
+          }
+          if (amtc_maskHasSector(tbe.RequestedSectorMask, 1)) {
+              assert(cache_entry.TokensSec1 == tokens_per_sector);
+          }
+      } else {
+          // If there is no TBE, we gracefully fall back to checking the whole line.
+          if (amtc_maskHasSector(cache_entry.ValidSectors, 0)) {
+              assert(cache_entry.TokensSec0 == tokens_per_sector);
+          }
+          if (amtc_maskHasSector(cache_entry.ValidSectors, 1)) {
+              assert(cache_entry.TokensSec1 == tokens_per_sector);
+          }
       }
 
-      cache_entry.DirtySectors :=
-        amtc_unionMasks(cache_entry.DirtySectors, upgrade_mask);
+      DPRINTF(RubySlicc,
+        "AMTC_L1_COMPLETE_OWNED_SECTOR addr=%#x valid=%d upgrading_mask=%d\n",
+        address, cache_entry.ValidSectors, upgrade_mask);
+
+      // Upgrade the specific sector to Dirty!
+      cache_entry.DirtySectors := amtc_unionMasks(cache_entry.DirtySectors, upgrade_mask);
     }
   }
 
@@ -2015,41 +2213,74 @@ action(amtc_completeIfAlreadyOwnsSector, "aco",
 
   action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've collected thus far.") {
     assert(is_valid(cache_entry));
-    if (cache_entry.Tokens > 0) {
+
+    // Evaluate if we hold tokens for ANY sector
+    if (cache_entry.TokensSec0 > 0 || cache_entry.TokensSec1 > 0) {
       peek(requestNetwork_in, RequestMsg) {
         enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
           out_msg.addr := address;
-          int expected_tokens := amtc_expectedTokensForMask(cache_entry.ValidSectors);
-          if ( (cache_entry.Tokens > (expected_tokens / 2))) {
-            out_msg.Type := CoherenceResponseType:DATA_OWNER;
-          } else {
-            out_msg.Type := CoherenceResponseType:ACK;
-          }
+
+          // We are yielding stray tokens. This is strictly a control message.
+          out_msg.Type := CoherenceResponseType:ACK;
           out_msg.Sender := machineID;
           out_msg.Destination.add(in_msg.Requestor);
-          assert(cache_entry.Tokens >= 1);
+
           out_msg.TokensSec0 := cache_entry.TokensSec0;
-out_msg.TokensSec1 := cache_entry.TokensSec1;
+          out_msg.TokensSec1 := cache_entry.TokensSec1;
+
+          // Even though it's an ACK, we pass the block along just in case
           out_msg.DataBlk := cache_entry.DataBlk;
           out_msg.MessageSize := MessageSizeType:Response_Control;
+
+          // AMTC Metadata: Flag exactly which sectors these tokens belong to
+          int t_mask := 0;
+          if (cache_entry.TokensSec0 > 0) { t_mask := amtc_unionMasks(t_mask, 1); }
+          if (cache_entry.TokensSec1 > 0) { t_mask := amtc_unionMasks(t_mask, 2); }
+
+          out_msg.token_sector_mask := t_mask;
+          out_msg.valid_sector_mask := 0; // ACKs never carry valid payload bytes
         }
       }
     }
-    cache_entry.Tokens := 0;
+
+    // Safely zero out our local tokens since we just yielded them all
+    cache_entry.TokensSec0 := 0;
+    cache_entry.TokensSec1 := 0;
   }
 
-action(u_writeDataToCache, "u", desc="Write data to cache") {
+  action(u_writeDataToCache, "u", desc="Write data to cache") {
     peek(responseNetwork_in, ResponseMsg) {
       assert(is_valid(cache_entry));
 
-      int copy_mask := in_msg.valid_sector_mask;
+      int copy_mask := 0;
+      if (in_msg.Type == CoherenceResponseType:DATA_SHARED ||
+          in_msg.Type == CoherenceResponseType:DATA_OWNER) {
+          copy_mask := in_msg.valid_sector_mask;
+      }
+
       if (is_valid(tbe)) {
         copy_mask := amtc_intersectMasks(copy_mask, tbe.RequestedSectorMask);
       }
 
-      // If the incoming message has no data (ACK), just skip.
-      if (copy_mask != 0) {
+      // ===================================================================
+      // CRITICAL FIX: The Refined "Late Data" Shield
+      // Only drop the data if we hold ALL tokens AND we already have the valid bytes!
+      // ===================================================================
+      int tokens_per_sector := max_tokens() / 2;
 
+      if (amtc_maskHasSector(copy_mask, 0) &&
+          cache_entry.TokensSec0 == tokens_per_sector &&
+          amtc_maskHasSector(cache_entry.ValidSectors, 0)) {
+          copy_mask := amtc_clearSector(copy_mask, 0); // Drop stale Sec 0
+      }
+
+      if (amtc_maskHasSector(copy_mask, 1) &&
+          cache_entry.TokensSec1 == tokens_per_sector &&
+          amtc_maskHasSector(cache_entry.ValidSectors, 1)) {
+          copy_mask := amtc_clearSector(copy_mask, 1); // Drop stale Sec 1
+      }
+
+      if (copy_mask != 0) {
           if (amtc_maskHasSector(copy_mask, 0)) {
               cache_entry.DataBlk.copyPartial(in_msg.DataBlk, 0, 32);
           }
@@ -2058,9 +2289,6 @@ action(u_writeDataToCache, "u", desc="Write data to cache") {
               cache_entry.DataBlk.copyPartial(in_msg.DataBlk, 32, 32);
           }
 
-          // ===================================================================
-          // CRITICAL FIX: Lock the metadata strictly to the bytes we just copied!
-          // ===================================================================
           cache_entry.ValidSectors := amtc_unionMasks(cache_entry.ValidSectors, copy_mask);
 
           if (in_msg.Dirty) {
@@ -2154,18 +2382,9 @@ action(amtc_markValidSectorsFromResponse, "mvs", desc="Mark valid sectors from r
             update_mask := amtc_intersectMasks(update_mask, tbe.RequestedSectorMask);
           }
 
-          int new_valid := cache_entry.ValidSectors;
-
-          // TOKEN-AWARE VALIDATION: We only need > 0 tokens to hold valid read-only data!
-          if (amtc_maskHasSector(update_mask, 0) && cache_entry.TokensSec0 > 0) {
-              new_valid := amtc_unionMasks(new_valid, 1); // mark sector 0 valid
-          }
-
-          if (amtc_maskHasSector(update_mask, 1) && cache_entry.TokensSec1 > 0) {
-              new_valid := amtc_unionMasks(new_valid, 2); // mark sector 1 valid
-          }
-
-          cache_entry.ValidSectors := new_valid;
+          // If the network gave us the data, mark it valid in the SRAM immediately!
+          // The transient state will protect the CPU from reading it until tokens arrive.
+          cache_entry.ValidSectors := amtc_unionMasks(cache_entry.ValidSectors, update_mask);
       }
     }
   }
@@ -2289,6 +2508,11 @@ action(amtc_markValidSectorsFromResponse, "mvs", desc="Mark valid sectors from r
           tbe.IssueCount := tbe.IssueCount + 1;
 
           // Refresh the timer so we don't time out while waiting for this new request
+	  // CRITICAL FIX: You MUST unset the timer before setting it again!
+	    if (reissueTimerTable.isSet(address)) {
+		reissueTimerTable.unset(address);
+	    }
+
           if (dynamic_timeout_enabled) {
             reissueTimerTable.set(address, clockEdge() + cyclesToTicks(averageLatencyEstimate()));
           } else {
@@ -2297,408 +2521,399 @@ action(amtc_markValidSectorsFromResponse, "mvs", desc="Mark valid sectors from r
       }
   }
 
+  action(amtc_computeMissingMask, "cm", desc="Compute missing sectors") {
+    assert(is_valid(tbe));
+    peek(mandatoryQueue_in, RubyRequest) {
+        int req_offset := getOffset(in_msg.PhysicalAddress);
+        int needed_mask := amtc_calculateNeededMask(req_offset, in_msg.Size);
+
+        // COLD MISS: We have no valid data. Fetch the entire line from Memory.
+        if (!is_valid(cache_entry) || cache_entry.ValidSectors == 0) {
+            tbe.RequestedSectorMask := amtc_fullMask();
+        }
+        // WARM MISS: We have some data, just fetch the missing pieces/tokens.
+        else {
+            if (in_msg.Type == RubyRequestType:ST || in_msg.Type == RubyRequestType:ATOMIC || in_msg.Type == RubyRequestType:Locked_RMW_Write) {
+                int missing_upgrade := 0;
+                int tokens_per_sector := max_tokens() / 2;
+
+                if (amtc_maskHasSector(needed_mask, 0) && cache_entry.TokensSec0 < tokens_per_sector) {
+                    missing_upgrade := amtc_unionMasks(missing_upgrade, 1);
+                }
+                if (amtc_maskHasSector(needed_mask, 1) && cache_entry.TokensSec1 < tokens_per_sector) {
+                    missing_upgrade := amtc_unionMasks(missing_upgrade, 2);
+                }
+                tbe.RequestedSectorMask := missing_upgrade;
+            } else {
+                tbe.RequestedSectorMask := amtc_subtractMask(needed_mask, cache_entry.ValidSectors);
+            }
+        }
+
+        if (tbe.RequestedSectorMask == 0) { tbe.RequestedSectorMask := needed_mask; }
+    }
+  }
+
+  action(z_stallAndWaitMandatoryQueue, "z", desc="Stall and wait the mandatory queue") {
+    // This tells the queue to stop evaluating this address until we explicitly wake it up later
+    stall_and_wait(mandatoryQueue_in, address);
+  }
+  action(amtc_updateStateFromSectors, "as",
+       desc="Resolve state based on sector ownership") {
+
+  bool sec0 := amtc_maskHasSector(cache_entry.ValidSectors, 0);
+  bool sec1 := amtc_maskHasSector(cache_entry.ValidSectors, 1);
+
+  if (sec0 && sec1) {
+    // full line
+    cache_entry.CacheState := State:M;
+  } else {
+    // partial ownership
+    cache_entry.CacheState := State:O;
+  }
+}
+  int amtc_getSector(Addr a) {
+    return (addressToInt(a) / 32) % 2;
+  }
+
+bool amtc_isHit(Entry cache_entry, Addr addr) {
+  int sid := amtc_getSector(addr);
+
+  return is_valid(cache_entry) &&
+         amtc_maskHasSector(cache_entry.ValidSectors, sid);
+}
+
+
   //*****************************************************
   // TRANSITIONS
   //*****************************************************
 
-  // Transitions for Load/Store/L2_Replacement from transient states
-  transition({IM, SM, OM, IS, IM_L, IS_L, I_L, S_L, SM_L, M_W, MM_W}, L1_Replacement) {
-    ta_traceStalledAddress;
+ // =====================================================================
+  // SECTION 1: TRANSIENT STATE STALLS (THE PIPELINE SHIELD)
+  // Purpose: Block CPU mandatory queue requests while waiting for network.
+  // =====================================================================
+
+// =====================================================================
+  // SECTION 1: TRANSIENT STATE STALLS (THE PIPELINE SHIELD)
+  // Purpose: Block CPU mandatory queue requests while waiting for network.
+  // =====================================================================
+
+  // 1A. DATA-STARVED TRANSIENTS (Waiting for physical bytes)
+  // These states have nothing. Stall EVERY CPU request.
+  transition({IM, IS, IM_L, IS_L, S_IS, O_IS, M_IS, M_IM, S_IM},
+             {Load, Ifetch, Store, Atomic, Load_Sector_Miss, Store_Sector_Miss, L1_Replacement}) {
     zz_stallAndWaitMandatoryQueue;
   }
 
-  transition({IM, SM, OM, IS, IM_L, IS_L, SM_L}, {Store, Atomic}) {
+  // 1B. TOKEN-STARVED TRANSIENTS (Waiting for write permissions)
+  // These states HAVE data. They will successfully hit on Load/Ifetch.
+  // We only stall Stores, Atomics, Sector Misses, and Evictions.
+  transition({SM, OM, S_L, SM_L},
+             {Store, Atomic, Store_Sector_Miss, Load_Sector_Miss, L1_Replacement}) {
     zz_stallAndWaitMandatoryQueue;
   }
 
-  transition({IM, IS, IM_L, IS_L}, {Load, Ifetch}) {
+  // 1C. TIMEOUT-WAITING TRANSIENTS (Migratory / Lockout)
+  // These states have Data AND Tokens. They hit locally on Load/Store/Atomic.
+  // We ONLY stall them if they trigger a sector miss or are evicted.
+  transition({M_W, MM_W},
+             {Load_Sector_Miss, Store_Sector_Miss, L1_Replacement}) {
     zz_stallAndWaitMandatoryQueue;
   }
 
-  // Lockdowns
-  transition({NP, I, S, O, M, MM, M_W, MM_W, IM, SM, OM, IS}, Own_Lock_or_Unlock) {
-    l_popPersistentQueue;
-  }
-
-  // Transitions from NP
-  transition(NP, Load, IS) {
-    ii_allocateL1DCacheBlock;
-    i_allocateTBE;
-    a_issueReadRequest;
-    uu_profileDataMiss;
-    k_popMandatoryQueue;
-  }
-
-  transition(NP, Ifetch, IS) {
-    pp_allocateL1ICacheBlock;
-    i_allocateTBE;
-    a_issueReadRequest;
-    uu_profileInstMiss;
-    k_popMandatoryQueue;
-  }
-
-  transition(NP, {Store, Atomic}, IM) {
-    ii_allocateL1DCacheBlock;
-    i_allocateTBE;
-    b_issueWriteRequest;
-    uu_profileDataMiss;
-    k_popMandatoryQueue;
-  }
-
-  transition(NP, {Ack, Data_Shared, Data_Owner, Data_All_Tokens}) {
-    bb_bounceResponse;
-    n_popResponseQueue;
-  }
-
-  transition(NP, {Transient_GETX, Transient_Local_GETX, Transient_GETS, Transient_Local_GETS}) {
+  // 1D. NETWORK SNOOP STALLS
+  transition({S_IS, O_IS, M_IS, M_IM, S_IM, OM, IM, SM, I_L, IM_L, IS_L, S_L, SM_L, M_W, MM_W},
+             {Transient_GETX, Transient_Local_GETX, Transient_GETS, Transient_Local_GETS, Transient_GETS_Last_Token, Transient_Local_GETS_Last_Token}) {
     m_popRequestQueue;
   }
 
+  transition(IS, {Ack, Ack_Owner}) {
+    q_updateTokensFromResponse;
+    amtc_markValidSectorsFromResponse;
+    n_popResponseQueue;
+  }
+
+  // =====================================================================
+  // SECTION 2: ALLOCATION & EVICTION (THE CACHE LIFECYCLE)
+  // Purpose: Moving from Not Present (NP) to active, or Active to Idle (I).
+  // =====================================================================
+
+  // Allocation from NP (Requires cache block allocation)
+  transition(NP, Load, IS)            { ii_allocateL1DCacheBlock; i_allocateTBE; a_issueReadRequest; uu_profileDataMiss; j_setReissueTimer; }
+  transition(NP, Ifetch, IS)          { pp_allocateL1ICacheBlock; i_allocateTBE; a_issueReadRequest; uu_profileInstMiss; j_setReissueTimer; }
+  transition(NP, {Store, Atomic}, IM) { ii_allocateL1DCacheBlock; i_allocateTBE; b_issueWriteRequest; uu_profileDataMiss; j_setReissueTimer; }
+
+  // Allocation from Idle (Block already exists, just needs TBE)
+  transition(I, Load, IS)             { i_allocateTBE; a_issueReadRequest; uu_profileDataMiss; }
+  transition(I, Ifetch, IS)           { i_allocateTBE; a_issueReadRequest; uu_profileInstMiss; }
+  transition(I, {Store, Atomic}, IM)  { i_allocateTBE; b_issueWriteRequest; uu_profileDataMiss; }
+
+  // Evictions
+  transition(I, L1_Replacement)       { ta_traceStalledAddress; tr_tokenReplacement; gg_deallocateL1CacheBlock; ka_wakeUpAllDependents; }
+  transition(S, L1_Replacement, I)    { ta_traceStalledAddress; cc_sharedReplacement; forward_eviction_to_cpu; gg_deallocateL1CacheBlock; ka_wakeUpAllDependents; }
+  transition({O, M, MM}, L1_Replacement, I) { ta_traceStalledAddress; c_ownedReplacement; forward_eviction_to_cpu; gg_deallocateL1CacheBlock; ka_wakeUpAllDependents; }
+
+  // =====================================================================
+  // SECTION 2B: BASE STATE SNOOP DROPS & BOUNCES
+  // Purpose: Safely ignore network requests for cache lines we don't hold.
+  // =====================================================================
+
+  // 1. Snoops and stray responses to NP (Not Present)
+  transition(NP, {Transient_GETX, Transient_Local_GETX, Transient_GETS, Transient_Local_GETS, Transient_GETS_Last_Token, Transient_Local_GETS_Last_Token}) {
+    m_popRequestQueue;
+  }
   transition(NP, {Persistent_GETX, Persistent_GETS, Persistent_GETS_Last_Token}, I_L) {
     l_popPersistentQueue;
   }
 
-  // Transitions from Idle
-  transition(I, Load, IS) {
-    i_allocateTBE;
-    a_issueReadRequest;
-    uu_profileDataMiss;
-    k_popMandatoryQueue;
+  transition(NP, {Ack, Ack_Owner, Ack_All_Tokens, Ack_Owner_All_Tokens, Data_Shared, Data_Owner, Data_All_Tokens, Data_Shared_Partial, Data_Owner_Partial}){
+    bb_bounceResponse;
+    n_popResponseQueue;
   }
 
-  transition(I, Ifetch, IS) {
-    i_allocateTBE;
-    a_issueReadRequest;
-    uu_profileInstMiss;
-    k_popMandatoryQueue;
-  }
-
-  transition(I, {Store, Atomic}, IM) {
-    i_allocateTBE;
-    b_issueWriteRequest;
-    uu_profileDataMiss;
-    k_popMandatoryQueue;
-  }
-
-  transition(I, L1_Replacement) {
-    ta_traceStalledAddress;
-    tr_tokenReplacement;
-    gg_deallocateL1CacheBlock;
-    ka_wakeUpAllDependents;
-  }
-
-  transition(I, {Transient_GETX, Transient_Local_GETX}) {
-    t_sendAckWithCollectedTokens;
-    m_popRequestQueue;
-  }
-
+  // 2. Snoops to I (Idle - Block allocated but no tokens/data)
   transition(I, {Transient_GETS, Transient_GETS_Last_Token, Transient_Local_GETS_Last_Token, Transient_Local_GETS}) {
     m_popRequestQueue;
   }
-
+  transition(I, {Transient_GETX, Transient_Local_GETX}) {
+    t_sendAckWithCollectedTokens; // I might have collected stray tokens, send them back
+    m_popRequestQueue;
+  }
   transition(I, {Persistent_GETX, Persistent_GETS, Persistent_GETS_Last_Token}, I_L) {
     e_sendAckWithCollectedTokens;
     l_popPersistentQueue;
   }
 
-  transition(I_L, {Persistent_GETX, Persistent_GETS, Persistent_GETS_Last_Token}) {
-    l_popPersistentQueue;
+  // =====================================================================
+  // SECTION 3: STABLE STATE HITS (ZERO-LATENCY ACCESS)
+  // Purpose: Fast-path execution when we already have the required sectors.
+  // =====================================================================
+
+  transition({S, SM, S_L, SM_L, O, OM, M, M_W, MM, MM_W}, Load) {
+    h_load_hit; uu_profileDataHit; k_popMandatoryQueue;
   }
 
-  transition(I, Ack) {
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    n_popResponseQueue;
+  transition({S, SM, S_L, SM_L, O, OM, M, M_W, MM, MM_W}, Ifetch) {
+    h_ifetch_hit; uu_profileInstHit; k_popMandatoryQueue;
   }
 
-  transition(I, Data_Shared, S) {
-    u_writeDataToCache;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    n_popResponseQueue;
+  transition({MM, MM_W, M, M_W}, Store) {
+    hh_store_hit; uu_profileDataHit; k_popMandatoryQueue;
   }
 
-  transition(I, Data_Owner, O) {
-    u_writeDataToCache;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    n_popResponseQueue;
+  transition({MM, MM_W, M_W}, Atomic) {
+    hh_store_hit; uu_profileDataHit; k_popMandatoryQueue;
   }
 
-  transition(I, Data_All_Tokens, M) {
-    u_writeDataToCache;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    n_popResponseQueue;
+  // Edge case: Atomic in M upgrades line to MM
+  transition(M, Atomic, MM) {
+    hh_store_hit; uu_profileDataHit; k_popMandatoryQueue;
   }
 
-  // Transitions from Shared
-  transition({S, SM, S_L, SM_L}, Load) {
-    h_load_hit;
-    uu_profileDataHit;
-    k_popMandatoryQueue;
-  }
 
-  transition({S, SM, S_L, SM_L}, Ifetch) {
-    h_ifetch_hit;
-    uu_profileInstHit;
-    k_popMandatoryQueue;
-  }
+  // =====================================================================
+  // SECTION 4: HETEROGENEOUS SECTOR MISSES (THE AMTC CORE)
+  // Purpose: Triggering upgrades when touching invalid/unowned sectors.
+  // =====================================================================
 
-  transition(S, {Store, Atomic}, SM) {
+  // Load Sector Misses (Fetch missing data bytes)
+  transition(S, Load_Sector_Miss, S_IS)       { i_allocateTBE; amtc_computeMissingMask; a_issueReadRequest; j_setReissueTimer; }
+  transition(O, Load_Sector_Miss, O_IS)       { i_allocateTBE; ao_issueOwnerReadRequest; uu_profileDataMiss; k_popMandatoryQueue; }
+  transition({M, MM}, Load_Sector_Miss, M_IS) { i_allocateTBE; amtc_computeMissingMask; a_issueReadRequest; j_setReissueTimer; }
+
+  // Store Sector Misses (Fetch tokens/data for upgrade)
+  transition(S, Store_Sector_Miss, S_IM)      { i_allocateTBE; amtc_computeMissingMask; b_issueWriteRequest; j_setReissueTimer; }
+  transition(O, Store_Sector_Miss, M_IM)      {
     i_allocateTBE;
     b_issueWriteRequest;
     uu_profileDataMiss;
-    k_popMandatoryQueue;
+    zz_stallAndWaitMandatoryQueue;
   }
+  transition({M, MM}, Store_Sector_Miss, M_IM){ i_allocateTBE; amtc_computeMissingMask; b_issueWriteRequest; j_setReissueTimer; }
 
-  transition(S, L1_Replacement, I) {
-    ta_traceStalledAddress;
-    cc_sharedReplacement; // Only needed in some cases
-    forward_eviction_to_cpu;
-    gg_deallocateL1CacheBlock;
-    ka_wakeUpAllDependents;
-  }
+  // Whole line upgrades from read-only states
+  transition(S, {Store, Atomic}, SM)          { i_allocateTBE; b_issueWriteRequest; uu_profileDataMiss; }
+  transition(O, {Store, Atomic}, OM)          { i_allocateTBE; b_issueWriteRequest; uu_profileDataMiss; }
 
-  transition(S, {Transient_GETX, Transient_Local_GETX}, I) {
-    t_sendAckWithCollectedTokens;
-    p_informL2AboutTokenLoss;
-    forward_eviction_to_cpu
-    m_popRequestQueue;
-  }
-
-  // only owner responds to non-local requests
-  transition(S, Transient_GETS) {
-    m_popRequestQueue;
-  }
-
-  transition(S, Transient_Local_GETS) {
-    d_sendDataWithToken;
-    m_popRequestQueue;
-  }
-
-  transition(S, {Transient_GETS_Last_Token, Transient_Local_GETS_Last_Token}) {
-    m_popRequestQueue;
-  }
-
-  transition({S, S_L}, Persistent_GETX, I_L) {
-    e_sendAckWithCollectedTokens;
-    p_informL2AboutTokenLoss;
-    forward_eviction_to_cpu
-    l_popPersistentQueue;
-  }
-
-  transition(S, {Persistent_GETS, Persistent_GETS_Last_Token}, S_L) {
-    f_sendAckWithAllButNorOneTokens;
-    l_popPersistentQueue;
-  }
-
-  transition(S_L, {Persistent_GETS, Persistent_GETS_Last_Token}) {
-    l_popPersistentQueue;
-  }
-
-  transition(S, Ack) {
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    n_popResponseQueue;
-  }
-
-  transition(S, Data_Shared) {
-    w_assertIncomingDataAndCacheDataMatch;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    n_popResponseQueue;
-  }
-
-  transition(S, Data_Owner, O) {
-    w_assertIncomingDataAndCacheDataMatch;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    n_popResponseQueue;
-  }
-
-  transition(S, Data_All_Tokens, M) {
-    w_assertIncomingDataAndCacheDataMatch;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    n_popResponseQueue;
-  }
-
-  // Transitions from Owned
-  transition({O, OM}, Ifetch) {
-    h_ifetch_hit;
-    uu_profileInstHit;
-    k_popMandatoryQueue;
-  }
-
-  transition({O, OM}, Load) {
-    h_load_hit;
-    uu_profileDataHit;
-    k_popMandatoryQueue;
-  }
-
-  transition(O, {Store, Atomic}, OM) {
-    i_allocateTBE;
-    //hh_store_hit
-    b_issueWriteRequest;
-    uu_profileDataMiss;
-    k_popMandatoryQueue;
-  }
-
-  transition(O, L1_Replacement, I) {
-    ta_traceStalledAddress;
-    c_ownedReplacement;
-    forward_eviction_to_cpu
-    gg_deallocateL1CacheBlock;
-    ka_wakeUpAllDependents;
-  }
-
-  transition(O, {Transient_GETX, Transient_Local_GETX}, I) {
-    dd_sendDataWithAllTokens;
-    p_informL2AboutTokenLoss;
-    forward_eviction_to_cpu
-    m_popRequestQueue;
-  }
-
-  transition(O, Persistent_GETX, I_L) {
-    ee_sendDataWithAllTokens;
-    p_informL2AboutTokenLoss;
-    forward_eviction_to_cpu
-    l_popPersistentQueue;
-  }
-
-  transition(O, Persistent_GETS, S_L) {
-    ff_sendDataWithAllButNorOneTokens;
-    l_popPersistentQueue;
-  }
-
-  transition(O, Persistent_GETS_Last_Token, I_L) {
-    fo_sendDataWithOwnerToken;
-    forward_eviction_to_cpu
-    l_popPersistentQueue;
-  }
-
-  transition(O, Transient_GETS) {
-    d_sendDataWithToken;
-    m_popRequestQueue;
-  }
-
-  transition(O, Transient_Local_GETS) {
-    d_sendDataWithToken;
-    m_popRequestQueue;
-  }
-
-  // ran out of tokens, wait for it to go persistent
-  transition(O, {Transient_GETS_Last_Token, Transient_Local_GETS_Last_Token}) {
-    m_popRequestQueue;
-  }
-
-  transition(O, Ack) {
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    n_popResponseQueue;
-  }
-
-  transition(O, Ack_All_Tokens, M) {
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    n_popResponseQueue;
-  }
-
-  transition(O, Data_Shared) {
-    w_assertIncomingDataAndCacheDataMatch;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    n_popResponseQueue;
-  }
-
-  transition(O, Data_All_Tokens, M) {
-    w_assertIncomingDataAndCacheDataMatch;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    n_popResponseQueue;
-  }
 
   // =====================================================================
-  // STALE RESPONSE ABSORPTION IN STABLE STATES
+  // SECTION 5: RESPONSE ABSORPTION (DECOUPLED DATA & TOKENS)
+  // Purpose: Safely accumulating partial responses until a complete hit.
   // =====================================================================
 
-  // Absorb late token-only packets
-  transition({M, MM}, {Ack, Ack_All_Tokens}) {
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
+  // 5A. Safe Absorption in Stable States (Duplicate network packets)
+  transition({I, S, O}, {Ack, Ack_Owner}) {
+    q_updateTokensFromResponse;
+    amtc_markValidSectorsFromResponse;
+    n_popResponseQueue;
+  }
+  transition({I, S, O}, {Data_Shared_Partial, Data_Owner_Partial}) {
+    u_writeDataToCache; q_updateTokensFromResponse; amtc_markValidSectorsFromResponse; n_popResponseQueue;
+  }
+
+ // =====================================================================
+  // SECTION 5B: Safe Absorption in Transient States (Building the puzzle)
+  // =====================================================================
+
+  // 1A. Generic Safe Token Absorption for standard transient states
+  transition({S_IS, O_IS, M_IS, M_IM, S_IM}, {Ack, Ack_Owner}) {
+    q_updateTokensFromResponse; amtc_markValidSectorsFromResponse; n_popResponseQueue;
+  }
+
+  // 1B. IM state safely absorbs normal Acks (e.g. from invalidations)
+  transition(IM, Ack) {
+    q_updateTokensFromResponse; amtc_markValidSectorsFromResponse; n_popResponseQueue;
+  }
+
+  // 1C. CRITICAL FIX: IM state receives an Ack_Owner from the Directory.
+  // The Directory refused to send data, so we MUST explicitly ask for it!
+  transition(IM, Ack_Owner) {
+    q_updateTokensFromResponse;
+    amtc_markValidSectorsFromResponse;
+    // We have the tokens, but we still need the physical bytes!
+    //a_issueImmediateMissingReadRequest;
     n_popResponseQueue;
   }
 
-  // Absorb late data packets (from duplicate memory fetches)
-  transition({M, MM}, {Data_Shared, Data_Owner, Data_All_Tokens, Data_Shared_Partial, Data_Owner_Partial}) {
+  transition({SM, OM}, {Ack, Ack_Owner}) {
+    q_updateTokensFromResponse; amtc_markValidSectorsFromResponse; n_popResponseQueue;
+  }
+
+  // 2. Safe Partial Data Absorption
+  transition({S_IS, O_IS, M_IS, M_IM, S_IM }, {Data_Shared_Partial, Data_Owner_Partial}) {
+    u_writeDataToCache; q_updateTokensFromResponse; amtc_markValidSectorsFromResponse; n_popResponseQueue;
+  }
+
+  transition({IM, SM}, {Data_Shared_Partial, Data_Owner_Partial}) {
     u_writeDataToCache;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
+    q_updateTokensFromResponse;
+    amtc_markValidSectorsFromResponse;
+
+    a_issueImmediateMissingReadRequest;
     n_popResponseQueue;
   }
 
-  // Transitions from Modified
-  transition({MM, MM_W}, Ifetch) {
-    h_ifetch_hit;
-    uu_profileInstHit;
-    k_popMandatoryQueue;
+  // ===================================================================
+  // AMTC ACCUMULATION: Handle fragmented data arrivals during a Read
+  // ===================================================================
+  transition(IS, {Data_Shared_Partial, Data_Owner_Partial}) {
+    u_writeDataToCache;
+    q_updateTokensFromResponse;
+    amtc_markValidSectorsFromResponse;
+
+    // We got some data, but we are still missing sectors required for the Load!
+    // Forcefully pull the missing physical bytes from the Directory.
+    a_issueImmediateMissingReadRequest;
+
+    n_popResponseQueue;
   }
 
-  transition({MM, MM_W}, Load) {
-    h_load_hit;
-    uu_profileDataHit;
-    k_popMandatoryQueue;
+  // 3. CRITICAL FIX: The "Split Response" Advance
+  // If full Data arrives BEFORE Tokens during a write miss, advance to the Upgrade states!
+  transition(S_IM, {Data_Shared, Data_Owner}, SM) {
+    u_writeDataToCache; q_updateTokensFromResponse; amtc_markValidSectorsFromResponse; n_popResponseQueue;
   }
 
-  transition({MM_W}, {Store, Atomic}) {
-    hh_store_hit;
-    uu_profileDataHit;
-    k_popMandatoryQueue;
+  transition(M_IM, {Data_Shared, Data_Owner}, OM) {
+    u_writeDataToCache; q_updateTokensFromResponse; amtc_markValidSectorsFromResponse; n_popResponseQueue;
   }
 
-  transition(MM, Store) {
-    hh_store_hit;
-    uu_profileDataHit;
-    k_popMandatoryQueue;
+  // 5C. Mathematical Perfection (Waking the CPU!)
+  transition(S_IS, {Data_Shared, Data_All_Tokens}, S) {
+    u_writeDataToCache; q_updateTokensFromResponse; amtc_markValidSectorsFromResponse;
+    x_external_load_hit;
+    s_deallocateTBE;
+    j_unsetReissueTimer;
+    n_popResponseQueue;
+    kd_wakeUpDependents;
+  }
+  transition(S_IS, Data_Owner, O) {
+    u_writeDataToCache; q_updateTokensFromResponse; amtc_markValidSectorsFromResponse; x_external_load_hit; s_deallocateTBE; j_unsetReissueTimer; n_popResponseQueue; kd_wakeUpDependents;
   }
 
-  transition(MM, Atomic, M) {
-    hh_store_hit;
-    uu_profileDataHit;
-    k_popMandatoryQueue;
+  transition(S_IM, Data_All_Tokens, M) {
+    u_writeDataToCache; q_updateTokensFromResponse; amtc_markValidSectorsFromResponse; xx_external_store_hit; s_deallocateTBE; j_unsetReissueTimer; n_popResponseQueue; kd_wakeUpDependents;
   }
 
-  transition(MM, L1_Replacement, I) {
-    ta_traceStalledAddress;
-    c_ownedReplacement;
-    forward_eviction_to_cpu
-    gg_deallocateL1CacheBlock;
-    ka_wakeUpAllDependents;
+  transition(M_IM, {Data_All_Tokens}, MM) {
+    u_writeDataToCache; amtc_markValidSectorsFromResponse; q_updateTokensFromResponse; xx_external_store_hit; s_deallocateTBE; j_unsetReissueTimer; n_popResponseQueue; kd_wakeUpDependents;
+  }
+  transition(M_IS, {Data_Shared, Data_Owner, Data_All_Tokens}, M) {
+    u_writeDataToCache; amtc_markValidSectorsFromResponse; q_updateTokensFromResponse; x_external_load_hit; s_deallocateTBE; j_unsetReissueTimer; n_popResponseQueue; kd_wakeUpDependents;
   }
 
-  transition(MM, {Transient_GETX, Transient_Local_GETX, Transient_GETS, Transient_Local_GETS}, I) {
-    dd_sendDataWithAllTokens;
-    p_informL2AboutTokenLoss;
-    forward_eviction_to_cpu
-    m_popRequestQueue;
+  // =====================================================================
+  // SECTION 5D: STANDARD CACHE LINE COMPLETIONS
+  // Purpose: Waking the CPU for standard full-line fetches and upgrades.
+  // =====================================================================
+
+  // IS Completions (Reads from Idle/NP)
+  transition(IS, Data_Shared, S) { u_writeDataToCache; q_updateTokensFromResponse; amtc_markValidSectorsFromResponse; x_external_load_hit; s_deallocateTBE; j_unsetReissueTimer; n_popResponseQueue; kd_wakeUpDependents; }
+  transition(IS, Data_Owner, O) { u_writeDataToCache; q_updateTokensFromResponse; amtc_markValidSectorsFromResponse; x_external_load_hit; s_deallocateTBE; j_unsetReissueTimer; n_popResponseQueue; kd_wakeUpDependents; }
+  transition(IS, Data_All_Tokens, M_W) { u_writeDataToCache; q_updateTokensFromResponse; amtc_markValidSectorsFromResponse; x_external_load_hit; o_scheduleUseTimeout; j_unsetReissueTimer; n_popResponseQueue; kd_wakeUpDependents; }
+
+  // IM Completions (Writes from Idle/NP)
+  transition(IM, Data_Shared, SM) { u_writeDataToCache; q_updateTokensFromResponse; amtc_markValidSectorsFromResponse; n_popResponseQueue; }
+  transition(IM, Data_Owner, M) { u_writeDataToCache; q_updateTokensFromResponse; amtc_markValidSectorsFromResponse; xx_external_store_hit; j_unsetReissueTimer; s_deallocateTBE; n_popResponseQueue; kd_wakeUpDependents; }
+  transition(IM, Data_All_Tokens, M_W) { u_writeDataToCache; q_updateTokensFromResponse; amtc_markValidSectorsFromResponse; amtc_updateStateFromSectors; o_scheduleUseTimeout; j_unsetReissueTimer; n_popResponseQueue; }
+
+  // SM Completions (Upgrades from Shared)
+  transition(SM, Data_Shared) { w_assertIncomingDataAndCacheDataMatch; q_updateTokensFromResponse; amtc_markValidSectorsFromResponse; n_popResponseQueue; }
+  transition(SM, Data_Owner, OM) { w_assertIncomingDataAndCacheDataMatch; q_updateTokensFromResponse; amtc_markValidSectorsFromResponse; n_popResponseQueue; }
+  transition(SM, Data_All_Tokens, MM_W) { w_assertIncomingDataAndCacheDataMatch; q_updateTokensFromResponse; amtc_markValidSectorsFromResponse; xx_external_store_hit; o_scheduleUseTimeout; j_unsetReissueTimer; n_popResponseQueue; kd_wakeUpDependents; }
+
+  // OM Completions (Upgrades from Owned)
+  transition(OM, Data_Shared) { w_assertIncomingDataAndCacheDataMatch; q_updateTokensFromResponse; amtc_markValidSectorsFromResponse; n_popResponseQueue; }
+  transition(OM, {Data_Owner, Data_Owner_Partial}) { w_assertIncomingDataAndCacheDataMatch; q_updateTokensFromResponse; amtc_markValidSectorsFromResponse; n_popResponseQueue; }
+  transition(OM, Data_All_Tokens, MM_W) { w_assertIncomingDataAndCacheDataMatch; q_updateTokensFromResponse; amtc_markValidSectorsFromResponse; xx_external_store_hit; o_scheduleUseTimeout; j_unsetReissueTimer; n_popResponseQueue; kd_wakeUpDependents; }
+
+  // =====================================================================
+  // SECTION 6: STARVATION & TIMEOUTS (THE PERSISTENT NETWORK)
+  // Purpose: Ensuring forward progress when tokens are highly contested.
+  // =====================================================================
+
+  // 1. Reissue Read Requests (Missing Data)
+  transition({IS, S_IS, O_IS, M_IS}, Request_Timeout) {
+    j_unsetReissueTimer;
+    a_issueReadRequest;
+    //j_setReissueTimer;
   }
 
-  transition({MM_W}, {Transient_GETX, Transient_Local_GETX, Transient_GETS, Transient_Local_GETS}) { // Ignore the request
-    m_popRequestQueue;
+  // 2. Reissue Write & Upgrade Requests (Missing Data or Tokens)
+  transition({IM, S_IM, M_IM, SM, OM}, Request_Timeout) {
+    j_unsetReissueTimer;
+    b_issueWriteRequest;
+    //j_setReissueTimer;
   }
 
-  // Implement the migratory sharing optimization, even for persistent requests
-  transition(MM, {Persistent_GETX, Persistent_GETS}, I_L) {
-    ee_sendDataWithAllTokens;
-    p_informL2AboutTokenLoss;
-    forward_eviction_to_cpu
+  // 2B. CRITICAL FIX: Reissue Owner Pulls (We have tokens, but missed the data!)
+  transition({IM, SM, OM, IS, S_IS, O_IS, M_IS}, Request_Timeout_Owner){
+    j_unsetReissueTimer;
+
+    // This action explicitly calculates the missing mask and forces
+    // a GETS request with is_owner_pull = true!
+    a_issueImmediateMissingReadRequest;
+  }
+
+  // 3. Ignore stray timeouts in stable and timeout-wait states
+  transition({M, MM, M_W, MM_W}, Request_Timeout) {
+    j_unsetReissueTimer;
+  }
+
+  // Lockdowns & Exits
+  transition({NP, I, S, O, M, MM, M_W, MM_W, IM, SM, OM, IS, S_IS, O_IS, M_IS, M_IM, S_IM}, Own_Lock_or_Unlock) {
     l_popPersistentQueue;
   }
 
-  // ignore persistent requests in lockout period
-  transition(MM_W, {Persistent_GETX, Persistent_GETS}) {
-    l_popPersistentQueue;
+  // =====================================================================
+  // SECTION 6B: MIGRATORY TIMEOUTS & SETTLING
+  // Purpose: Resolving M_W and MM_W once their guaranteed "Use" window expires.
+  // =====================================================================
+
+  // 1. Nobody is starving. The cache gets to keep the line! Settle into stable Modified.
+  transition(M_W, {Use_TimeoutNoStarvers, Use_TimeoutNoStarvers_NoMig}, M) {
+    s_deallocateTBE;
+    jj_unsetUseTimer;
+    kd_wakeUpDependents;
   }
 
   transition(MM_W, Use_TimeoutNoStarvers, MM) {
@@ -2713,102 +2928,14 @@ amtc_markValidSectorsFromResponse;
     kd_wakeUpDependents;
   }
 
-  // Transitions from Dirty Exclusive
-  transition({M, M_W}, Ifetch) {
-    h_ifetch_hit;
-    uu_profileInstHit;
-    k_popMandatoryQueue;
-  }
-
-  transition({M, M_W}, Load) {
-    h_load_hit;
-    uu_profileDataHit;
-    k_popMandatoryQueue;
-  }
-
-  transition(M, Store, MM) {
-    hh_store_hit;
-    uu_profileDataHit;
-    k_popMandatoryQueue;
-  }
-
-  transition(M, Atomic) {
-    hh_store_hit;
-    uu_profileDataHit;
-    k_popMandatoryQueue;
-  }
-
-  transition(M_W, Store, MM_W) {
-    hh_store_hit;
-    uu_profileDataHit;
-    k_popMandatoryQueue;
-  }
-
-  transition(M_W, Atomic) {
-    hh_store_hit;
-    uu_profileDataHit;
-    k_popMandatoryQueue;
-  }
-
-  transition(M, L1_Replacement, I) {
-    ta_traceStalledAddress;
-    c_ownedReplacement;
-    forward_eviction_to_cpu
-    gg_deallocateL1CacheBlock;
-    ka_wakeUpAllDependents;
-  }
-
-  transition(M, {Transient_GETX, Transient_Local_GETX}, I) {
-    dd_sendDataWithAllTokens;
-    p_informL2AboutTokenLoss;
-    forward_eviction_to_cpu
-    m_popRequestQueue;
-  }
-
-  transition(M, Transient_Local_GETS, O) {
-    d_sendDataWithToken;
-    m_popRequestQueue;
-  }
-
-  transition(M, Transient_GETS, O) {
-    d_sendDataWithNTokenIfAvail;
-    m_popRequestQueue;
-  }
-
-  transition(M_W, {Transient_GETX, Transient_Local_GETX, Transient_GETS, Transient_Local_GETS}) { // Ignore the request
-    m_popRequestQueue;
-  }
-
-  transition(M, Persistent_GETX, I_L) {
-    ee_sendDataWithAllTokens;
-    p_informL2AboutTokenLoss;
-    forward_eviction_to_cpu
-    l_popPersistentQueue;
-  }
-
-  transition(M, Persistent_GETS, S_L) {
-    ff_sendDataWithAllButNorOneTokens;
-    l_popPersistentQueue;
-  }
-
-  // ignore persistent requests in lockout period
-  transition(M_W, {Persistent_GETX, Persistent_GETS}) {
-    l_popPersistentQueue;
-  }
-
+  // 2. Someone is starving for Shared. Yield tokens/data down to S_L.
   transition(M_W, Use_TimeoutStarverS, S_L) {
     s_deallocateTBE;
     ff_sendDataWithAllButNorOneTokens;
     jj_unsetUseTimer;
   }
 
-  // someone unlocked during timeout
-  transition(M_W, {Use_TimeoutNoStarvers, Use_TimeoutNoStarvers_NoMig}, M) {
-    s_deallocateTBE;
-    jj_unsetUseTimer;
-    kd_wakeUpDependents;
-  }
-
+  // 3. Someone is starving for Exclusive. Yield everything.
   transition(M_W, Use_TimeoutStarverX, I_L) {
     s_deallocateTBE;
     ee_sendDataWithAllTokens;
@@ -2817,624 +2944,33 @@ amtc_markValidSectorsFromResponse;
     jj_unsetUseTimer;
   }
 
-  // migratory
+  // Migratory Optimization: If in MM_W, even a Shared starver takes everything.
   transition(MM_W, {Use_TimeoutStarverX, Use_TimeoutStarverS}, I_L) {
     s_deallocateTBE;
     ee_sendDataWithAllTokens;
     forward_eviction_to_cpu;
     p_informL2AboutTokenLoss;
     jj_unsetUseTimer;
-
   }
-
-  // Handle completion of a write upgrade while in the waiting state
-// =====================================================================
-  // DATA PATH: The response contains valid physical bytes
   // =====================================================================
-  transition({M_W, MM_W}, Data_All_Tokens, MM) {
-    u_writeDataToCache;  // <--- Safe to use! The payload has data.
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    amtc_completeIfAlreadyOwnsSector;
-    j_unsetReissueTimer;
-    jj_unsetUseTimer;
-    s_deallocateTBE;
-    n_popResponseQueue;
-    kd_wakeUpDependents;
-  }
-
+  // STALE RESPONSE ABSORPTION IN STABLE STATES
   // =====================================================================
-  // ACK PATH: The response is just tokens, no data!
-  // =====================================================================
-  transition({M_W, MM_W}, Ack_All_Tokens, MM) {
-    // CRITICAL FIX: Do NOT call u_writeDataToCache here!
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    amtc_completeIfAlreadyOwnsSector;
-    j_unsetReissueTimer;
-    jj_unsetUseTimer;
-    s_deallocateTBE;
-    n_popResponseQueue;
-    kd_wakeUpDependents;
-  }
 
-  // Transient_GETX and Transient_GETS in transient states
-  transition(OM, {Transient_GETX, Transient_Local_GETX, Transient_GETS, Transient_GETS_Last_Token, Transient_Local_GETS_Last_Token, Transient_Local_GETS}) {
-    m_popRequestQueue;  // Even if we have the data, we can pretend we don't have it yet.
-  }
-
-  transition(IS, {Transient_GETX, Transient_Local_GETX}) {
-    t_sendAckWithCollectedTokens;
-    m_popRequestQueue;
-  }
-
-  transition(IS, {Transient_GETS, Transient_GETS_Last_Token, Transient_Local_GETS_Last_Token, Transient_Local_GETS}) {
-    m_popRequestQueue;
-  }
-
-  transition(IS, {Persistent_GETX, Persistent_GETS, Persistent_GETS_Last_Token}, IS_L) {
-    e_sendAckWithCollectedTokens;
-    l_popPersistentQueue;
-  }
-
-  transition(IS_L, {Persistent_GETX, Persistent_GETS}) {
-    l_popPersistentQueue;
-  }
-
-  transition(IM, {Persistent_GETX, Persistent_GETS, Persistent_GETS_Last_Token}, IM_L) {
-    e_sendAckWithCollectedTokens;
-    l_popPersistentQueue;
-  }
-
-  transition(IM_L, {Persistent_GETX, Persistent_GETS}) {
-    l_popPersistentQueue;
-  }
-
-  transition({SM, SM_L}, Persistent_GETX, IM_L) {
-    e_sendAckWithCollectedTokens;
-    forward_eviction_to_cpu
-    l_popPersistentQueue;
-  }
-
-  transition(SM, {Persistent_GETS, Persistent_GETS_Last_Token}, SM_L) {
-    f_sendAckWithAllButNorOneTokens;
-    l_popPersistentQueue;
-  }
-
-  transition(SM_L, {Persistent_GETS, Persistent_GETS_Last_Token}) {
-    l_popPersistentQueue;
-  }
-
-  transition(OM, Persistent_GETX, IM_L) {
-    ee_sendDataWithAllTokens;
-    forward_eviction_to_cpu
-    l_popPersistentQueue;
-  }
-
-  transition(OM, Persistent_GETS, SM_L) {
-    ff_sendDataWithAllButNorOneTokens;
-    l_popPersistentQueue;
-  }
-
-  transition(OM, Persistent_GETS_Last_Token, IM_L) {
-    fo_sendDataWithOwnerToken;
-    l_popPersistentQueue;
-  }
-
-  // Transitions from IM/SM
-
-  transition({IM, SM}, Ack) {
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    n_popResponseQueue;
-  }
-
-  transition(IM, Data_Shared, SM) {
-    u_writeDataToCache;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    n_popResponseQueue;
-  }
-
-  transition(IM, Data_Owner, M) {
-    u_writeDataToCache;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    xx_external_store_hit;
-    j_unsetReissueTimer;
-    n_popResponseQueue;
-    s_deallocateTBE;
-    kd_wakeUpDependents;
-  }
-
-transition(IM, Data_All_Tokens, M_W) {
-    u_writeDataToCache;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    xx_external_store_hit;
-    o_scheduleUseTimeout;
-    j_unsetReissueTimer;
-    n_popResponseQueue;
-    kd_wakeUpDependents;
-  }
-
-  transition(SM, Data_Shared) {
-    w_assertIncomingDataAndCacheDataMatch;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    n_popResponseQueue;
-  }
-
-  transition(SM, Data_Owner, OM) {
-    w_assertIncomingDataAndCacheDataMatch;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    n_popResponseQueue;
-  }
-
-  transition(SM, Data_All_Tokens, MM_W) {
-    w_assertIncomingDataAndCacheDataMatch;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    xx_external_store_hit;
-    o_scheduleUseTimeout;
-    j_unsetReissueTimer;
-    n_popResponseQueue;
-    kd_wakeUpDependents;
-  }
-
-  transition({IM, SM}, {Transient_GETX, Transient_Local_GETX}, IM) { // We don't have the data yet, but we might have collected some tokens.  We give them up here to avoid livelock
-    t_sendAckWithCollectedTokens;
-    forward_eviction_to_cpu;
-    m_popRequestQueue;
-  }
-
-  transition({IM, SM}, {Transient_GETS, Transient_GETS_Last_Token, Transient_Local_GETS_Last_Token, Transient_Local_GETS}) {
-    m_popRequestQueue;
-  }
-
-  transition({IM, SM}, Request_Timeout) {
-    j_unsetReissueTimer;
-    b_issueWriteRequest;
-  }
-
-  // Transitions from OM
-
-  transition(OM, Ack, M) {
-    amtc_markValidSectorsFromResponse;
-    amtc_completeIfAlreadyOwnsSector;
-    xx_external_store_hit; // <--- ADD THIS CALLBACK
-    j_unsetReissueTimer;
-    n_popResponseQueue;
-    s_deallocateTBE;
-    kd_wakeUpDependents;
-  }
-
-  transition(OM, Ack_All_Tokens, MM_W) {
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    xx_external_store_hit;
-    o_scheduleUseTimeout;
-    j_unsetReissueTimer;
-    n_popResponseQueue;
-    kd_wakeUpDependents;
-  }
-
-  transition(OM, Data_Shared) {
-    w_assertIncomingDataAndCacheDataMatch;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    n_popResponseQueue;
-  }
-
-  transition(OM, Data_All_Tokens, MM_W) {
-    w_assertIncomingDataAndCacheDataMatch;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    xx_external_store_hit;
-    o_scheduleUseTimeout;
-    j_unsetReissueTimer;
-    n_popResponseQueue;
-    kd_wakeUpDependents;
-  }
-
-  transition(OM, Request_Timeout, M) {
-    amtc_completeIfAlreadyOwnsSector;
-    j_unsetReissueTimer;
-    s_deallocateTBE;
-    kd_wakeUpDependents;
-  }
-  // Transitions from IS
-
-  transition(IS, Ack) {
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    n_popResponseQueue;
-  }
-
-  transition(IS, Data_Shared, S) {
-    u_writeDataToCache;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    x_external_load_hit;
-    s_deallocateTBE;
-    j_unsetReissueTimer;
-    n_popResponseQueue;
-    kd_wakeUpDependents;
-  }
-
-  transition(IS, Data_Owner, O) {
-    u_writeDataToCache;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    x_external_load_hit;
-    s_deallocateTBE;
-    j_unsetReissueTimer;
-    n_popResponseQueue;
-    kd_wakeUpDependents;
-  }
-
-  transition(IS, Data_All_Tokens, M_W) {
-    u_writeDataToCache;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    x_external_load_hit;
-    o_scheduleUseTimeout;
-    j_unsetReissueTimer;
-    n_popResponseQueue;
-    kd_wakeUpDependents;
-  }
-
-  transition(IS, Request_Timeout) {
-    j_unsetReissueTimer;
-    a_issueReadRequest;
-  }
-
-  // Transitions from I_L
-
-  transition(I_L, Load, IS_L) {
-    ii_allocateL1DCacheBlock;
-    i_allocateTBE;
-    a_issueReadRequest;
-    uu_profileDataMiss;
-    k_popMandatoryQueue;
-  }
-
-  transition(I_L, Ifetch, IS_L) {
-    pp_allocateL1ICacheBlock;
-    i_allocateTBE;
-    a_issueReadRequest;
-    uu_profileInstMiss;
-    k_popMandatoryQueue;
-  }
-
-  transition(I_L, {Store, Atomic}, IM_L) {
-    ii_allocateL1DCacheBlock;
-    i_allocateTBE;
-    b_issueWriteRequest;
-    uu_profileDataMiss;
-    k_popMandatoryQueue;
-  }
-
-
-  // Transitions from S_L
-
-  transition(S_L, {Store, Atomic}, SM_L) {
-    i_allocateTBE;
-    b_issueWriteRequest;
-    uu_profileDataMiss;
-    k_popMandatoryQueue;
-  }
-
-  // Other transitions from *_L states
-
-  transition({I_L, IM_L, IS_L, S_L, SM_L}, {Transient_GETS, Transient_GETS_Last_Token, Transient_Local_GETS_Last_Token, Transient_Local_GETS, Transient_GETX, Transient_Local_GETX}) {
-    m_popRequestQueue;
-  }
-
-  transition({I_L, IM_L, IS_L, S_L, SM_L}, Ack) {
-    g_bounceResponseToStarver;
-    n_popResponseQueue;
-  }
-
-  transition({I_L, IM_L, S_L, SM_L}, {Data_Shared, Data_Owner}) {
-    g_bounceResponseToStarver;
-    n_popResponseQueue;
-  }
-
-  transition({I_L, S_L}, Data_All_Tokens) {
-    g_bounceResponseToStarver;
-    n_popResponseQueue;
-  }
-
-  transition(IS_L, Request_Timeout) {
-    j_unsetReissueTimer;
-    a_issueReadRequest;
-  }
-
-  transition({IM_L, SM_L}, Request_Timeout) {
-    j_unsetReissueTimer;
-    b_issueWriteRequest;
-  }
-
-  // Opportunisticly Complete the memory operation in the following
-  // cases.  Note: these transitions could just use
-  // g_bounceResponseToStarver, but if we have the data and tokens, we
-  // might as well complete the memory request while we have the
-  // chance (and then immediately forward on the data)
-
-  transition(IM_L, Data_All_Tokens, MM_W) {
-    u_writeDataToCache;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    xx_external_store_hit;
-    j_unsetReissueTimer;
-    o_scheduleUseTimeout;
-    n_popResponseQueue;
-    kd_wakeUpDependents;
-  }
-
-  transition(SM_L, Data_All_Tokens, S_L) {
-    u_writeDataToCache;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    xx_external_store_hit;
-    ff_sendDataWithAllButNorOneTokens;
-    s_deallocateTBE;
-    j_unsetReissueTimer;
-    n_popResponseQueue;
-  }
-
-  transition(IS_L, Data_Shared, I_L) {
-    u_writeDataToCache;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    x_external_load_hit;
-    s_deallocateTBE;
-    e_sendAckWithCollectedTokens;
-    p_informL2AboutTokenLoss;
-    j_unsetReissueTimer;
-    n_popResponseQueue;
-  }
-
-  transition(IS_L, Data_Owner, I_L) {
-    u_writeDataToCache;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    x_external_load_hit;
-    ee_sendDataWithAllTokens;
-    s_deallocateTBE;
-    p_informL2AboutTokenLoss;
-    j_unsetReissueTimer;
-    n_popResponseQueue;
-  }
-
-  transition(IS_L, Data_All_Tokens, M_W) {
-    u_writeDataToCache;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    x_external_load_hit;
-    j_unsetReissueTimer;
-    o_scheduleUseTimeout;
-    n_popResponseQueue;
-    kd_wakeUpDependents;
-  }
-
-  // Own_Lock_or_Unlock
-
-  transition(I_L, Own_Lock_or_Unlock, I) {
-    l_popPersistentQueue;
-    kd_wakeUpDependents;
-  }
-
-  transition(S_L, Own_Lock_or_Unlock, S) {
-    l_popPersistentQueue;
-    kd_wakeUpDependents;
-  }
-
-  transition(IM_L, Own_Lock_or_Unlock, IM) {
-    l_popPersistentQueue;
-    kd_wakeUpDependents;
-  }
-
-  transition(IS_L, Own_Lock_or_Unlock, IS) {
-    l_popPersistentQueue;
-    kd_wakeUpDependents;
-  }
-
-  transition(SM_L, Own_Lock_or_Unlock, SM) {
-    l_popPersistentQueue;
-    kd_wakeUpDependents;
-  }
-
-  transition({M, MM, M_W, MM_W}, Request_Timeout) {
-    j_unsetReissueTimer;
-  }
-
-  // =====================================================================
-  // AMTC: SECTOR MISS TRANSITIONS
-  // =====================================================================
-// =====================================================================
-  // 1. TRIGGER THE FETCH FOR LOAD SECTOR MISSES (Reads)
-  // =====================================================================
-  transition(S, Load_Sector_Miss, S_IS) {
-    i_allocateTBE;
-    a_issueReadRequest;
-    uu_profileDataMiss;
-    k_popMandatoryQueue;
-  }
-
-  transition(O, Load_Sector_Miss, O_IS) {
-    i_allocateTBE;
-    ao_issueOwnerReadRequest;
-    uu_profileDataMiss;
-    k_popMandatoryQueue;
-  }
-
-  // =====================================================================
-  // 2. TRIGGER THE FETCH FOR STORE SECTOR MISSES (Writes)
-  // =====================================================================
-  // A Shared cache writing a missing sector needs Data + All Tokens
-  transition(S, Store_Sector_Miss, IM) {
-    i_allocateTBE;
-    b_issueWriteRequest;
-    uu_profileDataMiss;
-    k_popMandatoryQueue;
-  }
-
-  // An Owner cache writing a missing sector needs Data + All Tokens
-  transition(O, Store_Sector_Miss, M_IM) {
-    i_allocateTBE;
-    b_issueWriteRequest;
-    uu_profileDataMiss;
-    k_popMandatoryQueue;
-  }
-
-  // =====================================================================
-  // 3. STALL CONCURRENT MISSES
-  // =====================================================================
-  // If the CPU hits another miss while we are already waiting for an upgrade, stall it!
-  transition({SM, OM}, {Load_Sector_Miss, Store_Sector_Miss}) {
-    zz_stallAndWaitMandatoryQueue;
-  }
-
- // -------------------------------------------------------------------------
-  // STABLE STATES: Safe to allocate TBE and pull the missing sector
-  // -------------------------------------------------------------------------
- transition({M, MM}, Load_Sector_Miss, M_IS) {
-    i_allocateTBE;
-    ao_issueOwnerReadRequest;
-    uu_profileDataMiss;
-    k_popMandatoryQueue;
-  }
-
-  transition({M, MM}, Store_Sector_Miss, M_IM) {
-    i_allocateTBE;
-    ao_issueOwnerReadRequest;
-    uu_profileDataMiss;
-    k_popMandatoryQueue;
-  }
-
-  // -------------------------------------------------------------------------
-  // TRANSIENT STATES: The TBE is busy tracking the Use_Timeout!
-  // We MUST stall the CPU request until the timeout finishes and we reach M/MM.
-  // -------------------------------------------------------------------------
-transition({M_W, MM_W}, {Load_Sector_Miss, Store_Sector_Miss}) {
-    zz_stallAndWaitMandatoryQueue;
-  }
-  // 2. Stall incoming CPU requests while waiting for the missing sector
-  transition({S_IS, O_IS, M_IS, M_IM}, {Load, Ifetch, Store, Atomic, L1_Replacement, Load_Sector_Miss, Store_Sector_Miss}) {
-      zz_stallAndWaitMandatoryQueue;
-  }
-
-  // 3. Network Responses (Merge the data, return to the correct base state)
-  transition(S_IS, Ack) { amtc_markValidSectorsFromResponse; q_updateTokensFromResponse; n_popResponseQueue; }
-  transition(S_IS, Data_Shared, S) { u_writeDataToCache; amtc_markValidSectorsFromResponse; q_updateTokensFromResponse; x_external_load_hit; s_deallocateTBE; j_unsetReissueTimer; n_popResponseQueue; kd_wakeUpDependents; }
-  transition(S_IS, Data_Owner, O) { u_writeDataToCache; amtc_markValidSectorsFromResponse; q_updateTokensFromResponse; x_external_load_hit; s_deallocateTBE; j_unsetReissueTimer; n_popResponseQueue; kd_wakeUpDependents; }
-  transition(S_IS, Data_All_Tokens, M) { u_writeDataToCache; amtc_markValidSectorsFromResponse; q_updateTokensFromResponse; x_external_load_hit; s_deallocateTBE; j_unsetReissueTimer; n_popResponseQueue; kd_wakeUpDependents; }
-  transition(S_IS, Request_Timeout) { j_unsetReissueTimer; a_issueReadRequest; }
-
-  transition(O_IS, Ack) { amtc_markValidSectorsFromResponse; q_updateTokensFromResponse; n_popResponseQueue; }
-  transition(O_IS, Data_Shared, O) { u_writeDataToCache; amtc_markValidSectorsFromResponse; q_updateTokensFromResponse; x_external_load_hit; s_deallocateTBE; j_unsetReissueTimer; n_popResponseQueue; kd_wakeUpDependents; }
-  transition(O_IS, Data_Owner, O) { u_writeDataToCache; amtc_markValidSectorsFromResponse; q_updateTokensFromResponse; x_external_load_hit; s_deallocateTBE; j_unsetReissueTimer; n_popResponseQueue; kd_wakeUpDependents; }
-  transition(O_IS, Data_All_Tokens, M) { u_writeDataToCache; amtc_markValidSectorsFromResponse; q_updateTokensFromResponse; x_external_load_hit; s_deallocateTBE; j_unsetReissueTimer; n_popResponseQueue; kd_wakeUpDependents; }
-  transition(O_IS, Request_Timeout) { j_unsetReissueTimer; a_issueReadRequest; }
-
-  transition(M_IS, Ack) { amtc_markValidSectorsFromResponse; q_updateTokensFromResponse; n_popResponseQueue; }
-  transition(M_IS, Data_Shared, M) { u_writeDataToCache; amtc_markValidSectorsFromResponse; q_updateTokensFromResponse; x_external_load_hit; s_deallocateTBE; j_unsetReissueTimer; n_popResponseQueue; kd_wakeUpDependents; }
-  transition(M_IS, Data_Owner, M) { u_writeDataToCache; amtc_markValidSectorsFromResponse; q_updateTokensFromResponse; x_external_load_hit; s_deallocateTBE; j_unsetReissueTimer; n_popResponseQueue; kd_wakeUpDependents; }
-  transition(M_IS, Data_All_Tokens, M) { u_writeDataToCache; amtc_markValidSectorsFromResponse; q_updateTokensFromResponse; x_external_load_hit; s_deallocateTBE; j_unsetReissueTimer; n_popResponseQueue; kd_wakeUpDependents; }
-  transition(M_IS, Request_Timeout) { j_unsetReissueTimer; a_issueReadRequest; }
-
-  transition(M_IM, Ack) { amtc_markValidSectorsFromResponse; q_updateTokensFromResponse; n_popResponseQueue; }
-  // Data-only response for a store/upgrade miss is not sufficient.
-  // Install the returned data, but do not issue the store callback and do not
-  // move to MM until owner/all-token coverage arrives.
-transition(M_IM, Data_Shared, MM) {
-    u_writeDataToCache;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    xx_external_store_hit;
-    s_deallocateTBE;
-    j_unsetReissueTimer;
-    n_popResponseQueue;
-    kd_wakeUpDependents;
-  }
-  transition(M_IM, Data_Owner, MM) { u_writeDataToCache; amtc_markValidSectorsFromResponse; q_updateTokensFromResponse; xx_external_store_hit; s_deallocateTBE; j_unsetReissueTimer; n_popResponseQueue; kd_wakeUpDependents; }
-  transition(M_IM, Data_All_Tokens, MM) { u_writeDataToCache; amtc_markValidSectorsFromResponse; q_updateTokensFromResponse; xx_external_store_hit; s_deallocateTBE; j_unsetReissueTimer; n_popResponseQueue; kd_wakeUpDependents; }
-  transition(M_IM, Request_Timeout)
-  {
-    j_unsetReissueTimer;
-    ao_issueOwnerReadRequest;
-  }
-
-  // 4. Ignore transient requests safely while waiting
-  transition({S_IS, O_IS, M_IS, M_IM}, {Transient_GETX, Transient_Local_GETX, Transient_GETS, Transient_Local_GETS, Transient_GETS_Last_Token, Transient_Local_GETS_Last_Token}) {
-     m_popRequestQueue;
-  }
-
-  transition({S_IS, O_IS, M_IS, M_IM}, Own_Lock_or_Unlock) { l_popPersistentQueue; }
-  transition({S_IS, O_IS, M_IS, M_IM}, {Persistent_GETX, Persistent_GETS, Persistent_GETS_Last_Token}) {
-     e_sendAckWithCollectedTokens; // safely drop tokens to prevent persistent deadlock
-     l_popPersistentQueue;
-  }
-
-  transition({IS, IS_L, M_IM, M_IS, S_IS, O_IS}, {Data_Shared_Partial, Data_Owner_Partial}) {
-    u_writeDataToCache;
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    n_popResponseQueue;
-  }
-
-  // Transition to handle getting all tokens via ACK while waiting for an Instruction Fetch
-  transition(IS, Ack_All_Tokens, IS) {
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-
-    // We have the tokens, but we are missing the data!
-    // Force an immediate read request to get the bytes from the Directory/Memory.
-    a_issueImmediateMissingReadRequest;
-
-    n_popResponseQueue;
-  }
-
-  // Handle early tokens arriving for a missing sector on a partially Modified line
-  transition({M_IM, M_IS},Ack_All_Tokens) {
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-
-    // We got the tokens for the missing sector, but we still need the data bytes!
-    a_issueImmediateMissingReadRequest;
-
-    n_popResponseQueue;
-  }
-
-  // ====================================================================
-  // THE UPGRADE: We already had the data, and now we have the tokens!
-  // ====================================================================
-  transition(SM, Ack_All_Tokens, MM_W) {
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    xx_external_store_hit;       // Complete the CPU store!
-    o_scheduleUseTimeout;
-    j_unsetReissueTimer;
-    n_popResponseQueue;
-    kd_wakeUpDependents;
-  }
-
-  // ====================================================================
-  // THE SECTOR MISS: We got the tokens, but we STILL need the data!
-  // ====================================================================
-  transition(IM, Ack_All_Tokens) {
-q_updateTokensFromResponse;
-amtc_markValidSectorsFromResponse;
-    a_issueImmediateMissingReadRequest; // Force the Directory to send data
-    n_popResponseQueue;
-  }
-
-  transition(IM, Ack_Owner_All_Tokens, M) { // Or whatever your target state is
+  // CRITICAL FIX: Added M_W and MM_W to absorb late token-only packets
+  // Also added Ack_Owner variants to catch Directory owner-pull replies
+  transition({M, MM, M_W, MM_W}, {Ack, Ack_All_Tokens, Ack_Owner, Ack_Owner_All_Tokens}) {
     q_updateTokensFromResponse;
+    amtc_markValidSectorsFromResponse;
     n_popResponseQueue;
   }
+
+  // CRITICAL FIX: Added M_W and MM_W to absorb late data packets
+  transition({M, MM, M_W, MM_W}, {Data_Shared, Data_Owner, Data_All_Tokens, Data_Shared_Partial, Data_Owner_Partial}) {
+    u_writeDataToCache;
+    q_updateTokensFromResponse;
+    amtc_markValidSectorsFromResponse;
+    n_popResponseQueue;
+  }
+
 
 }

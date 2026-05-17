@@ -1,4 +1,4 @@
-/*
+/* AMTC-L2cache.sm
  * Copyright (c) 1999-2013 Mark D. Hill and David A. Wood
  * All rights reserved.
  *
@@ -70,6 +70,10 @@ machine(MachineType:L2Cache, "Token protocol")
     S, AccessPermission:Read_Only, desc="Shared, not present in any local L1s";
     O, AccessPermission:Read_Only, desc="Owned, not present in any L1s";
     M, AccessPermission:Read_Write, desc="Modified, not present in any L1s";
+
+    SX, AccessPermission:Busy, desc="Shared, waiting for L2 accumulation";
+    OX, AccessPermission:Busy, desc="Owned, waiting for L2 accumulation";
+    MX, AccessPermission:Busy, desc="Modified, waiting for L2 accumulation";
   }
 
   // EVENTS
@@ -351,6 +355,11 @@ machine(MachineType:L2Cache, "Token protocol")
       // Basic sanity checks: No sector can have negative tokens
       assert(cache_entry.TokensSec0 >= 0);
       assert(cache_entry.TokensSec1 >= 0);
+
+      // Ensure no transition sets state==I during a GETX upgrade path.
+      if (cache_entry.CacheState == State:SX || cache_entry.CacheState == State:OX || cache_entry.CacheState == State:MX) {
+        assert(state != State:I);
+      }
 
       // In AMTC, the whole line's max_tokens() is divided equally among sectors
       int tokens_per_sector := max_tokens() / 2;
@@ -664,7 +673,7 @@ machine(MachineType:L2Cache, "Token protocol")
            out_msg.Prefetch := in_msg.Prefetch;
 
            // Never propagate stale owner pulls
-           out_msg.is_owner_pull := false;
+           out_msg.is_owner_pull := in_msg.is_owner_pull;
 
            DPRINTF(RubySlicc,
                    "AMTC_L2_DIR_ONLY addr=%#x mask=%d\n",
@@ -1119,18 +1128,16 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
       int safe_send_mask := amtc_intersectMasks(req_mask, cache_entry.ValidSectors);
 
       if (safe_send_mask != 0) {
-        // We have data to send
+        // We have SOME data to send
         enqueue(responseNetwork_out, ResponseMsg, l2_response_latency) {
           out_msg.addr := address;
           out_msg.Type := CoherenceResponseType:DATA_OWNER;
           out_msg.Sender := machineID;
           out_msg.Destination.add(in_msg.Requestor);
 
-          // Attach the split tokens
           out_msg.TokensSec0 := send_t0;
           out_msg.TokensSec1 := send_t1;
 
-          // PHASE 1: Sector Aware Data Copy
           if (amtc_maskHasSector(safe_send_mask, 0)) {
               out_msg.DataBlk.copyPartial(cache_entry.DataBlk, 0, 32);
           }
@@ -1148,37 +1155,38 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
           out_msg.MessageSize := amtc_getSizeFromDirtyMask(safe_send_mask);
         }
       } else {
-        // Heterogeneous Miss: We have tokens, but no data!
+        // We have NO data, just tokens
         enqueue(responseNetwork_out, ResponseMsg, l2_response_latency) {
           out_msg.addr := address;
           out_msg.Type := CoherenceResponseType:ACK;
           out_msg.Sender := machineID;
           out_msg.Destination.add(in_msg.Requestor);
-
-          // Attach the split tokens
           out_msg.TokensSec0 := send_t0;
           out_msg.TokensSec1 := send_t1;
-
           out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
           out_msg.sector_mask := req_mask;
           out_msg.valid_sector_mask := 0;
           out_msg.token_sector_mask := req_mask;
           out_msg.requested_sector_mask := req_mask;
           out_msg.MessageSize := MessageSizeType:Response_Control;
-          out_msg.Destination.broadcast(MachineType:L2Cache);
-           out_msg.Destination.remove(machineID);
-           out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
         }
-        // Force the Directory to fetch the missing physical bytes
+      }
+
+      // ===================================================================
+      // CRITICAL FIX: ALWAYS fetch physically missing bytes from the Directory!
+      // Even if we sent partial data above, we still need the rest of the line.
+      // ===================================================================
+      if (safe_send_mask != req_mask) {
+        int missing_mask := amtc_subtractMask(req_mask, safe_send_mask);
         enqueue(globalRequestNetwork_out, RequestMsg, l2_request_latency) {
            out_msg.addr := address;
            out_msg.Type := CoherenceRequestType:GETS;
-           out_msg.Requestor := in_msg.Requestor;
+           out_msg.Requestor := in_msg.Requestor; // The Directory will reply directly to the L1!
            out_msg.RetryNum := in_msg.RetryNum;
            out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
-           out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
-           out_msg.sector_mask := req_mask;
-           out_msg.requested_sector_mask := req_mask;
+           out_msg.sector_id := amtc_primarySectorFromMask(missing_mask);
+           out_msg.sector_mask := missing_mask;
+           out_msg.requested_sector_mask := missing_mask;
            out_msg.MessageSize := MessageSizeType:Request_Control;
            out_msg.AccessMode := in_msg.AccessMode;
            out_msg.Prefetch := in_msg.Prefetch;
@@ -1188,7 +1196,7 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
            out_msg.is_atomic := in_msg.is_atomic;
            out_msg.is_signal := in_msg.is_signal;
            out_msg.merged_req := in_msg.merged_req;
-           out_msg.is_owner_pull := false ;
+           out_msg.is_owner_pull := false;
         }
       }
 
@@ -1719,9 +1727,47 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     o_popL1RequestQueue;
   }
 
-  transition({S, O}, L2_Accumulation_Done, M) {
+  transition({S, O, SX, OX, MX}, L2_Accumulation_Done, M) {
     z_resetAccumulationFlag;
     rc_clearRequestedMask;
     t_popTriggerQueue;
+  }
+
+  // Late-arriving tokens after the first partial response are merged
+  transition({SX, OX, MX}, Ack) {
+    q_updateTokensFromResponse;
+    cl2_checkL2Accumulation;
+    n_popResponseQueue;
+  }
+
+  transition({SX, OX, MX}, {Data_Shared, Data_Owner}) {
+    w_assertIncomingDataAndCacheDataMatch;
+    q_updateTokensFromResponse;
+    u_writeDataToCache;
+    cl2_checkL2Accumulation;
+    n_popResponseQueue;
+  }
+
+  transition({SX, OX, MX}, {Writeback_Tokens, Writeback_Shared_Data, Writeback_Owned}) {
+    w_assertIncomingDataAndCacheDataMatch;
+    q_updateTokensFromResponse;
+    u_writeDataToCache;
+    h_updateFilterFromL1HintOrWB;
+    cl2_checkL2Accumulation;
+    n_popResponseQueue;
+  }
+
+  // -------------------------------------------------------------------------
+  // TRANSIENT ACCUMULATION SHIELD
+  // Ignore retries and new requests while we are busy accumulating.
+  // The L1 caches will naturally time out and retry again later!
+  // -------------------------------------------------------------------------
+
+  transition({SX, OX, MX}, {L1_GETX, L1_GETS}) {
+    o_popL1RequestQueue;
+  }
+
+  transition({SX, OX, MX}, {Transient_GETX, Transient_GETS}) {
+    m_popRequestQueue;
   }
 }

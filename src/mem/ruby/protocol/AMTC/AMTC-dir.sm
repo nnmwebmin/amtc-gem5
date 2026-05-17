@@ -1,4 +1,4 @@
-/*
+/*   AMTC_dir.sm
  * Copyright (c) 1999-2013 Mark D. Hill and David A. Wood
  * All rights reserved.
  *
@@ -114,6 +114,7 @@ machine(MachineType:Directory, "Token protocol")
     DMA_READ, desc="A DMA Read memory request";
     DMA_WRITE, desc="A DMA Write memory request";
     GETS_Owner_Pull, desc="The Owner is requesting raw data for a missing sector";
+
 
 
     // TWO INTERNAL TRIGGERS ---
@@ -571,28 +572,35 @@ machine(MachineType:Directory, "Token protocol")
     }
 }
 
-  in_port(requestNetwork_in, RequestMsg, requestToDir) {
+in_port(requestNetwork_in, RequestMsg, requestToDir) {
     if (requestNetwork_in.isReady(clockEdge())) {
       peek(requestNetwork_in, RequestMsg) {
         assert(in_msg.Destination.isElement(machineID));
 
         // --- DOMAIN-AWARE EVENT SPLITTING ---
-        if (in_msg.Type == CoherenceRequestType:GETS) {
-            if (in_msg.is_owner_pull) {
-                // Intercept Owner Pulls here!
-                trigger(Event:GETS_Owner_Pull, in_msg.addr, TBEs[in_msg.addr]);
-            } else if (is_cpu_domain(in_msg.Requestor)) {
+
+        // 1. CRITICAL FIX: Intercept ALL Owner Pulls FIRST, regardless of whether
+        // the original request was a GETS or GETX.
+        if (in_msg.is_owner_pull) {
+            trigger(Event:GETS_Owner_Pull, in_msg.addr, TBEs[in_msg.addr]);
+        }
+        // 2. Normal GETS Routing
+        else if (in_msg.Type == CoherenceRequestType:GETS) {
+            if (is_cpu_domain(in_msg.Requestor)) {
                 trigger(Event:CPU_GETS, in_msg.addr, TBEs[in_msg.addr]);
             } else {
                 trigger(Event:GPU_GETS, in_msg.addr, TBEs[in_msg.addr]);
             }
-        } else if (in_msg.Type == CoherenceRequestType:GETX) {
+        }
+        // 3. Normal GETX Routing
+        else if (in_msg.Type == CoherenceRequestType:GETX) {
             if (is_cpu_domain(in_msg.Requestor)) {
                 trigger(Event:CPU_GETX, in_msg.addr, TBEs[in_msg.addr]);
             } else {
                 trigger(Event:GPU_GETX, in_msg.addr, TBEs[in_msg.addr]);
             }
-        } else {
+        }
+        else {
             error("Invalid message");
         }
       }
@@ -1811,20 +1819,11 @@ action(a_inv_remote_domain_on_getx, "invR", desc="Invalidate remote domain on up
   // CE → CE_XFER → CE TRANSITIONS
   // ============================================================================
 
-  transition(CE, CPU_GETX, CE_XFER) {
-    st_saveRequestor;
+  // CRITICAL FIX: Instantly transfer ownership without allocating a TBE!
+  transition(CE, CPU_GETX) {
     fwd_req_to_cpu;
+    u_set_cpu_exclusive;
     j_popIncomingRequestQueue;
-  }
-
-  transition(CE_XFER, Data_Owner, CE) {
-    f_commitTransferredOwner;
-    k_popIncomingResponseQueue;
-  }
-
-  transition(CE_XFER, Ack_Owner, CE) {
-    f_commitTransferredOwner;
-    k_popIncomingResponseQueue;
   }
 
   // ============================================================================
@@ -1884,6 +1883,18 @@ action(a_inv_remote_domain_on_getx, "invR", desc="Invalidate remote domain on up
   }
   transition(GE, CPU_GETX, MIG_G2C) {
     v_allocateTBE; fwd_inv_to_gpu; j_popIncomingRequestQueue;
+  }
+
+  // =====================================================================
+  // CRITICAL FIX: Added missing completion transition to prevent TBE leaks!
+  // =====================================================================
+  transition(MIG_G2C, Tokens_Ack, CE) {
+    f_incrementTokens;
+    d_send_remaining_tokens_cpu;
+    u_set_cpu_exclusive;
+    s_deallocateTBE; // <--- This prevents the TBE table from filling up!
+    k_popIncomingResponseQueue;
+    qw_wakeUpDependents;
   }
 
 //============================================================================
