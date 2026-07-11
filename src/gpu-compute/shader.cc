@@ -36,6 +36,7 @@
 #include "arch/amdgpu/common/gpu_translation_state.hh"
 #include "arch/amdgpu/common/tlb.hh"
 #include "base/chunk_generator.hh"
+#include "base/logging.hh"
 #include "debug/GPUAgentDisp.hh"
 #include "debug/GPUDisp.hh"
 #include "debug/GPUMem.hh"
@@ -202,14 +203,30 @@ Shader::execScheduledAdds()
  */
 void
 Shader::prepareInvalidate(HSAQueueEntry *task) {
+    warn("AMTC_PREP_INV_ENTER tick=%llu task=%p dispatch_id=%d queue_id=%u started=%d outstanding=%d n_cu=%d n_cu_per_sqc=%d\n",
+         (unsigned long long)curTick(), task, task->dispatchId(),
+         task->queueId(), task->isInvStarted(), task->outstandingInvs(),
+         n_cu, n_cu_per_sqc);
+
     // if invalidate has already started/finished, then do nothing
-    if (task->isInvStarted()) return;
+    if (task->isInvStarted()) {
+        warn("AMTC_PREP_INV_SKIP_ALREADY_STARTED tick=%llu task=%p dispatch_id=%d outstanding=%d\n",
+             (unsigned long long)curTick(), task, task->dispatchId(),
+             task->outstandingInvs());
+        return;
+    }
 
     // invalidate has never started; it can only perform once at kernel launch
+    warn("AMTC_PREP_INV_BEFORE_ASSERT tick=%llu task=%p dispatch_id=%d outstanding=%d\n",
+         (unsigned long long)curTick(), task, task->dispatchId(),
+         task->outstandingInvs());
     assert(task->outstandingInvs() == -1);
     int kernId = task->dispatchId();
+
     // counter value is 0 now, indicating the inv is about to start
     _dispatcher.updateInvCounter(kernId, +1);
+    warn("AMTC_PREP_INV_BASE_COUNTER tick=%llu task=%p dispatch_id=%d outstanding=%d\n",
+         (unsigned long long)curTick(), task, kernId, task->outstandingInvs());
 
     // iterate all cus managed by the shader, to perform invalidate.
     for (int i_cu = 0; i_cu < n_cu; ++i_cu) {
@@ -219,10 +236,19 @@ Shader::prepareInvalidate(HSAQueueEntry *task) {
                                                  cuList[i_cu]->requestorId(),
                                                  0, -1);
 
+        warn("AMTC_PREP_INV_CU_BEFORE_INC tick=%llu task=%p dispatch_id=%d cu=%d outstanding=%d\n",
+             (unsigned long long)curTick(), task, kernId, i_cu,
+             task->outstandingInvs());
         _dispatcher.updateInvCounter(kernId, +1);
+        warn("AMTC_PREP_INV_CU_AFTER_INC tick=%llu task=%p dispatch_id=%d cu=%d outstanding=%d requestor=%d\n",
+             (unsigned long long)curTick(), task, kernId, i_cu,
+             task->outstandingInvs(), cuList[i_cu]->requestorId());
+
         // all necessary INV flags are all set now, call cu to execute
         cuList[i_cu]->doInvalidate(tcc_req, task->dispatchId());
-
+        warn("AMTC_PREP_INV_CU_DO_INVALIDATE_SENT tick=%llu task=%p dispatch_id=%d cu=%d outstanding=%d\n",
+             (unsigned long long)curTick(), task, kernId, i_cu,
+             task->outstandingInvs());
 
         // A set of CUs share a single SQC cache. Send a single invalidate
         // request to each SQC
@@ -231,12 +257,18 @@ Shader::prepareInvalidate(HSAQueueEntry *task) {
                                                  0, -1);
 
         if ((i_cu % n_cu_per_sqc) == 0) {
+            warn("AMTC_PREP_INV_SQC_SENT tick=%llu task=%p dispatch_id=%d cu=%d outstanding=%d requestor=%d\n",
+                 (unsigned long long)curTick(), task, kernId, i_cu,
+                 task->outstandingInvs(), cuList[i_cu]->requestorId());
             cuList[i_cu]->doSQCInvalidate(sqc_req, task->dispatchId());
         }
 
         // I don't like this. This is intrusive coding.
         cuList[i_cu]->resetRegisterPool();
     }
+
+    warn("AMTC_PREP_INV_EXIT tick=%llu task=%p dispatch_id=%d outstanding=%d\n",
+         (unsigned long long)curTick(), task, kernId, task->outstandingInvs());
 }
 
 /**
@@ -560,7 +592,11 @@ Shader::notifyCuSleep() {
 void
 Shader::decNumOutstandingInvL2s()
 {
+    int before = num_outstanding_invl2s;
     num_outstanding_invl2s--;
+    warn("AMTC_SHADER_INV_L2_DEC tick=%llu before=%d after=%d deferred=%d\n",
+         (unsigned long long)curTick(), before, num_outstanding_invl2s,
+         (int)deferred_dispatches.size());
 
     if (num_outstanding_invl2s == 0 && !deferred_dispatches.empty()) {
         for (auto &dispatch : deferred_dispatches) {

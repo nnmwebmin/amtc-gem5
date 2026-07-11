@@ -1,3 +1,23 @@
+structure (VIPERCoalescer, external = "yes") {
+  void readCallback(Addr, DataBlock);
+  void readCallback(Addr, MachineType, DataBlock, bool);
+  void readCallback(Addr, MachineType, DataBlock,
+                    Cycles, Cycles, Cycles, bool);
+  void readCallback(Addr, MachineType, DataBlock,
+                    Cycles, Cycles, Cycles, bool, bool);
+  void writeCallback(Addr, DataBlock);
+  void writeCallback(Addr, MachineType, DataBlock);
+  void writeCallback(Addr, MachineType, DataBlock,
+                     Cycles, Cycles, Cycles);
+  void writeCallback(Addr, MachineType, DataBlock,
+                     Cycles, Cycles, Cycles, bool);
+  void atomicCallback(Addr, MachineType, DataBlock);
+  void invTCPCallback(Addr);
+  void invTCCCallback(Addr);
+  void writeCompleteCallback(Addr, uint64_t);
+  void evictionCallback(Addr);
+}
+
 /*
  * Copyright (c) 1999-2005 Mark D. Hill and David A. Wood
  * All rights reserved.
@@ -35,6 +55,7 @@
 enumeration(CoherenceRequestType, desc="...") {
   GETX,      desc="Get eXclusive";
   GETS,      desc="Get Shared";
+  InvCache,  desc="Invalidate TCC cache entry from TCP";
 }
 
 // PersistentType
@@ -50,6 +71,7 @@ enumeration(CoherenceResponseType, desc="...") {
   ACK_OWNER,  desc="data-less owner token";
   DATA_SHARED, desc="Data";
   ACK,         desc="ACKnowledgment";
+  InvL2Resp,   desc="L2 invalidate completed";
   WB_TOKENS,   desc="L1 to L2 writeback";
   WB_SHARED_DATA,   desc="L1 to L2 writeback with data";
   WB_OWNED,    desc="L1 to L2 writeback with data";
@@ -111,6 +133,11 @@ structure(RequestMsg, desc="...", interface="Message") {
   bool is_signal, default="false", desc="HSA/doorbell signal request";
   bool merged_req, default="false", desc="Request represents a merged sector mask";
   bool is_owner_pull, default="false", desc="True if the Owner is pulling missing sector data";
+
+  // AMTC GETX upgrade credit: tokens already retained by the requester.
+  // These are metadata credits only; they must not be added to L2 token storage.
+  int requester_held_tokens_sec0, default="0", desc="Requester-held token credit for sector 0";
+  int requester_held_tokens_sec1, default="0", desc="Requester-held token credit for sector 1";
 
   bool functionalRead(Packet *pkt) {
     // No data in request messages

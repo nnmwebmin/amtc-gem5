@@ -940,6 +940,21 @@ Sequencer::invL1()
             m_num_pending_invs);
 }
 
+void
+Sequencer::invL1CallbackIfPending()
+{
+    warn("AMTC_DBG_SEQ_INV_L1_IF_PENDING tick=%llu sequencer=%s "
+         "cache_inv_pkt=%p pending=%d\n",
+         (unsigned long long)curTick(),
+         name(),
+         m_cache_inv_pkt,
+         m_num_pending_invs);
+
+    if (m_cache_inv_pkt && m_num_pending_invs > 0) {
+        invL1Callback();
+    }
+}
+
 bool
 Sequencer::empty() const
 {
@@ -1022,6 +1037,30 @@ Sequencer::makeRequest(PacketPtr pkt)
 
         }
 #endif
+    } else if (pkt->cmd == MemCmd::MemSyncReq) {
+        /*
+         * Kernel-launch invalidates are emitted as MemSyncReq with paddr 0
+         * and can also have hasNoAddr() set.  Handle MemSyncReq before the
+         * generic hasNoAddr path so the Sequencer records m_cache_inv_pkt
+         * and starts the L1 cache walk.  Otherwise TCP invalidate completion
+         * sees cache_inv_pkt=null and pending=0 forever.
+         */
+        primary_type = secondary_type = RubyRequestType_REPLACEMENT;
+        assert(!m_cache_inv_pkt);
+        m_cache_inv_pkt = pkt;
+
+        warn("AMTC_SEQ_MEMSYNC_INV_START tick=%llu sequencer=%s pkt=%p "
+             "isKernel=%d isInvL1=%d hasNoAddr=%d paddr=%#llx\n",
+             (unsigned long long)curTick(),
+             name(),
+             pkt,
+             pkt->req->isKernel(),
+             pkt->req->isInvL1(),
+             pkt->req->hasNoAddr(),
+             pkt->req->hasNoAddr() ? 0ULL :
+                 (unsigned long long)pkt->getAddr());
+
+        invL1();
     } else if (pkt->req->hasNoAddr()) {
         primary_type = secondary_type = RubyRequestType_hasNoAddr;
     } else {
@@ -1051,11 +1090,6 @@ Sequencer::makeRequest(PacketPtr pkt)
             }
         } else if (pkt->isFlush() || pkt->isCleanInvalidateRequest()) {
             primary_type = secondary_type = RubyRequestType_FLUSH;
-        } else if (pkt->cmd == MemCmd::MemSyncReq) {
-            primary_type = secondary_type = RubyRequestType_REPLACEMENT;
-            assert(!m_cache_inv_pkt);
-            m_cache_inv_pkt = pkt;
-            invL1();
         } else {
             panic("Cannot convert packet [%s] to ruby request\n",
                   pkt->print());

@@ -159,6 +159,7 @@ structure (Sequencer, external = "yes") {
   void evictionCallback(Addr);
 
   void invL1Callback();
+  void invL1CallbackIfPending();
 
   void recordRequestType(SequencerRequestType);
   bool checkResourceAvailable(CacheResourceType, Addr);

@@ -1,4 +1,5 @@
 /*
+ * AMTC-TCC.sm
  * Copyright (c) 2010-2015 Advanced Micro Devices, Inc.
  * All rights reserved.
  *
@@ -49,9 +50,11 @@ machine(MachineType:TCC, "TCC Cache")
   MessageBuffer * probeFromNB, network="From", virtual_network="0", vnet_type="request";
   MessageBuffer * responseFromNB, network="From", virtual_network="2", vnet_type="response";
   // To the NB
-  MessageBuffer * requestToNB, network="To", virtual_network="0", vnet_type="request";
+  MessageBuffer * requestToNB, network="To", virtual_network="5", vnet_type="request";
   MessageBuffer * responseToNB, network="To", virtual_network="2", vnet_type="response";
   MessageBuffer * unblockToNB, network="To", virtual_network="4", vnet_type="unblock";
+
+  MessageBuffer * ownerResponseFromL1, network="From", virtual_network="4", vnet_type="response";
 
   MessageBuffer * triggerQueue;
 
@@ -62,10 +65,13 @@ machine(MachineType:TCC, "TCC Cache")
     // Requests (from TCP / L1)
     GETS,            desc="Read request";
     GETX,            desc="Write / atomic request";
+    InvCache,        desc="Invalidate request from TCP";
 
     // Responses (from Directory / Memory / L2)
     Data,            desc="Data response (DATA_SHARED / DATA_OWNER)";
     Ack,             desc="Completion / ACK";
+    StaleOwnerAck, desc="Zero-token ACK_OWNER from stale CPU owner";
+    OwnerRespData, desc="DATA response arriving on ownerResponseFromL1 queue";
 
     // Internal cache behavior
     L2_Repl,         desc="Cache replacement";
@@ -74,6 +80,13 @@ machine(MachineType:TCC, "TCC Cache")
     // Optional (keep only if used)
     Inv,             desc="Invalidate request";
     Bypass,          desc="Bypass L2 (GPU/SLC path)";
+
+    TCP_WriteThrough, desc="Writethrough payload from TCP";
+
+    // CPU/Directory probes reaching TCC.  These are separate from
+    // core-side GETS/GETX because they are sourced from probeFromNB_in.
+    CPU_GETS, desc="CPU/Directory forwarded GETS probe to TCC";
+    CPU_GETX, desc="CPU/Directory forwarded GETX probe to TCC";
   }
 
   // STATES
@@ -104,6 +117,11 @@ machine(MachineType:TCC, "TCC Cache")
     bool Dirty,                 desc="Is the data dirty (diff from memory?)";
     DataBlock DataBlk,          desc="Data for the block";
     WriteMask writeMask,        desc="Dirty byte mask";
+
+    // AMTC sector/token metadata for GPU TCC.
+    int ValidSectors, default="0", desc="Bitmask of valid sectors (1=S0, 2=S1)";
+    int TokensSec0, default="0", desc="Tokens held for sector 0";
+    int TokensSec1, default="0", desc="Tokens held for sector 1";
   }
 
   structure(TBE, desc="...") {
@@ -145,42 +163,197 @@ machine(MachineType:TCC, "TCC Cache")
   // FUNCTION DEFINITIONS
   Tick clockEdge();
 
-  int getSector(Addr addr) {
-	  Addr offset;
-
-	offset := addr % 128;
-
-	if (offset < 32) {
-		return 0;
-	} else if (offset < 64) {
-		return 1;
-	} else if (offset < 96) {
-		return 2;
-	} else {
-		return 3;
-	}
+   // -------------------------------------------------------------------------
+  // AMTC compact sector helpers.
+  // Physical Ruby coherence block remains 64B. Logical sharing is represented
+  // as 2 x 32B sectors: sector 0 = bytes 0..31, sector 1 = bytes 32..63.
+  // Full-line mask is 3. Old full-line mask values such as 15 are sanitized
+  // to 3 so untrimmed controllers cannot accidentally re-enable 4 sectors.
+  // -------------------------------------------------------------------------
+  int amtc_maskFromSector(int sid) {
+    if (sid == 0) {
+      return 1;
+    }
+    return 2;
   }
 
-  Entry getCacheEntry(Addr addr), return_by_pointer="yes" {
-    return static_cast(Entry, "pointer", L2cache.lookup(addr));
+  int amtc_fullMask() {
+    return 3;
   }
 
-  DataBlock getDataBlock(Addr addr), return_by_ref="yes" {
-    return getCacheEntry(addr).DataBlk;
+  int amtc_sanitizeMask(int mask) {
+    int result := 0;
+    if ((mask % 2) == 1) {
+      result := result + 1;
+    }
+    if (((mask / 2) % 2) == 1) {
+      result := result + 2;
+    }
+    if (result == 0 && mask != 0) {
+      result := 3;
+    }
+    return result;
   }
+
+  bool amtc_maskHasSector(int mask, int sid) {
+    int clean := amtc_sanitizeMask(mask);
+    if (sid == 0) {
+      return ((clean % 2) == 1);
+    }
+    return (((clean / 2) % 2) == 1);
+  }
+
+  int amtc_addSectorToMask(int mask, int sid) {
+    int clean := amtc_sanitizeMask(mask);
+    if (amtc_maskHasSector(clean, sid)) {
+      return clean;
+    }
+    return clean + amtc_maskFromSector(sid);
+  }
+
+  int amtc_intersectMasks(int a, int b) {
+    int result := 0;
+    if (amtc_maskHasSector(a, 0) && amtc_maskHasSector(b, 0)) {
+      result := result + 1;
+    }
+    if (amtc_maskHasSector(a, 1) && amtc_maskHasSector(b, 1)) {
+      result := result + 2;
+    }
+    return result;
+  }
+
+  int amtc_unionMasks(int a, int b) {
+    int result := amtc_sanitizeMask(a);
+    if (amtc_maskHasSector(b, 0)) {
+      result := amtc_addSectorToMask(result, 0);
+    }
+    if (amtc_maskHasSector(b, 1)) {
+      result := amtc_addSectorToMask(result, 1);
+    }
+    return amtc_sanitizeMask(result);
+  }
+
+  bool amtc_maskContainsAll(int have_mask, int need_mask) {
+    int have := amtc_sanitizeMask(have_mask);
+    int need := amtc_sanitizeMask(need_mask);
+    if (amtc_maskHasSector(need, 0) && !amtc_maskHasSector(have, 0)) {
+      return false;
+    }
+    if (amtc_maskHasSector(need, 1) && !amtc_maskHasSector(have, 1)) {
+      return false;
+    }
+    return true;
+  }
+
+  int amtc_primarySectorFromMask(int mask) {
+    if (amtc_maskHasSector(mask, 0)) {
+      return 0;
+    }
+    return 1;
+  }
+
+  int amtc_normalizeMask(int mask, int sid) {
+    if (mask != 0) {
+      return amtc_sanitizeMask(mask);
+    }
+    return amtc_maskFromSector(sid);
+  }
+
+  int amtc_sectorFromAddr(Addr addr) {
+    return ((addressToInt(addr) / 32) % 2);
+  }
+
+  int amtc_singleSectorMaskFromAddr(Addr addr) {
+    return amtc_maskFromSector(amtc_sectorFromAddr(addr));
+  }
+
+  int amtc_countSectors(int mask) {
+    int count := 0;
+    if (amtc_maskHasSector(mask, 0)) {
+      count := count + 1;
+    }
+    if (amtc_maskHasSector(mask, 1)) {
+      count := count + 1;
+    }
+    return count;
+  }
+
+  int amtc_expectedTokensForMask(int mask) {
+    int active := amtc_countSectors(mask);
+    if (active == 0) {
+      active := 2;
+    }
+    return (max_tokens() / 2) * active;
+  }
+
+  int amtc_clearSector(int mask, int sid) {
+    int clean := amtc_sanitizeMask(mask);
+    if (sid == 0 && amtc_maskHasSector(clean, 0)) {
+      return clean - 1;
+    }
+    if (sid == 1 && amtc_maskHasSector(clean, 1)) {
+      return clean - 2;
+    }
+    return clean;
+  }
+
+  int amtc_subtractMask(int base, int remove) {
+    int result := amtc_sanitizeMask(base);
+    if (amtc_maskHasSector(remove, 0)) {
+      result := amtc_clearSector(result, 0);
+    }
+    if (amtc_maskHasSector(remove, 1)) {
+      result := amtc_clearSector(result, 1);
+    }
+    return result;
+  }
+
+  MessageSizeType amtc_getSizeFromDirtyMask(int mask) {
+    int active := amtc_countSectors(mask);
+    if (active == 1) {
+      return MessageSizeType:Response_Sector2_Data;
+    }
+    return MessageSizeType:Response_Data;
+  }
+
+  Entry getCacheEntry(Addr address), return_by_pointer="yes" {
+    Entry cache_entry := static_cast(Entry, "pointer", L2cache.lookup(address));
+    return cache_entry;
+  }
+
 
   bool presentOrAvail(Addr addr) {
     return L2cache.isTagPresent(addr) || L2cache.cacheAvail(addr);
   }
 
-  State getState(TBE tbe, Entry cache_entry, Addr addr) {
-    if (is_valid(tbe)) {
-      return tbe.TBEState;
-    } else if (is_valid(cache_entry)) {
-      return cache_entry.CacheState;
+
+//  void functionalRead(Addr addr, Packet *pkt) {
+  //  testAndRead(addr, getCacheEntry(addr).DataBlk, pkt);
+//  }
+
+//  int functionalWrite(Addr addr, Packet *pkt) {
+//    int num_functional_writes := 0;
+//    num_functional_writes := num_functional_writes +
+//        testAndWrite(addr, getCacheEntry(addr).DataBlk, pkt);
+//    return num_functional_writes;
+//  }
+
+  int getTokensForMask(Entry cache_entry, int mask) {
+    int total := 0;
+
+    if (is_valid(cache_entry)) {
+
+        if (amtc_maskHasSector(mask, 0)) {
+            total := total + cache_entry.TokensSec0;
+        }
+
+        if (amtc_maskHasSector(mask, 1)) {
+            total := total + cache_entry.TokensSec1;
+        }
     }
-    return State:I;
-  }
+
+    return total;
+}
 
   void setState(TBE tbe, Entry cache_entry, Addr addr, State state) {
     if (is_valid(tbe)) {
@@ -268,12 +441,16 @@ machine(MachineType:TCC, "TCC Cache")
     }
   }
 
-  State getState(Entry cache_entry, Addr addr) {
+  State getState(TBE tbe, Entry cache_entry, Addr addr) {
+    if (is_valid(tbe)) {
+      return tbe.TBEState;
+    }
+
     if (is_valid(cache_entry)) {
       return cache_entry.CacheState;
-    } else {
-      return State:I;
     }
+
+    return State:I;
   }
 
   // ** OUT_PORTS **
@@ -308,16 +485,43 @@ machine(MachineType:TCC, "TCC Cache")
           not have the correct GLC/SLC information for a given request.
          */
         bool is_slc_set := in_msg.isSLCSet;
+        DPRINTF(RubySlicc,
+        "AMTC_TCC_RESP_RAW_IN addr=%#x type=%s sender=%s tok0=%d tok1=%d valid=%d tokenmask=%d reqmask=%d state=%s\n",
+        in_msg.addr,
+        in_msg.Type,
+        in_msg.Sender,
+        in_msg.TokensSec0,
+        in_msg.TokensSec1,
+        in_msg.valid_sector_mask,
+        in_msg.token_sector_mask,
+        in_msg.requested_sector_mask,
+        getState(tbe, cache_entry, in_msg.addr));
 
         // Whether the SLC bit is set or not, WB acks should invoke the
         // WBAck event. For cases where a read response will follow a
         // WBAck (A read bypass evict on a dirty line), the line's TLB
         // will not be deallocated on WBAck, and the SLC bit will be
         // checked when the read response is received.
-        if (in_msg.Type == CoherenceResponseType:ACK) {
-          trigger(Event:Ack, in_msg.addr, cache_entry, tbe);
-        } else if(in_msg.Type == CoherenceResponseType:DATA_SHARED ||
-          in_msg.Type == CoherenceResponseType:DATA_OWNER){
+          if (in_msg.Type == CoherenceResponseType:ACK_OWNER &&
+              in_msg.TokensSec0 == 0 &&
+              in_msg.TokensSec1 == 0 &&
+              in_msg.valid_sector_mask == 0 &&
+              in_msg.token_sector_mask == 0) {
+
+            DPRINTF(RubySlicc,
+                    "AMTC_TCC_STALE_OWNER_ACK_IN addr=%#x sender=%s reqmask=%d sectormask=%d\n",
+                    in_msg.addr,
+                    in_msg.Sender,
+                    in_msg.requested_sector_mask,
+                    in_msg.sector_mask);
+
+            trigger(Event:StaleOwnerAck, in_msg.addr, cache_entry, tbe);
+
+          } else if (in_msg.Type == CoherenceResponseType:ACK) {
+            trigger(Event:Ack, in_msg.addr, cache_entry, tbe);
+
+          } else if(in_msg.Type == CoherenceResponseType:DATA_SHARED ||
+                    in_msg.Type == CoherenceResponseType:DATA_OWNER){
           // If the SLC bit is set or the cache is write-through and
           // we're receiving modified data (such as from an atomic),
           // the response needs to bypass the cache and should not be
@@ -346,7 +550,7 @@ machine(MachineType:TCC, "TCC Cache")
       peek(coreRequestNetwork_in, RequestMsg, block_on="addr") {
         TBE tbe := TBEs.lookup(in_msg.addr);
         Entry cache_entry := getCacheEntry(in_msg.addr);
-        State current_state := getState(cache_entry, in_msg.addr);
+        State current_state := getState(tbe, cache_entry, in_msg.addr);
 
         // --- DOMAIN-AWARE FILTERING ---
         // Use the same helper here for the CPU domain check
@@ -368,6 +572,8 @@ machine(MachineType:TCC, "TCC Cache")
                 }
             } else if (in_msg.Type == CoherenceRequestType:GETX) {
                 trigger(Event:GETX, in_msg.addr, cache_entry, tbe);
+            } else if (in_msg.Type == CoherenceRequestType:InvCache) {
+                trigger(Event:InvCache, in_msg.addr, cache_entry, tbe);
             } else {
                 error("Unexpected Request Message to TCC");
             }
@@ -375,6 +581,102 @@ machine(MachineType:TCC, "TCC Cache")
       }
     }
   }
+
+  in_port(tcpWriteThrough_in, ResponseMsg, requestFromTCP, rank=1) {
+    if (tcpWriteThrough_in.isReady(clockEdge())) {
+      peek(tcpWriteThrough_in, ResponseMsg, block_on="addr") {
+        TBE tbe := TBEs.lookup(in_msg.addr);
+        Entry cache_entry := getCacheEntry(in_msg.addr);
+
+        if (in_msg.Type == CoherenceResponseType:WB_SHARED_DATA) {
+          if (presentOrAvail(in_msg.addr)) {
+            trigger(Event:TCP_WriteThrough, in_msg.addr, cache_entry, tbe);
+          } else {
+            Addr victim := L2cache.cacheProbe(in_msg.addr);
+            trigger(Event:L2_Repl, victim, getCacheEntry(victim), TBEs.lookup(victim));
+          }
+        } else {
+          tcpWriteThrough_in.dequeue(clockEdge());
+        }
+      }
+    }
+  }
+
+  in_port(ownerResponseFromL1_in, ResponseMsg, ownerResponseFromL1) {
+    if (ownerResponseFromL1_in.isReady(clockEdge())) {
+      peek(ownerResponseFromL1_in, ResponseMsg) {
+        Entry cache_entry := getCacheEntry(in_msg.addr);
+        TBE tbe := TBEs.lookup(in_msg.addr);
+        DPRINTF(RubySlicc,
+                "AMTC_TCC_OWNER_RESP_RAW_IN addr=%#x type=%s sender=%s tok0=%d tok1=%d valid=%d tokenmask=%d reqmask=%d\n",
+                in_msg.addr,
+                in_msg.Type,
+                in_msg.Sender,
+                in_msg.TokensSec0,
+                in_msg.TokensSec1,
+                in_msg.valid_sector_mask,
+                in_msg.token_sector_mask,
+                in_msg.requested_sector_mask);
+
+        if (in_msg.Type == CoherenceResponseType:ACK_OWNER &&
+            in_msg.TokensSec0 == 0 &&
+            in_msg.TokensSec1 == 0 &&
+            in_msg.valid_sector_mask == 0 &&
+            in_msg.token_sector_mask == 0) {
+          trigger(Event:StaleOwnerAck, in_msg.addr, cache_entry, tbe);
+        } else if (in_msg.Type == CoherenceResponseType:DATA_SHARED ||
+                  in_msg.Type == CoherenceResponseType:DATA_OWNER) {
+          DPRINTF(RubySlicc,
+                  "AMTC_TCC_OWNER_RESP_DATA_IN addr=%#x type=%s sender=%s tok0=%d tok1=%d valid=%d tokenmask=%d reqmask=%d\n",
+                  in_msg.addr,
+                  in_msg.Type,
+                  in_msg.Sender,
+                  in_msg.TokensSec0,
+                  in_msg.TokensSec1,
+                  in_msg.valid_sector_mask,
+                  in_msg.token_sector_mask,
+                  in_msg.requested_sector_mask);
+          trigger(Event:OwnerRespData, in_msg.addr, cache_entry, tbe);
+        } else if (in_msg.Type == CoherenceResponseType:ACK) {
+          trigger(Event:Ack, in_msg.addr, cache_entry, tbe);
+        } else {
+          error("Unexpected owner response to TCC");
+        }
+      }
+    }
+  }
+
+  in_port(probeFromNB_in, RequestMsg, probeFromNB) {
+    if (probeFromNB_in.isReady(clockEdge())) {
+      peek(probeFromNB_in, RequestMsg, block_on="addr") {
+        Entry cache_entry := getCacheEntry(in_msg.addr);
+        TBE tbe := TBEs.lookup(in_msg.addr);
+
+        DPRINTF(RubySlicc,
+                "AMTC_TCC_PROBE_FROM_NB addr=%#x type=%s requestor=%s mask=%d reqmask=%d retry=%d ownerpull=%d state=%s\n",
+                in_msg.addr,
+                in_msg.Type,
+                in_msg.Requestor,
+                in_msg.sector_mask,
+                in_msg.requested_sector_mask,
+                in_msg.RetryNum,
+                in_msg.is_owner_pull,
+                getState(tbe, cache_entry, in_msg.addr));
+
+        if (in_msg.Type == CoherenceRequestType:GETS) {
+          trigger(Event:CPU_GETS, in_msg.addr, cache_entry, tbe);
+        } else if (in_msg.Type == CoherenceRequestType:GETX) {
+          trigger(Event:CPU_GETX, in_msg.addr, cache_entry, tbe);
+        } else {
+          DPRINTF(RubySlicc,
+                  "AMTC_TCC_PROBE_DROP_UNSUPPORTED addr=%#x type=%s\n",
+                  in_msg.addr, in_msg.Type);
+          probeFromNB_in.dequeue(clockEdge());
+        }
+      }
+    }
+  }
+
 
   // BEGIN ACTIONS
 
@@ -389,11 +691,17 @@ machine(MachineType:TCC, "TCC Cache")
     peek(coreRequestNetwork_in, RequestMsg) {
       enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
         out_msg.addr := address;
-        out_msg.Type := CoherenceResponseType:ACK;
+        out_msg.Type := CoherenceResponseType:InvL2Resp;
         out_msg.Sender := machineID;
         out_msg.Destination.add(in_msg.Requestor);
         out_msg.MessageSize := MessageSizeType:Response_Control;
         out_msg.sector_id := in_msg.sector_id;
+        out_msg.sector_mask := amtc_normalizeMask(in_msg.sector_mask, in_msg.sector_id);
+        out_msg.requested_sector_mask := amtc_normalizeMask(in_msg.requested_sector_mask, in_msg.sector_id);
+        out_msg.valid_sector_mask := 0;
+        out_msg.token_sector_mask := 0;
+        out_msg.TokensSec0 := 0;
+        out_msg.TokensSec1 := 0;
         DPRINTF(RubySlicc, "%s\n", out_msg);
       }
     }
@@ -401,6 +709,7 @@ machine(MachineType:TCC, "TCC Cache")
 
   action(sd_sendData, "sd", desc="send Shared response") {
     peek(coreRequestNetwork_in, RequestMsg) {
+      int req_mask := amtc_normalizeMask(in_msg.requested_sector_mask, in_msg.sector_id);
       enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
         out_msg.addr := address;
         out_msg.Type := CoherenceResponseType:DATA_SHARED;
@@ -411,8 +720,15 @@ machine(MachineType:TCC, "TCC Cache")
         out_msg.Dirty := false;
         out_msg.isGLCSet := in_msg.isGLCSet;
         out_msg.isSLCSet := in_msg.isSLCSet;
-        out_msg.sector_id := in_msg.sector_id;
-        DPRINTF(RubySlicc, "%s\n", out_msg);
+        out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+        out_msg.sector_mask := req_mask;
+        out_msg.requested_sector_mask := req_mask;
+        out_msg.valid_sector_mask := req_mask;
+        out_msg.TokensSec0 := 0;
+        out_msg.TokensSec1 := 0;
+        out_msg.token_sector_mask := 0;
+        DPRINTF(RubySlicc, "AMTC_TCC_LOCAL_DATA addr=%#x req=%d valid=%d tokmask=%d\n",
+                address, req_mask, out_msg.valid_sector_mask, out_msg.token_sector_mask);
       }
     }
   }
@@ -436,12 +752,23 @@ machine(MachineType:TCC, "TCC Cache")
         }
         out_msg.isGLCSet := in_msg.isGLCSet;
         out_msg.isSLCSet := in_msg.isSLCSet;
-        // reuse CURequestor/Sender field to allow multiple concurrent loads and
-        // track where they should go back to (since TBE can't distinguish
-        // destinations)
+        // AMTC GPU fix: responseFromNB Sender is often Directory/L2 owner,
+        // not the original TCP/SQC requester.  The original GPU requester(s)
+        // are captured in the TCC TBE when the miss was issued.  Route normal
+        // fills back to tbe.Destination so GPUCoalescer receives readCallback.
         out_msg.Destination.clear();
-        out_msg.Destination.add(in_msg.Sender);
+        out_msg.Destination := tbe.Destination;
         out_msg.sector_id := in_msg.sector_id;
+        out_msg.sector_mask := amtc_normalizeMask(in_msg.sector_mask, in_msg.sector_id);
+        out_msg.requested_sector_mask := amtc_normalizeMask(in_msg.requested_sector_mask, in_msg.sector_id);
+        out_msg.valid_sector_mask := amtc_normalizeMask(in_msg.valid_sector_mask, in_msg.sector_id);
+        out_msg.token_sector_mask := amtc_normalizeMask(in_msg.token_sector_mask, in_msg.sector_id);
+        out_msg.TokensSec0 := in_msg.TokensSec0;
+        out_msg.TokensSec1 := in_msg.TokensSec1;
+        DPRINTF(RubySlicc,
+                "AMTC_TCC_RESP_TO_CORE_TBE_DEST_V2 addr=%#x dest=%s sender=%s valid=%d tokmask=%d\n",
+                address, out_msg.Destination, in_msg.Sender,
+                out_msg.valid_sector_mask, out_msg.token_sector_mask);
       }
       DPRINTF(RubySlicc, "%s\n", out_msg);
     }
@@ -453,17 +780,32 @@ machine(MachineType:TCC, "TCC Cache")
           out_msg.addr := address;
           out_msg.Type := CoherenceResponseType:DATA_SHARED;
           out_msg.Sender := machineID;
-          // reuse CURequestor field to allow multiple concurrent loads and
-          // track where they should go back to (since TBE can't distinguish
-          // destinations)
+          // AMTC GPU fix: DATA_OWNER/SLC bypass responses may also be owner
+          // responses whose Sender is not the original TCP/SQC requester.
+          // Prefer the TBE destination when present; otherwise fall back to
+          // Sender for true no-TBE bypass paths.
           out_msg.Destination.clear();
-          out_msg.Destination.add(in_msg.Sender);
+          if (is_valid(tbe)) {
+            out_msg.Destination := tbe.Destination;
+          } else {
+            out_msg.Destination.add(in_msg.Sender);
+          }
           out_msg.DataBlk := in_msg.DataBlk;
           out_msg.MessageSize := MessageSizeType:Response_Data;
           out_msg.Dirty := false;
           out_msg.isGLCSet := in_msg.isGLCSet;
           out_msg.isSLCSet := in_msg.isSLCSet;
           out_msg.sector_id := in_msg.sector_id;
+          out_msg.sector_mask := amtc_normalizeMask(in_msg.sector_mask, in_msg.sector_id);
+          out_msg.requested_sector_mask := amtc_normalizeMask(in_msg.requested_sector_mask, in_msg.sector_id);
+          out_msg.valid_sector_mask := amtc_normalizeMask(in_msg.valid_sector_mask, in_msg.sector_id);
+          out_msg.token_sector_mask := amtc_normalizeMask(in_msg.token_sector_mask, in_msg.sector_id);
+          out_msg.TokensSec0 := in_msg.TokensSec0;
+          out_msg.TokensSec1 := in_msg.TokensSec1;
+          DPRINTF(RubySlicc,
+                  "AMTC_TCC_BYPASS_TO_CORE_DEST_V2 addr=%#x dest=%s sender=%s valid=%d tokmask=%d\n",
+                  address, out_msg.Destination, in_msg.Sender,
+                  out_msg.valid_sector_mask, out_msg.token_sector_mask);
           DPRINTF(RubySlicc, "%s\n", out_msg);
         }
     }
@@ -472,6 +814,7 @@ machine(MachineType:TCC, "TCC Cache")
   action(rd_requestData, "r", desc="Miss in L2, pass on") {
     peek(coreRequestNetwork_in, RequestMsg) {
       DPRINTF(RubySlicc, "in_msg: %s\n", in_msg);
+      int req_mask := amtc_normalizeMask(in_msg.requested_sector_mask, in_msg.sector_id);
       enqueue(requestToNB_out, RequestMsg, l2_request_latency) {
         out_msg.addr := address;
         out_msg.Type := in_msg.Type;
@@ -486,8 +829,12 @@ machine(MachineType:TCC, "TCC Cache")
         out_msg.MessageSize := in_msg.MessageSize;
         out_msg.isGLCSet := in_msg.isGLCSet;
         out_msg.isSLCSet := in_msg.isSLCSet;
-        out_msg.sector_id := in_msg.sector_id;
-        DPRINTF(RubySlicc, "out_msg: %s\n", out_msg);
+        out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+        out_msg.sector_mask := req_mask;
+        out_msg.requested_sector_mask := req_mask;
+        out_msg.is_gpu := true;
+        DPRINTF(RubySlicc, "AMTC_TCC_FWD_REQ addr=%#x type=%s reqmask=%d is_gpu=%d\n",
+                address, out_msg.Type, req_mask, out_msg.is_gpu);
       }
     }
   }
@@ -503,6 +850,8 @@ machine(MachineType:TCC, "TCC Cache")
         out_msg.MessageSize := MessageSizeType:Writeback_Control;
 
         out_msg.sector_id := in_msg.sector_id;
+        out_msg.sector_mask := amtc_normalizeMask(in_msg.sector_mask, in_msg.sector_id);
+        out_msg.requested_sector_mask := out_msg.sector_mask;
       }
     }
   }
@@ -518,6 +867,8 @@ machine(MachineType:TCC, "TCC Cache")
         out_msg.MessageSize := MessageSizeType:Writeback_Control;
 
         out_msg.sector_id := in_msg.sector_id;
+        out_msg.sector_mask := amtc_normalizeMask(in_msg.sector_mask, in_msg.sector_id);
+        out_msg.requested_sector_mask := out_msg.sector_mask;
       }
     }
   }
@@ -539,6 +890,7 @@ machine(MachineType:TCC, "TCC Cache")
 
   action(ar_sendAtomicResponse, "ar", desc="send Atomic Ack") {
     peek(coreRequestNetwork_in, RequestMsg) {
+        int req_mask := amtc_normalizeMask(in_msg.requested_sector_mask, in_msg.sector_id);
         enqueue(responseToCore_out, ResponseMsg, l2_response_latency + glc_atomic_latency, true) {
           out_msg.addr := address;
           out_msg.Type := CoherenceResponseType:DATA_SHARED;
@@ -550,6 +902,13 @@ machine(MachineType:TCC, "TCC Cache")
           out_msg.DataBlk := cache_entry.DataBlk;
           out_msg.isGLCSet := in_msg.isGLCSet;
           out_msg.isSLCSet := in_msg.isSLCSet;
+          out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+          out_msg.sector_mask := req_mask;
+          out_msg.requested_sector_mask := req_mask;
+          out_msg.valid_sector_mask := req_mask;
+          out_msg.token_sector_mask := 0;
+          out_msg.TokensSec0 := 0;
+          out_msg.TokensSec1 := 0;
         }
     }
     cache_entry.DataBlk.clearAtomicLogEntries();
@@ -567,6 +926,12 @@ machine(MachineType:TCC, "TCC Cache")
           out_msg.isGLCSet := tbe.isGLCSet;
           out_msg.isSLCSet := tbe.isSLCSet;
           out_msg.sector_id := in_msg.sector_id;
+          out_msg.sector_mask := amtc_normalizeMask(in_msg.sector_mask, in_msg.sector_id);
+          out_msg.requested_sector_mask := amtc_normalizeMask(in_msg.requested_sector_mask, in_msg.sector_id);
+          out_msg.valid_sector_mask := amtc_normalizeMask(in_msg.valid_sector_mask, in_msg.sector_id);
+          out_msg.token_sector_mask := amtc_normalizeMask(in_msg.token_sector_mask, in_msg.sector_id);
+          out_msg.TokensSec0 := in_msg.TokensSec0;
+          out_msg.TokensSec1 := in_msg.TokensSec1;
         }
     }
     cache_entry.DataBlk.clearAtomicLogEntries();
@@ -583,6 +948,13 @@ machine(MachineType:TCC, "TCC Cache")
           out_msg.DataBlk := in_msg.DataBlk;
           out_msg.isGLCSet := in_msg.isGLCSet;
           out_msg.isSLCSet := in_msg.isSLCSet;
+          out_msg.sector_id := in_msg.sector_id;
+          out_msg.sector_mask := amtc_normalizeMask(in_msg.sector_mask, in_msg.sector_id);
+          out_msg.requested_sector_mask := amtc_normalizeMask(in_msg.requested_sector_mask, in_msg.sector_id);
+          out_msg.valid_sector_mask := amtc_normalizeMask(in_msg.valid_sector_mask, in_msg.sector_id);
+          out_msg.token_sector_mask := amtc_normalizeMask(in_msg.token_sector_mask, in_msg.sector_id);
+          out_msg.TokensSec0 := in_msg.TokensSec0;
+          out_msg.TokensSec1 := in_msg.TokensSec1;
         }
     }
   }
@@ -591,6 +963,9 @@ machine(MachineType:TCC, "TCC Cache")
     if (is_invalid(cache_entry)) {
       set_cache_entry(L2cache.allocate(address, new Entry));
       cache_entry.writeMask.clear();
+      cache_entry.ValidSectors := 0;
+      cache_entry.TokensSec0 := 0;
+      cache_entry.TokensSec1 := 0;
     }
   }
 
@@ -653,7 +1028,70 @@ machine(MachineType:TCC, "TCC Cache")
   action(wcb_writeCacheBlock, "wcb", desc="write data to TCC") {
     peek(responseFromNB_in, ResponseMsg) {
       cache_entry.DataBlk := in_msg.DataBlk;
-      DPRINTF(RubySlicc, "Writing to TCC: %s\n", in_msg);
+      cache_entry.ValidSectors := amtc_normalizeMask(in_msg.valid_sector_mask, in_msg.sector_id);
+      cache_entry.TokensSec0 := cache_entry.TokensSec0 + in_msg.TokensSec0;
+      cache_entry.TokensSec1 := cache_entry.TokensSec1 + in_msg.TokensSec1;
+      if (cache_entry.TokensSec0 > (max_tokens() / 2)) { cache_entry.TokensSec0 := (max_tokens() / 2); }
+      if (cache_entry.TokensSec1 > (max_tokens() / 2)) { cache_entry.TokensSec1 := (max_tokens() / 2); }
+      DPRINTF(RubySlicc, "AMTC_TCC_FILL addr=%#x valid=%d tokmask=%d t0=%d t1=%d\n",
+              address, cache_entry.ValidSectors, in_msg.token_sector_mask,
+              cache_entry.TokensSec0, cache_entry.TokensSec1);
+    }
+  }
+
+
+  action(wcbo_writeCacheBlockFromOwnerResp, "wcbo",
+         desc="Write data to TCC from ownerResponseFromL1 queue") {
+    peek(ownerResponseFromL1_in, ResponseMsg) {
+      cache_entry.DataBlk := in_msg.DataBlk;
+      cache_entry.ValidSectors := amtc_normalizeMask(in_msg.valid_sector_mask, in_msg.sector_id);
+      cache_entry.TokensSec0 := cache_entry.TokensSec0 + in_msg.TokensSec0;
+      cache_entry.TokensSec1 := cache_entry.TokensSec1 + in_msg.TokensSec1;
+      if (cache_entry.TokensSec0 > (max_tokens() / 2)) { cache_entry.TokensSec0 := (max_tokens() / 2); }
+      if (cache_entry.TokensSec1 > (max_tokens() / 2)) { cache_entry.TokensSec1 := (max_tokens() / 2); }
+      DPRINTF(RubySlicc,
+              "AMTC_TCC_WCB_OWNER_RESP addr=%#x valid=%d tokmask=%d t0=%d t1=%d\n",
+              address, cache_entry.ValidSectors, in_msg.token_sector_mask,
+              cache_entry.TokensSec0, cache_entry.TokensSec1);
+    }
+  }
+
+  action(sdro_sendDataResponseFromOwnerResp, "sdro",
+         desc="Send repaired owner-response data to original SQC/TCP requester") {
+    enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+      out_msg.addr := address;
+      out_msg.Type := CoherenceResponseType:DATA_SHARED;
+      out_msg.Sender := machineID;
+      out_msg.MessageSize := MessageSizeType:Response_Data;
+      out_msg.Dirty := false;
+      peek(ownerResponseFromL1_in, ResponseMsg) {
+        if ((getAccessPermission(address) == AccessPermission:NotPresent) ||
+            (getAccessPermission(address) == AccessPermission:Invalid)) {
+          out_msg.DataBlk := in_msg.DataBlk;
+        } else {
+          out_msg.DataBlk := cache_entry.DataBlk;
+        }
+        out_msg.isGLCSet := in_msg.isGLCSet;
+        out_msg.isSLCSet := in_msg.isSLCSet;
+
+        // For TCC stale-owner repair, the Directory's Sender is not the
+        // original SQC/TCP requester. Use the TBE destination captured when
+        // the original core-side GETS/GETX allocated this miss.
+        out_msg.Destination.clear();
+        out_msg.Destination := tbe.Destination;
+
+        out_msg.sector_id := in_msg.sector_id;
+        out_msg.sector_mask := amtc_normalizeMask(in_msg.sector_mask, in_msg.sector_id);
+        out_msg.requested_sector_mask := amtc_normalizeMask(in_msg.requested_sector_mask, in_msg.sector_id);
+        out_msg.valid_sector_mask := amtc_normalizeMask(in_msg.valid_sector_mask, in_msg.sector_id);
+        out_msg.token_sector_mask := amtc_normalizeMask(in_msg.token_sector_mask, in_msg.sector_id);
+        out_msg.TokensSec0 := in_msg.TokensSec0;
+        out_msg.TokensSec1 := in_msg.TokensSec1;
+      }
+      DPRINTF(RubySlicc,
+              "AMTC_TCC_SEND_OWNER_REPAIR_DATA addr=%#x dest=%s valid=%d tokmask=%d\n",
+              address, out_msg.Destination, out_msg.valid_sector_mask,
+              out_msg.token_sector_mask);
     }
   }
 
@@ -676,6 +1114,7 @@ action(at_atomicThrough, "at", desc="forward atomic as GETX") {
 
   peek(coreRequestNetwork_in, RequestMsg) {
 
+    int req_mask := amtc_normalizeMask(in_msg.requested_sector_mask, in_msg.sector_id);
     enqueue(requestToNB_out, RequestMsg, l2_request_latency) {
 
       out_msg.addr := address;
@@ -691,7 +1130,10 @@ action(at_atomicThrough, "at", desc="forward atomic as GETX") {
 
       out_msg.isGLCSet := in_msg.isGLCSet;
       out_msg.isSLCSet := in_msg.isSLCSet;
-      out_msg.sector_id := in_msg.sector_id;
+      out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+      out_msg.sector_mask := req_mask;
+      out_msg.requested_sector_mask := req_mask;
+      out_msg.is_gpu := true;
     }
   }
 }
@@ -754,6 +1196,231 @@ action(pa_performAtomic, "pa", desc="Perform atomic (AMTC)") {
   }
 }
 
+action(wcb_writeCacheBlockFromTCP, "wcbtcp", desc="write data to TCC from TCP") {
+    peek(tcpWriteThrough_in, ResponseMsg) {
+      // Overlay the GPU's write-through payload directly into the L2
+      cache_entry.DataBlk.copyPartial(in_msg.DataBlk, 0, 64);
+      cache_entry.ValidSectors := amtc_normalizeMask(in_msg.valid_sector_mask, in_msg.sector_id);
+      cache_entry.Dirty := true;
+      DPRINTF(RubySlicc,
+              "AMTC_TCC_WB_SHARED_DATA_ABSORB addr=%#x valid=%d\n",
+              address, cache_entry.ValidSectors);
+    }
+  }
+
+
+  action(fwt_forwardWriteThroughToNB, "fwt", desc="Forward TCP WB_SHARED_DATA to NB/Directory for CPU-side invalidation") {
+    peek(tcpWriteThrough_in, ResponseMsg) {
+      int req_mask := in_msg.requested_sector_mask;
+      if (req_mask == 0) {
+        req_mask := in_msg.valid_sector_mask;
+      }
+      if (req_mask == 0) {
+        req_mask := in_msg.sector_mask;
+      }
+      if (req_mask == 0) {
+        req_mask := amtc_fullMask();
+      }
+      req_mask := amtc_sanitizeMask(req_mask);
+
+      enqueue(responseToNB_out, ResponseMsg, l2_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:WB_SHARED_DATA;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+        out_msg.DataBlk := in_msg.DataBlk;
+        out_msg.Dirty := true;
+        out_msg.MessageSize := amtc_getSizeFromDirtyMask(req_mask);
+
+        out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+        out_msg.sector_mask := req_mask;
+        out_msg.requested_sector_mask := req_mask;
+        out_msg.valid_sector_mask := req_mask;
+        out_msg.token_sector_mask := 0;
+        out_msg.TokensSec0 := 0;
+        out_msg.TokensSec1 := 0;
+        out_msg.isGLCSet := in_msg.isGLCSet;
+        out_msg.isSLCSet := in_msg.isSLCSet;
+      }
+
+      DPRINTF(RubySlicc,
+              "AMTC_TCC_WB_SHARED_FORWARD_TO_NB addr=%#x mask=%d dirty=1\n",
+              address, req_mask);
+    }
+  }
+
+  action(ptw_popTcpWriteThrough, "ptw", desc="pop tcp write through queue") {
+    tcpWriteThrough_in.dequeue(clockEdge());
+  }
+
+  action(rso_repairStaleOwnerGets, "rso",
+        desc="Repair stale-owner ACK by re-requesting GETS from Directory") {
+    peek(ownerResponseFromL1_in, ResponseMsg) {
+      int req_mask := amtc_normalizeMask(in_msg.requested_sector_mask,
+                                        in_msg.sector_id);
+
+      if (req_mask == 0) {
+        req_mask := amtc_normalizeMask(in_msg.sector_mask, in_msg.sector_id);
+      }
+
+      if (req_mask == 0) {
+        req_mask := amtc_fullMask();
+      }
+
+      enqueue(requestToNB_out, RequestMsg, l2_request_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:GETS;
+
+        // Keep TCC as requester. The pending SQC fetch is tracked in TCC.
+        out_msg.Requestor := machineID;
+        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+
+        out_msg.MessageSize := MessageSizeType:Request_Control;
+        out_msg.AccessMode := RubyAccessMode:User;
+        out_msg.Prefetch := PrefetchBit:No;
+
+        out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+        out_msg.sector_mask := req_mask;
+        out_msg.requested_sector_mask := req_mask;
+
+        out_msg.is_gpu := true;
+        out_msg.is_sync := false;
+        out_msg.is_bypass := false;
+        out_msg.is_atomic := false;
+        out_msg.is_signal := false;
+
+        // Mark as stale-owner repair.
+        out_msg.is_owner_pull := true;
+        out_msg.RetryNum := 1;
+
+        out_msg.isGLCSet := in_msg.isGLCSet;
+        out_msg.isSLCSet := in_msg.isSLCSet;
+      }
+
+      DPRINTF(RubySlicc,
+              "AMTC_TCC_STALE_OWNER_REPAIR_GETS addr=%#x sender=%s mask=%d retry=1\n",
+              address,
+              in_msg.Sender,
+              req_mask);
+    }
+  }
+
+  action(pro_popOwnerResponseFromL1Queue, "pro",
+        desc="Pop owner response from L1 queue") {
+    ownerResponseFromL1_in.dequeue(clockEdge());
+  }
+
+
+  action(ypro_yieldTokensToCPUFromProbe, "ypro",
+         desc="Yield requested sector tokens/data from TCC to CPU/Directory probe requester") {
+    peek(probeFromNB_in, RequestMsg) {
+      int req_mask := amtc_normalizeMask(in_msg.requested_sector_mask,
+                                         in_msg.sector_id);
+      if (req_mask == 0) {
+        req_mask := amtc_normalizeMask(in_msg.sector_mask, in_msg.sector_id);
+      }
+      if (req_mask == 0) {
+        req_mask := amtc_fullMask();
+      }
+
+      int send_t0 := 0;
+      int send_t1 := 0;
+
+      if (is_valid(cache_entry)) {
+        if (amtc_maskHasSector(req_mask, 0)) { send_t0 := cache_entry.TokensSec0; }
+        if (amtc_maskHasSector(req_mask, 1)) { send_t1 := cache_entry.TokensSec1; }
+      }
+
+      if (send_t0 > 0 || send_t1 > 0) {
+        enqueue(responseToNB_out, ResponseMsg, l2_response_latency) {
+          out_msg.addr := address;
+          out_msg.Sender := machineID;
+          out_msg.Destination.add(in_msg.Requestor);
+          out_msg.DataBlk := cache_entry.DataBlk;
+          out_msg.Dirty := cache_entry.Dirty;
+          out_msg.MessageSize := MessageSizeType:Response_Data;
+
+          out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+          out_msg.sector_mask := req_mask;
+          out_msg.requested_sector_mask := req_mask;
+          out_msg.valid_sector_mask := req_mask;
+          out_msg.token_sector_mask := amtc_sanitizeMask(req_mask);
+          out_msg.TokensSec0 := send_t0;
+          out_msg.TokensSec1 := send_t1;
+          out_msg.isGLCSet := in_msg.isGLCSet;
+          out_msg.isSLCSet := in_msg.isSLCSet;
+
+          if ((amtc_maskHasSector(req_mask, 0) && send_t0 == (max_tokens() / 2)) ||
+              (amtc_maskHasSector(req_mask, 1) && send_t1 == (max_tokens() / 2))) {
+            out_msg.Type := CoherenceResponseType:DATA_OWNER;
+          } else {
+            out_msg.Type := CoherenceResponseType:DATA_SHARED;
+          }
+        }
+
+        DPRINTF(RubySlicc,
+                "AMTC_TCC_PROBE_YIELD_DATA addr=%#x req=%s mask=%d t0=%d t1=%d\n",
+                address, in_msg.Requestor, req_mask, send_t0, send_t1);
+
+        if (amtc_maskHasSector(req_mask, 0)) { cache_entry.TokensSec0 := 0; }
+        if (amtc_maskHasSector(req_mask, 1)) { cache_entry.TokensSec1 := 0; }
+
+        cache_entry.ValidSectors := amtc_subtractMask(cache_entry.ValidSectors, req_mask);
+        if (cache_entry.ValidSectors == 0) {
+          L2cache.deallocate(address);
+          unset_cache_entry();
+        }
+      } else {
+        enqueue(responseToNB_out, ResponseMsg, l2_response_latency) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceResponseType:ACK_OWNER;
+          out_msg.Sender := machineID;
+          out_msg.Destination.add(in_msg.Requestor);
+          out_msg.MessageSize := MessageSizeType:Response_Control;
+          out_msg.Dirty := false;
+
+          out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+          out_msg.sector_mask := req_mask;
+          out_msg.requested_sector_mask := req_mask;
+          out_msg.valid_sector_mask := 0;
+          out_msg.token_sector_mask := 0;
+          out_msg.TokensSec0 := 0;
+          out_msg.TokensSec1 := 0;
+          out_msg.isGLCSet := in_msg.isGLCSet;
+          out_msg.isSLCSet := in_msg.isSLCSet;
+        }
+
+        DPRINTF(RubySlicc,
+                "AMTC_TCC_PROBE_STALE_ACK addr=%#x req=%s mask=%d state=%s\n",
+                address, in_msg.Requestor, req_mask,
+                getState(tbe, cache_entry, address));
+      }
+    }
+  }
+
+  action(invpro_invalidateProbeSectors, "invpro",
+         desc="Invalidate requested TCC sectors after CPU GETX probe") {
+    peek(probeFromNB_in, RequestMsg) {
+      int req_mask := amtc_normalizeMask(in_msg.requested_sector_mask,
+                                         in_msg.sector_id);
+      if (req_mask == 0) { req_mask := amtc_fullMask(); }
+
+      if (is_valid(cache_entry)) {
+        cache_entry.ValidSectors := amtc_subtractMask(cache_entry.ValidSectors, req_mask);
+        if (cache_entry.ValidSectors == 0) {
+          L2cache.deallocate(address);
+          unset_cache_entry();
+        }
+      }
+    }
+  }
+
+  action(ppro_popProbeFromNBQueue, "ppro",
+         desc="Pop incoming probeFromNB queue") {
+    probeFromNB_in.dequeue(clockEdge());
+  }
+
+
   // END ACTIONS
 
   // BEGIN TRANSITIONS
@@ -771,7 +1438,9 @@ action(pa_performAtomic, "pa", desc="Perform atomic (AMTC)") {
 
 transition({M, V}, GETS) {TagArrayRead, DataArrayRead} {
   ut_updateTag;
-  sdr_sendDataResponse;
+  // Local TCC hit is driven by coreRequestNetwork_in, not responseFromNB_in.
+  // Using sdr_sendDataResponse here can peek an empty NB response buffer.
+  sd_sendData;
   p_popRequestQueue;
 }
 
@@ -779,6 +1448,16 @@ transition(I, GETS) {TagArrayRead} {
   t_allocateTBE;
   rd_requestData;     // send GETS to directory
   p_popRequestQueue;
+}
+
+transition(I, StaleOwnerAck) {
+  rso_repairStaleOwnerGets;
+  pro_popOwnerResponseFromL1Queue;
+}
+
+transition({V, M}, StaleOwnerAck) {
+  rso_repairStaleOwnerGets;
+  pro_popOwnerResponseFromL1Queue;
 }
 
 transition({A}, GETS) {
@@ -791,7 +1470,9 @@ transition({A}, GETS) {
 transition({M}, GETX) {TagArrayRead, DataArrayWrite} {
   ut_updateTag;
   pa_performAtomic;
-  sdr_sendDataResponse;
+  // Local GETX/atomic hit is driven by coreRequestNetwork_in, not responseFromNB_in.
+  // Use the local response action so the requester comes from the active request.
+  sd_sendData;
   p_popRequestQueue;
 }
 
@@ -807,48 +1488,129 @@ transition(I, GETX) {TagArrayRead} {
   p_popRequestQueue;
 }
 
-transition(A, GETX) {
-  st_stallAndWaitRequest;
-}
-// -------------------------
-// DATA response handling
-// -------------------------
+  transition(A, GETX) {
+    st_stallAndWaitRequest;
+  }
+  // -------------------------
+  // Owner-response DATA handling
+  // -------------------------
 
-transition({I}, Data, V) {TagArrayWrite, DataArrayWrite} {
-  a_allocateBlock;
-  wcb_writeCacheBlock;
-  sdr_sendDataResponse;
-  wada_wakeUpAllDependentsAddr;
-  dt_deallocateTBE;
-  pr_popResponseQueue;
-}
+  transition({I}, OwnerRespData, V) {TagArrayWrite, DataArrayWrite} {
+    //a_allocateBlock;
+    //wcbo_writeCacheBlockFromOwnerResp;
+    sdro_sendDataResponseFromOwnerResp;
+    wada_wakeUpAllDependentsAddr;
+    dt_deallocateTBE;
+    pro_popOwnerResponseFromL1Queue;
+  }
 
-transition({V}, Data) {TagArrayWrite, DataArrayWrite} {
-  ut_updateTag;
-  wcb_writeCacheBlock;
-  sdr_sendDataResponse;
-  wada_wakeUpAllDependentsAddr;
-  dt_deallocateTBE;
-  pr_popResponseQueue;
-}
+  transition({V}, OwnerRespData) {TagArrayWrite, DataArrayWrite} {
+    ut_updateTag;
+    wcbo_writeCacheBlockFromOwnerResp;
+    sdro_sendDataResponseFromOwnerResp;
+    wada_wakeUpAllDependentsAddr;
+    dt_deallocateTBE;
+    pro_popOwnerResponseFromL1Queue;
+  }
 
-transition({A}, Data, M) {TagArrayWrite, DataArrayWrite} {
-  a_allocateBlock;
-  wcb_writeCacheBlock;
-  pa_performAtomic;
-  sdr_sendDataResponse;
-  wada_wakeUpAllDependentsAddr;
-  dt_deallocateTBE;
-  pr_popResponseQueue;
-}
+  // -------------------------
+  // DATA response handling
+  // -------------------------
 
-transition({M, V}, L2_Repl, I) {TagArrayRead} {
-  i_invL2;
-}
+  transition({I}, Data, V) {TagArrayWrite, DataArrayWrite} {
+    a_allocateBlock;
+    wcb_writeCacheBlock;
+    sdr_sendDataResponse;
+    wada_wakeUpAllDependentsAddr;
+    dt_deallocateTBE;
+    pr_popResponseQueue;
+  }
 
-transition(I, L2_Repl) {
-  // no-op
-}
+  transition({V}, Data) {TagArrayWrite, DataArrayWrite} {
+    ut_updateTag;
+    wcb_writeCacheBlock;
+    sdr_sendDataResponse;
+    wada_wakeUpAllDependentsAddr;
+    dt_deallocateTBE;
+    pr_popResponseQueue;
+  }
 
+  transition({A}, Data, M) {TagArrayWrite, DataArrayWrite} {
+    a_allocateBlock;
+    wcb_writeCacheBlock;
+    pa_performAtomic;
+    sdr_sendDataResponse;
+    wada_wakeUpAllDependentsAddr;
+    dt_deallocateTBE;
+    pr_popResponseQueue;
+  }
+
+  transition({M, V}, L2_Repl, I) {TagArrayRead} {
+    i_invL2;
+  }
+
+  transition(I, L2_Repl) {
+    // no-op
+  }
+
+  transition(I, TCP_WriteThrough, M) {TagArrayWrite, DataArrayWrite} {
+    a_allocateBlock;
+    wcb_writeCacheBlockFromTCP;
+    fwt_forwardWriteThroughToNB;
+    ptw_popTcpWriteThrough;
+  }
+
+  transition({V, M}, TCP_WriteThrough, M) {TagArrayWrite, DataArrayWrite} {
+    ut_updateTag;
+    wcb_writeCacheBlockFromTCP;
+    fwt_forwardWriteThroughToNB;
+    ptw_popTcpWriteThrough;
+  }
+
+
+  // -------------------------
+  // InvCache from TCP for GPU kernel-launch L2 invalidate
+  // -------------------------
+
+  transition(I, InvCache) {
+    ir_invL2Resp;
+    p_popRequestQueue;
+  }
+
+  transition({V, M, W}, InvCache, I) {TagArrayRead, TagArrayWrite} {
+    i_invL2;
+    ir_invL2Resp;
+    p_popRequestQueue;
+  }
+
+  transition({IV, WI, WIB, A}, InvCache) {
+    st_stallAndWaitRequest;
+  }
+
+  // -------------------------
+  // CPU/Directory probes to TCC from probeFromNB
+  // -------------------------
+
+  transition({V, M}, CPU_GETS) {TagArrayRead, DataArrayRead} {
+    ypro_yieldTokensToCPUFromProbe;
+    ppro_popProbeFromNBQueue;
+  }
+
+  transition({V, M}, CPU_GETX, I) {TagArrayRead, TagArrayWrite, DataArrayRead, DataArrayWrite} {
+    ypro_yieldTokensToCPUFromProbe;
+    invpro_invalidateProbeSectors;
+    ppro_popProbeFromNBQueue;
+  }
+
+  transition(I, {CPU_GETS, CPU_GETX}) {
+    ypro_yieldTokensToCPUFromProbe;
+    ppro_popProbeFromNBQueue;
+  }
+
+  // Forward L1 Bypass requests to the Directory (TCC -> Dir)
+  transition({I, V, M}, Bypass) {
+    rd_requestData;
+    p_popRequestQueue;
+  }
 
 }

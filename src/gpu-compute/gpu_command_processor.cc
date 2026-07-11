@@ -126,6 +126,9 @@ GPUCommandProcessor::performTimingRead(PacketPtr pkt, int dispType)
 void
 GPUCommandProcessor::completeTimingRead(int dispType)
 {
+    warn("AMTC_GCP_COMPLETE_TIMING_READ_ENTER tick=%llu dispType=%d "
+         "pending_before=%zu\n",
+         (unsigned long long)curTick(), dispType, kernelDispatchList.size());
     struct KernelDispatchData dispatchData = kernelDispatchList.front();
     kernelDispatchList.pop_front();
     delete dispatchData.readPkt;
@@ -133,6 +136,8 @@ GPUCommandProcessor::completeTimingRead(int dispType)
     // Only one of the following can happen at any time from one CP. Figure
     // out what performed the timing read and call to appropriate function.
     if (kernelDispatchList.size() == 0) {
+        warn("AMTC_GCP_COMPLETE_TIMING_READ_READY tick=%llu dispType=%d\n",
+             (unsigned long long)curTick(), dispType);
         switch (dispType) {
           case ComputeUnit::SQCPort::SenderState::DISPATCH_KERNEL_OBJECT:
             dispatchKernelObject(dispatchData.akc, dispatchData.raw_pkt,
@@ -167,6 +172,19 @@ GPUCommandProcessor::submitDispatchPkt(void *raw_pkt, uint32_t queue_id,
                                        Addr host_pkt_addr)
 {
     _hsa_dispatch_packet_t *disp_pkt = (_hsa_dispatch_packet_t*)raw_pkt;
+
+    warn("AMTC_GCP_SUBMIT_ENTER tick=%llu queue_id=%u host_pkt_addr=%#llx "
+         "raw_pkt=%p kernel_object=%#llx kernarg=%#llx completion=%#llx "
+         "grid=(%u,%u,%u) wg=(%u,%u,%u) outstanding_inv_l2=%d\n",
+         (unsigned long long)curTick(), queue_id,
+         (unsigned long long)host_pkt_addr, raw_pkt,
+         (unsigned long long)disp_pkt->kernel_object,
+         (unsigned long long)disp_pkt->kernarg_address,
+         (unsigned long long)disp_pkt->completion_signal,
+         disp_pkt->grid_size_x, disp_pkt->grid_size_y, disp_pkt->grid_size_z,
+         disp_pkt->workgroup_size_x, disp_pkt->workgroup_size_y,
+         disp_pkt->workgroup_size_z, shader()->getNumOutstandingInvL2s());
+
     // The kernel object should be aligned to a 64B boundary, but not
     // necessarily a cache line boundary.
     unsigned akc_alignment_granularity = 64;
@@ -182,6 +200,9 @@ GPUCommandProcessor::submitDispatchPkt(void *raw_pkt, uint32_t queue_id,
     if (shader()->getNumOutstandingInvL2s() > 0) {
         DPRINTF(GPUCommandProc,
                 "Deferring kernel launch due to outstanding L2 invalidates\n");
+        warn("AMTC_GCP_SUBMIT_DEFER tick=%llu queue_id=%u outstanding_inv_l2=%d\n",
+             (unsigned long long)curTick(), queue_id,
+             shader()->getNumOutstandingInvL2s());
         shader()->addDeferredDispatch(raw_pkt, queue_id, host_pkt_addr);
 
         return;
@@ -219,6 +240,9 @@ GPUCommandProcessor::submitDispatchPkt(void *raw_pkt, uint32_t queue_id,
         virt_proxy.readBlob(disp_pkt->kernel_object, (uint8_t*)akc,
             sizeof(AMDKernelCode));
 
+        warn("AMTC_GCP_SUBMIT_KERNEL_OBJECT_READY tick=%llu queue_id=%u "
+             "mode=se_proxy\n",
+             (unsigned long long)curTick(), queue_id);
         dispatchKernelObject(akc, raw_pkt, queue_id, host_pkt_addr);
     } else {
         /**
@@ -256,9 +280,17 @@ GPUCommandProcessor::submitDispatchPkt(void *raw_pkt, uint32_t queue_id,
 
             auto dma_callback = new DmaVirtCallback<uint32_t>(
               [=](const uint32_t&) {
+                warn("AMTC_GCP_SUBMIT_KERNEL_OBJECT_DMA_CB tick=%llu "
+                     "queue_id=%u mode=system_page\n",
+                     (unsigned long long)curTick(), queue_id);
                 dispatchKernelObject(akc, raw_pkt, queue_id, host_pkt_addr);
               });
 
+            warn("AMTC_GCP_SUBMIT_KERNEL_OBJECT_DMA_READ tick=%llu "
+                 "queue_id=%u addr=%#llx size=%zu mode=system_page\n",
+                 (unsigned long long)curTick(), queue_id,
+                 (unsigned long long)disp_pkt->kernel_object,
+                 sizeof(AMDKernelCode));
             dmaReadVirt(disp_pkt->kernel_object, sizeof(AMDKernelCode),
                     dma_callback, (void *)akc);
         } else {
@@ -293,6 +325,12 @@ GPUCommandProcessor::submitDispatchPkt(void *raw_pkt, uint32_t queue_id,
                 dispatchData.host_pkt_addr = host_pkt_addr;
                 dispatchData.readPkt = readPkt;
                 kernelDispatchList.push_back(dispatchData);
+                warn("AMTC_GCP_SUBMIT_KERNEL_OBJECT_TIMING_READ tick=%llu "
+                     "queue_id=%u chunk=%#llx complete=%llu pending_reads=%zu\n",
+                     (unsigned long long)curTick(), queue_id,
+                     (unsigned long long)chunk_addr,
+                     (unsigned long long)gen.complete(),
+                     kernelDispatchList.size());
                 performTimingRead(readPkt,
                     ComputeUnit::SQCPort::SenderState::DISPATCH_KERNEL_OBJECT);
             }
@@ -305,6 +343,13 @@ GPUCommandProcessor::dispatchKernelObject(AMDKernelCode *akc, void *raw_pkt,
                                         uint32_t queue_id, Addr host_pkt_addr)
 {
     _hsa_dispatch_packet_t *disp_pkt = (_hsa_dispatch_packet_t*)raw_pkt;
+
+    warn("AMTC_GCP_DISPATCH_KERNEL_OBJECT_ENTER tick=%llu queue_id=%u "
+         "raw_pkt=%p kernel_object=%#llx kernarg=%#llx completion=%#llx\n",
+         (unsigned long long)curTick(), queue_id, raw_pkt,
+         (unsigned long long)disp_pkt->kernel_object,
+         (unsigned long long)disp_pkt->kernarg_address,
+         (unsigned long long)disp_pkt->completion_signal);
 
     /**
      * If the kernarg_preload_spec_length is non-zero, the CP firmware will
@@ -355,6 +400,12 @@ GPUCommandProcessor::dispatchKernelObject(AMDKernelCode *akc, void *raw_pkt,
         dynamic_task_id, raw_pkt, akc, host_pkt_addr, machine_code_addr,
         gfxVersion);
 
+    warn("AMTC_GCP_TASK_CREATED tick=%llu queue_id=%u task_id=%d "
+         "is_blit=%d code_addr=%#llx completion=%#llx\n",
+         (unsigned long long)curTick(), queue_id, dynamic_task_id,
+         is_blit_kernel, (unsigned long long)machine_code_addr,
+         (unsigned long long)disp_pkt->completion_signal);
+
     // The driver expects the start time to be in ns
     Tick start_ts = curTick() / sim_clock::as_int::ns;
     dispatchStartTime.insert({disp_pkt->completion_signal, start_ts});
@@ -363,6 +414,10 @@ GPUCommandProcessor::dispatchKernelObject(AMDKernelCode *akc, void *raw_pkt,
     if (!is_blit_kernel && (non_blit_kernel_id < target_non_blit_kernel_id)) {
         DPRINTF(GPUCommandProc, "Skipping non-blit kernel %i (Task ID: %i)\n",
                 non_blit_kernel_id, dynamic_task_id);
+        warn("AMTC_GCP_TASK_SKIP tick=%llu queue_id=%u task_id=%d "
+             "non_blit_kernel_id=%d target=%d\n",
+             (unsigned long long)curTick(), queue_id, dynamic_task_id,
+             non_blit_kernel_id, target_non_blit_kernel_id);
 
         // Notify the HSA PP that this kernel is complete
         hsaPacketProc().finishPkt(task->dispPktPtr(), task->queueId());
@@ -401,10 +456,16 @@ GPUCommandProcessor::dispatchKernelObject(AMDKernelCode *akc, void *raw_pkt,
         task->numScalarRegs(), task->codeAddr(), 0, 0);
 
     if (akc->kernarg_preload_spec_length == 0) {
+        warn("AMTC_GCP_INIT_ABI_DIRECT tick=%llu queue_id=%u task_id=%d\n",
+             (unsigned long long)curTick(), queue_id, dynamic_task_id);
         initABI(task);
 
         delete akc;
     } else {
+        warn("AMTC_GCP_INIT_ABI_PRELOAD tick=%llu queue_id=%u task_id=%d "
+             "preload_len=%d\n",
+             (unsigned long long)curTick(), queue_id, dynamic_task_id,
+             akc->kernarg_preload_spec_length);
         readPreload(akc, task);
     }
 
@@ -712,7 +773,13 @@ GPUCommandProcessor::submitAgentDispatchPkt(void *raw_pkt, uint32_t queue_id,
 void
 GPUCommandProcessor::dispatchPkt(HSAQueueEntry *task)
 {
+    warn("AMTC_GCP_DISPATCH_PKT_ENTER tick=%llu queue_id=%u "
+         "task=%p completion=%#llx\n",
+         (unsigned long long)curTick(), task->queueId(), task,
+         (unsigned long long)task->completionSignal());
     dispatcher.dispatch(task);
+    warn("AMTC_GCP_DISPATCH_PKT_EXIT tick=%llu queue_id=%u task=%p\n",
+         (unsigned long long)curTick(), task->queueId(), task);
 }
 
 void
@@ -841,13 +908,25 @@ GPUCommandProcessor::initPreload(AMDKernelCode *akc, HSAQueueEntry *task)
 void
 GPUCommandProcessor::initABI(HSAQueueEntry *task)
 {
+    warn("AMTC_GCP_INIT_ABI_ENTER tick=%llu queue_id=%u task=%p\n",
+         (unsigned long long)curTick(), task->queueId(), task);
     auto cb = new DmaVirtCallback<uint32_t>(
         [ = ] (const uint32_t &readDispIdOffset)
-            { ReadDispIdOffsetDmaEvent(task, readDispIdOffset); }, 0);
+            {
+                warn("AMTC_GCP_INIT_ABI_READ_DISP_CB tick=%llu queue_id=%u "
+                     "task=%p readDispIdOffset=%u\n",
+                     (unsigned long long)curTick(), task->queueId(),
+                     task, readDispIdOffset);
+                ReadDispIdOffsetDmaEvent(task, readDispIdOffset);
+            }, 0);
 
     Addr hostReadIdxPtr
         = hsaPP->getQueueDesc(task->queueId())->hostReadIndexPtr;
 
+    warn("AMTC_GCP_INIT_ABI_READ_DISP_DMA tick=%llu queue_id=%u "
+         "task=%p addr=%#llx\n",
+         (unsigned long long)curTick(), task->queueId(), task,
+         (unsigned long long)(hostReadIdxPtr + sizeof(hostReadIdxPtr)));
     dmaReadVirt(hostReadIdxPtr + sizeof(hostReadIdxPtr),
         sizeof(uint32_t), cb, &cb->dmaBuffer);
 }

@@ -55,7 +55,7 @@ machine(MachineType:DMA, "DMA Controller")
   structure(TBE, desc="...") {
     State TBEState,    desc="Transient state";
     DataBlock DataBlk, desc="Data";
-    int RequestedSectorMask, default="15", desc="AMTC requested sector mask for this DMA transaction";
+    int RequestedSectorMask, default="3", desc="AMTC requested sector mask for this DMA transaction";
     int ReceivedSectorMask, default="0", desc="AMTC received sector mask for this DMA transaction";
     int TokenReadySectorMask, default="0", desc="AMTC token-ready sector mask for this DMA transaction";
     int LastSectorID, default="0", desc="AMTC primary sector id for this DMA transaction";
@@ -79,33 +79,26 @@ machine(MachineType:DMA, "DMA Controller")
 
   // -------------------------------------------------------------------------
   // AMTC arithmetic-only mask helpers.
-  // Ruby/SLICC protocol code should avoid C-style bitwise operators here.
-  // The helpers model 4 x 16B sectors inside the current 64B Ruby line.
+  // The current AMTC data path uses 2 x 32B sectors inside a 64B Ruby line:
+  //   sector 0 -> mask 1, sector 1 -> mask 2, full line -> mask 3.
+  // Keep DMA full-line by default, but never emit the old 4-sector mask 15.
   // -------------------------------------------------------------------------
   int amtc_maskFromSector(int sid) {
     if (sid == 0) {
       return 1;
-    } else if (sid == 1) {
-      return 2;
-    } else if (sid == 2) {
-      return 4;
     }
-    return 8;
+    return 2;
   }
 
   int amtc_fullMask() {
-    return 15;
+    return 3;
   }
 
   bool amtc_maskHasSector(int mask, int sid) {
     if (sid == 0) {
       return ((mask % 2) == 1);
-    } else if (sid == 1) {
-      return (((mask / 2) % 2) == 1);
-    } else if (sid == 2) {
-      return (((mask / 4) % 2) == 1);
     }
-    return (((mask / 8) % 2) == 1);
+    return (((mask / 2) % 2) == 1);
   }
 
   int amtc_addSectorToMask(int mask, int sid) {
@@ -123,12 +116,6 @@ machine(MachineType:DMA, "DMA Controller")
     if (amtc_maskHasSector(a, 1) && amtc_maskHasSector(b, 1)) {
       result := result + 2;
     }
-    if (amtc_maskHasSector(a, 2) && amtc_maskHasSector(b, 2)) {
-      result := result + 4;
-    }
-    if (amtc_maskHasSector(a, 3) && amtc_maskHasSector(b, 3)) {
-      result := result + 8;
-    }
     return result;
   }
 
@@ -140,12 +127,6 @@ machine(MachineType:DMA, "DMA Controller")
     if (amtc_maskHasSector(b, 1)) {
       result := amtc_addSectorToMask(result, 1);
     }
-    if (amtc_maskHasSector(b, 2)) {
-      result := amtc_addSectorToMask(result, 2);
-    }
-    if (amtc_maskHasSector(b, 3)) {
-      result := amtc_addSectorToMask(result, 3);
-    }
     return result;
   }
 
@@ -156,29 +137,26 @@ machine(MachineType:DMA, "DMA Controller")
     if (amtc_maskHasSector(need_mask, 1) && !amtc_maskHasSector(have_mask, 1)) {
       return false;
     }
-    if (amtc_maskHasSector(need_mask, 2) && !amtc_maskHasSector(have_mask, 2)) {
-      return false;
-    }
-    if (amtc_maskHasSector(need_mask, 3) && !amtc_maskHasSector(have_mask, 3)) {
-      return false;
-    }
     return true;
   }
 
   int amtc_primarySectorFromMask(int mask) {
     if (amtc_maskHasSector(mask, 0)) {
       return 0;
-    } else if (amtc_maskHasSector(mask, 1)) {
-      return 1;
-    } else if (amtc_maskHasSector(mask, 2)) {
-      return 2;
     }
-    return 3;
+    return 1;
   }
 
   int amtc_normalizeMask(int mask, int sid) {
-    if (mask != 0) {
-      return mask;
+    int result := 0;
+    if (amtc_maskHasSector(mask, 0)) {
+      result := result + 1;
+    }
+    if (amtc_maskHasSector(mask, 1)) {
+      result := result + 2;
+    }
+    if (result != 0) {
+      return result;
     }
     return amtc_maskFromSector(sid);
   }
@@ -231,6 +209,11 @@ machine(MachineType:DMA, "DMA Controller")
   in_port(dmaResponseQueue_in, DMAResponseMsg, responseFromDir, desc="...") {
     if (dmaResponseQueue_in.isReady(clockEdge())) {
       peek( dmaResponseQueue_in, DMAResponseMsg) {
+        DPRINTF(RubySlicc,
+                "AMTC_DMA_RESP_IN addr=%#x mask=%d valid=%d token=%d\n",
+                in_msg.LineAddress, in_msg.sector_mask,
+                in_msg.valid_sector_mask, in_msg.token_sector_mask);
+
         if (in_msg.Type == DMAResponseType:ACK) {
           trigger(Event:Ack, in_msg.LineAddress, TBEs[in_msg.LineAddress]);
         } else if (in_msg.Type == DMAResponseType:DATA) {
@@ -261,7 +244,7 @@ machine(MachineType:DMA, "DMA Controller")
         out_msg.is_bypass := false;
         out_msg.is_atomic := false;
         out_msg.is_signal := false;
-        DPRINTF(RubySlicc, "AMTC_DMA_READ_MASK_DEFAULT addr=%#x mask=%d\n", address, out_msg.sector_mask);
+        DPRINTF(RubySlicc, "AMTC_DMA_READ_REQ addr=%#x mask=%d sid=%d len=%d\n", address, out_msg.sector_mask, out_msg.sector_id, out_msg.Len);
       }
     }
   }
@@ -285,16 +268,23 @@ machine(MachineType:DMA, "DMA Controller")
           out_msg.is_bypass := false;
           out_msg.is_atomic := false;
           out_msg.is_signal := false;
-          DPRINTF(RubySlicc, "AMTC_DMA_WRITE_MASK_DEFAULT addr=%#x mask=%d\n", address, out_msg.sector_mask);
+          DPRINTF(RubySlicc, "AMTC_DMA_WRITE_REQ addr=%#x mask=%d sid=%d len=%d\n", address, out_msg.sector_mask, out_msg.sector_id, out_msg.Len);
         }
       }
   }
 
   action(a_ackCallback, "a", desc="Notify dma controller that write request completed") {
+    DPRINTF(RubySlicc,
+            "AMTC_DMA_ACK_CALLBACK addr=%#x reqmask=%d recvmask=%d\n",
+            address, tbe.RequestedSectorMask, tbe.ReceivedSectorMask);
     dma_sequencer.ackCallback(address);
   }
 
   action(d_dataCallback, "d", desc="Write data to dma sequencer") {
+    DPRINTF(RubySlicc,
+            "AMTC_DMA_DATA_CALLBACK addr=%#x reqmask=%d recvmask=%d tokenmask=%d\n",
+            address, tbe.RequestedSectorMask, tbe.ReceivedSectorMask,
+            tbe.TokenReadySectorMask);
     dma_sequencer.dataCallback(tbe.DataBlk, address);
   }
 
@@ -302,15 +292,37 @@ machine(MachineType:DMA, "DMA Controller")
     assert(is_valid(tbe));
     peek(dmaResponseQueue_in, DMAResponseMsg) {
         tbe.DataBlk := in_msg.DataBlk;
+        tbe.ReceivedSectorMask := amtc_normalizeMask(in_msg.valid_sector_mask,
+                                                     in_msg.sector_id);
+        tbe.TokenReadySectorMask := amtc_normalizeMask(in_msg.token_sector_mask,
+                                                       in_msg.sector_id);
+        tbe.LastSectorID := in_msg.sector_id;
+        DPRINTF(RubySlicc,
+                "AMTC_DMA_UPDATE_TBE_DATA addr=%#x mask=%d valid=%d token=%d recvmask=%d\n",
+                address, in_msg.sector_mask, in_msg.valid_sector_mask,
+                in_msg.token_sector_mask, tbe.ReceivedSectorMask);
     }
   }
 
   action(v_allocateTBE, "v", desc="Allocate TBE entry") {
     TBEs.allocate(address);
     set_tbe(TBEs[address]);
+    tbe.RequestedSectorMask := amtc_fullMask();
+    tbe.ReceivedSectorMask := 0;
+    tbe.TokenReadySectorMask := 0;
+    tbe.LastSectorID := 0;
+    DPRINTF(RubySlicc,
+            "AMTC_DMA_TBE_ALLOC addr=%#x reqmask=%d sid=%d\n",
+            address, tbe.RequestedSectorMask, tbe.LastSectorID);
   }
 
   action(w_deallocateTBE, "w", desc="Deallocate TBE entry") {
+    DPRINTF(RubySlicc,
+            "AMTC_DMA_TBE_FREE addr=%#x state=%s reqmask=%d recvmask=%d\n",
+            address,
+            getState(tbe, address),
+            tbe.RequestedSectorMask,
+            tbe.ReceivedSectorMask);
     TBEs.deallocate(address);
     unset_tbe();
   }
@@ -324,6 +336,14 @@ machine(MachineType:DMA, "DMA Controller")
   }
 
   action(zz_stallAndWaitRequestQueue, "zz", desc="...") {
+    peek(dmaRequestQueue_in, SequencerMsg) {
+      DPRINTF(RubySlicc,
+              "AMTC_DMA_REQ_STALL addr=%#x type=%s state=%s tbe_valid=%d\n",
+              in_msg.LineAddress,
+              in_msg.Type,
+              getState(tbe, address),
+              is_valid(tbe));
+    }
     stall_and_wait(dmaRequestQueue_in, address);
   }
 

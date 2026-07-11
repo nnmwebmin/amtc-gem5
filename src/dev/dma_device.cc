@@ -44,6 +44,7 @@
 #include <cassert>
 #include <cstring>
 #include <optional>
+#include <string>
 #include <utility>
 
 #include "base/logging.hh"
@@ -55,6 +56,26 @@
 
 namespace gem5
 {
+
+namespace
+{
+
+constexpr Addr AmtcDmaTraceBase = 0x11b4000;
+constexpr Addr AmtcDmaTraceMask = ~Addr(0x3ff);
+
+static inline bool
+amtcTraceDmaAddr(Addr addr)
+{
+    return (addr & AmtcDmaTraceMask) == AmtcDmaTraceBase;
+}
+
+static inline bool
+amtcTraceDmaPort(const std::string &port_name)
+{
+    return port_name.find("hsapp.dma") != std::string::npos;
+}
+
+} // anonymous namespace
 
 DmaPort::DmaPort(ClockedObject *dev, System *s,
                  std::optional<uint32_t> sid, std::optional<uint32_t> ssid)
@@ -91,6 +112,17 @@ DmaPort::handleResp(DmaReqState *state, Addr addr, Addr size, Tick delay)
             state->numBytes, state->totBytes,
             state->completionEvent ?
             state->completionEvent->scheduled() : 0);
+
+    if (amtcTraceDmaAddr(addr) || amtcTraceDmaPort(name())) {
+        warn("AMTC_DMADEV_RESP_HANDLE tick=%llu port=%s cmd=%s addr=%#lx "
+             "size=%lu pending_after_dec=%u numBytes_before=%lu totBytes=%lu "
+             "completion_scheduled=%d\n",
+             (unsigned long long)curTick(), name().c_str(),
+             MemCmd(state->cmd).toString().c_str(), (unsigned long)addr,
+             (unsigned long)size, pendingCount,
+             (unsigned long)state->numBytes, (unsigned long)state->totBytes,
+             state->completionEvent ? state->completionEvent->scheduled() : 0);
+    }
 
     // Update the number of bytes received based on the request rather
     // than the packet as the latter could be rounded up to line sizes.
@@ -150,6 +182,14 @@ DmaPort::DmaReqState::createPacket()
 bool
 DmaPort::recvTimingResp(PacketPtr pkt)
 {
+    if (amtcTraceDmaAddr(pkt->getAddr()) || amtcTraceDmaPort(name())) {
+        warn("AMTC_DMADEV_RECV_TIMING_RESP tick=%llu port=%s pkt=%p cmd=%s "
+             "addr=%#lx size=%u is_resp=%d error=%d pending=%u\n",
+             (unsigned long long)curTick(), name().c_str(), pkt,
+             pkt->cmdString().c_str(), (unsigned long)pkt->getAddr(),
+             pkt->getSize(), pkt->isResponse(), pkt->isError(), pendingCount);
+    }
+
     // We shouldn't ever get a cacheable block in Modified state.
     assert(pkt->req->isUncacheable() ||
            !(pkt->cacheResponding() && !pkt->hasSharers()));
@@ -185,6 +225,24 @@ DmaPort::drain()
 void
 DmaPort::recvReqRetry()
 {
+    const bool trace_retry = amtcTraceDmaPort(name()) ||
+        (inRetry && amtcTraceDmaAddr(inRetry->getAddr())) ||
+        (!transmitList.empty() && amtcTraceDmaAddr(transmitList.front()->gen.addr()));
+
+    if (trace_retry) {
+        warn("AMTC_DMADEV_RETRY tick=%llu port=%s retryPending_before=%d "
+             "inRetry=%p inRetry_addr=%#lx inRetry_size=%u inRetry_cmd=%s "
+             "front_addr=%#lx front_size=%llu transmitList=%llu pending=%u sendEvent=%d\n",
+             (unsigned long long)curTick(), name().c_str(), retryPending,
+             inRetry,
+             inRetry ? (unsigned long)inRetry->getAddr() : 0UL,
+             inRetry ? inRetry->getSize() : 0,
+             inRetry ? inRetry->cmdString().c_str() : "none",
+             !transmitList.empty() ? (unsigned long)transmitList.front()->gen.addr() : 0UL,
+             !transmitList.empty() ? (unsigned long long)transmitList.front()->gen.size() : 0ULL,
+             (unsigned long long)transmitList.size(), pendingCount, sendEvent.scheduled());
+    }
+
     retryPending = false;
     if (transmitList.size())
         trySendTimingReq();
@@ -199,12 +257,46 @@ DmaPort::dmaAction(Packet::Command cmd, Addr addr, int size, Event *event,
     DPRINTF(DMA, "Starting DMA for addr: %#x size: %d sched: %d\n", addr, size,
             event ? event->scheduled() : -1);
 
+    if (amtcTraceDmaAddr(addr) || amtcTraceDmaPort(name()) || retryPending || inRetry) {
+        warn("AMTC_DMADEV_START tick=%llu port=%s cmd=%s addr=%#lx size=%d "
+             "event=%p event_scheduled=%d delay=%llu flags=%#lx "
+             "retryPending=%d inRetry=%p inRetry_addr=%#lx inRetry_size=%u "
+             "inRetry_cmd=%s front_addr=%#lx transmitList_before=%llu pending=%u "
+             "sendEvent=%d\n",
+             (unsigned long long)curTick(), name().c_str(),
+             MemCmd(cmd).toString().c_str(), (unsigned long)addr, size,
+             event, event ? event->scheduled() : -1,
+             (unsigned long long)delay, (unsigned long)flag,
+             retryPending, inRetry,
+             inRetry ? (unsigned long)inRetry->getAddr() : 0UL,
+             inRetry ? inRetry->getSize() : 0,
+             inRetry ? inRetry->cmdString().c_str() : "none",
+             !transmitList.empty() ? (unsigned long)transmitList.front()->gen.addr() : 0UL,
+             (unsigned long long)transmitList.size(), pendingCount,
+             sendEvent.scheduled());
+    }
+
     // One DMA request sender state for every action, that is then
     // split into many requests and packets based on the block size,
     // i.e. cache line size.
     transmitList.push_back(
             new DmaReqState(cmd, addr, cacheLineSize, size,
                 data, flag, requestorId, sid, ssid, event, delay));
+
+    if (amtcTraceDmaAddr(addr) || amtcTraceDmaPort(name()) || retryPending || inRetry) {
+        warn("AMTC_DMADEV_ENQUEUED tick=%llu port=%s addr=%#lx "
+             "transmitList_after=%llu pending=%u retryPending=%d "
+             "inRetry=%p inRetry_addr=%#lx inRetry_size=%u inRetry_cmd=%s "
+             "front_addr=%#lx front_size=%llu\n",
+             (unsigned long long)curTick(), name().c_str(),
+             (unsigned long)addr, (unsigned long long)transmitList.size(),
+             pendingCount, retryPending, inRetry,
+             inRetry ? (unsigned long)inRetry->getAddr() : 0UL,
+             inRetry ? inRetry->getSize() : 0,
+             inRetry ? inRetry->cmdString().c_str() : "none",
+             !transmitList.empty() ? (unsigned long)transmitList.front()->gen.addr() : 0UL,
+             !transmitList.empty() ? (unsigned long long)transmitList.front()->gen.size() : 0ULL);
+    }
 
     // In zero time, also initiate the sending of the packets for the request
     // we have just created. For atomic this involves actually completing all
@@ -263,20 +355,49 @@ DmaPort::trySendTimingReq()
     // and schedule the following send if it is successful
     DmaReqState *state = transmitList.front();
 
-    PacketPtr pkt = inRetry ? inRetry : state->createPacket();
+    const bool from_retry = inRetry != nullptr;
+    PacketPtr pkt = from_retry ? inRetry : state->createPacket();
     inRetry = nullptr;
 
     DPRINTF(DMA, "Trying to send %s addr %#x\n", pkt->cmdString(),
             pkt->getAddr());
 
+    const bool trace_pkt = amtcTraceDmaAddr(pkt->getAddr()) ||
+        amtcTraceDmaPort(name()) || from_retry || retryPending;
+    const Addr trace_addr = pkt->getAddr();
+    const unsigned trace_size = pkt->getSize();
+    const std::string trace_cmd = pkt->cmdString();
+    PacketPtr trace_pkt_ptr = pkt;
+
+    if (trace_pkt) {
+        warn("AMTC_DMADEV_SEND_BEFORE tick=%llu port=%s pkt=%p cmd=%s "
+             "addr=%#lx size=%u fromRetry=%d gen_complete=%lu gen_size=%lu "
+             "pending=%u retryPending=%d transmitList=%llu sendEvent=%d\n",
+             (unsigned long long)curTick(), name().c_str(), trace_pkt_ptr,
+             trace_cmd.c_str(), (unsigned long)trace_addr, trace_size,
+             from_retry, (unsigned long)state->gen.complete(),
+             (unsigned long)state->gen.size(), pendingCount, retryPending,
+             (unsigned long long)transmitList.size(), sendEvent.scheduled());
+    }
+
     // Check if this was the last packet now, since hypothetically the packet
     // response may come immediately, and state may be deleted.
     bool last = state->gen.last();
-    if (sendTimingReq(pkt)) {
+    const bool accepted = sendTimingReq(pkt);
+    if (accepted) {
         pendingCount++;
     } else {
         retryPending = true;
         inRetry = pkt;
+    }
+
+    if (trace_pkt) {
+        warn("AMTC_DMADEV_SEND_AFTER tick=%llu port=%s pkt=%p addr=%#lx "
+             "ok=%d last=%d pending=%u retryPending=%d inRetry=%p "
+             "transmitList=%llu sendEvent=%d\n",
+             (unsigned long long)curTick(), name().c_str(), trace_pkt_ptr,
+             (unsigned long)trace_addr, accepted, last, pendingCount,
+             retryPending, inRetry, (unsigned long long)transmitList.size(), sendEvent.scheduled());
     }
     if (!retryPending) {
         state->gen.next();
@@ -394,11 +515,43 @@ DmaPort::sendDma()
     // have to be done to make switching actually work.
     assert(transmitList.size());
 
+    const bool trace_front = amtcTraceDmaPort(name()) || retryPending || inRetry ||
+        (!transmitList.empty() && amtcTraceDmaAddr(transmitList.front()->gen.addr()));
+
+    if (trace_front) {
+        warn("AMTC_DMADEV_SENDDMA_ENTER tick=%llu port=%s front_addr=%#lx "
+             "front_size=%llu timing=%d atomic=%d retryPending=%d "
+             "inRetry=%p inRetry_addr=%#lx inRetry_size=%u inRetry_cmd=%s "
+             "sendEvent=%d transmitList=%llu pending=%u\n",
+             (unsigned long long)curTick(), name().c_str(),
+             !transmitList.empty() ? (unsigned long)transmitList.front()->gen.addr() : 0UL,
+             !transmitList.empty() ? (unsigned long long)transmitList.front()->gen.size() : 0ULL,
+             sys->isTimingMode(), sys->isAtomicMode(), retryPending, inRetry,
+             inRetry ? (unsigned long)inRetry->getAddr() : 0UL,
+             inRetry ? inRetry->getSize() : 0,
+             inRetry ? inRetry->cmdString().c_str() : "none",
+             sendEvent.scheduled(), (unsigned long long)transmitList.size(), pendingCount);
+    }
+
     if (sys->isTimingMode()) {
         // If we are either waiting for a retry or are still waiting after
         // sending the last packet, then do not proceed.
         if (retryPending || sendEvent.scheduled()) {
             DPRINTF(DMA, "Can't send immediately, waiting to send\n");
+            if (trace_front) {
+                warn("AMTC_DMADEV_SENDDMA_BLOCKED tick=%llu port=%s "
+                     "front_addr=%#lx front_size=%llu retryPending=%d "
+                     "inRetry=%p inRetry_addr=%#lx inRetry_size=%u inRetry_cmd=%s "
+                     "sendEvent=%d transmitList=%llu pending=%u\n",
+                     (unsigned long long)curTick(), name().c_str(),
+                     !transmitList.empty() ? (unsigned long)transmitList.front()->gen.addr() : 0UL,
+                     !transmitList.empty() ? (unsigned long long)transmitList.front()->gen.size() : 0ULL,
+                     retryPending, inRetry,
+                     inRetry ? (unsigned long)inRetry->getAddr() : 0UL,
+                     inRetry ? inRetry->getSize() : 0,
+                     inRetry ? inRetry->cmdString().c_str() : "none",
+                     sendEvent.scheduled(), (unsigned long long)transmitList.size(), pendingCount);
+            }
             return;
         }
 

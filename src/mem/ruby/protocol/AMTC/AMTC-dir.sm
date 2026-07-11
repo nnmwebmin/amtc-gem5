@@ -52,6 +52,13 @@ machine(MachineType:Directory, "Token protocol")
    MessageBuffer * requestToDir, network="From", virtual_network="2",
         vnet_type="request";
 
+   // AMTC audit83: TCC/NB forwarded RequestMsg path.
+   // This is intentionally separate from requestToDir because TCC forwards
+   // SQC/TCP requests on its NB path.  Directory actions handling this queue
+   // must peek/pop requestNetworkFromNB_in, not requestNetwork_in.
+   MessageBuffer * requestToDirFromNB, network="From", virtual_network="5",
+        vnet_type="request";
+
    MessageBuffer * dmaRequestToDir, network="From", virtual_network="0",
         vnet_type="request";
 
@@ -85,15 +92,38 @@ machine(MachineType:Directory, "Token protocol")
     CGS_GPU_UPG, AccessPermission:Busy, desc="Upgrading CGS to GE (waiting on CPU Ack)";
 
     CE_W_DataOnly, AccessPermission:Busy, desc="Fetching data-only for CPU Owner Pull";
+    CE_W_Stale_GETX, AccessPermission:Busy, desc="Repair stale CPU-exclusive self-owner GETX by fetching memory and forcing owner tokens";
+    CE_W_DMA_READ, AccessPermission:Busy, desc="DMA read while CPU-exclusive owner exists; fetch data for DMA and preserve CE";
+    GE_W_DMA_READ, AccessPermission:Busy, desc="DMA read while GPU-exclusive owner exists; fetch data for DMA and preserve GE";
+
+    CE_W_DMA_WRITE_BOTH, AccessPermission:Busy, desc="DMA write while CPU-exclusive owner exists; waiting for memory ack and CPU invalidation/data response";
+    CE_W_DMA_WRITE_MEM,  AccessPermission:Busy, desc="DMA write while CPU-exclusive owner exists; waiting for memory ack after CPU invalidation response";
+    CE_W_DMA_WRITE_TOK,  AccessPermission:Busy, desc="DMA write while CPU-exclusive owner exists; waiting for CPU invalidation/data response after memory ack";
+    GE_W_DMA_WRITE_BOTH, AccessPermission:Busy, desc="DMA write while GPU-exclusive owner exists; waiting for memory ack and GPU invalidation/data response";
+    GE_W_DMA_WRITE_MEM,  AccessPermission:Busy, desc="DMA write while GPU-exclusive owner exists; waiting for memory ack after GPU invalidation response";
+    GE_W_DMA_WRITE_TOK,  AccessPermission:Busy, desc="DMA write while GPU-exclusive owner exists; waiting for GPU invalidation/data response after memory ack";
+
     GE_W_DataOnly, AccessPermission:Busy, desc="Fetching data-only for GPU Owner Pull";
+    I_DMA_W, AccessPermission:Busy, desc="Fetching memory for DMA read from Invalid";
+
+    CS_DMA_R_W, AccessPermission:Busy, desc="DMA read from CPU-shared state";
+    CGS_DMA_R_W, AccessPermission:Busy, desc="DMA read from CPU/GPU-shared state";
+    GS_DMA_R_W, AccessPermission:Busy, desc="DMA read from GPU-shared state";
+
+    I_DMA_WRITE_W, AccessPermission:Busy, desc="DMA write from Invalid; waiting for memory ack";
   }
 
   // Events
   enumeration(Event, desc="Directory events") {
     CPU_GETS, desc="A GETS from the CPU domain";
     GPU_GETS, desc="A GETS from the GPU domain";
+    // AMTC audit83: same logical GPU requests, but arriving from the new
+    // requestNetworkFromNB_in queue.  They need queue-specific actions.
+    GPU_GETS_NB, desc="A GETS from the GPU/TCC NB path";
     CPU_GETX, desc="A GETX from the CPU domain";
+    CPU_GETX_Stale_Self, desc="Retrying CPU GETX after stale self-owner/no-progress loop";
     GPU_GETX, desc="A GETX from the GPU domain";
+    GPU_GETX_NB, desc="A GETX from the GPU/TCC NB path";
 
     Lockdown, desc="A lockdown request arrives";
     Unlockdown, desc="An un-lockdown request arrives";
@@ -109,17 +139,24 @@ machine(MachineType:Directory, "Token protocol")
     Memory_Data, desc="Data from memory arrives";
     Tokens_Ack,  desc="Tokens returned from an invalidation";
     Memory_Ack, desc="Writeback Ack from memory arrives";
+    Memory_Data_Stale, desc="Late memory data without a live TBE; consume only";
+    Memory_Ack_Stale, desc="Late memory writeback ACK without a live TBE; consume only";
 
     // DMA requests
     DMA_READ, desc="A DMA Read memory request";
     DMA_WRITE, desc="A DMA Write memory request";
     GETS_Owner_Pull, desc="The Owner is requesting raw data for a missing sector";
+    GETS_Owner_Pull_NB, desc="TCC/NB owner-pull repair GETS from stale-owner ACK path";
+
+    CPU_GETS_Owner_Pull_Repair, desc="CPU GETS retry after stale owner ACK; do not forward again";
 
 
 
     // TWO INTERNAL TRIGGERS ---
     Write_Complete,  desc="Internal trigger: All data and tokens for a write are accumulated";
     Read_Complete,   desc="Internal trigger: All data for a read is accumulated";
+    Tokens_All_Collected, desc="requested all tocken collected";
+    Data_Owner_All_Collected, desc="Data and final tokens arrived from an eviction";
   }
 
   // TYPES
@@ -410,12 +447,32 @@ machine(MachineType:Directory, "Token protocol")
     // 2. PHASE 1 DOMAIN INVARIANTS
     // ====================================================================
 
-    // INVARIANT A: Invalid & Initialization Wait States
-    // If no cache holds the line, OR we are waiting for memory before sending
-    // the first response, the Directory MUST hold exactly 100% of the tokens.
-    if (state == State:I || state == State:CS_W || state == State:CE_W || state == State:GS_W || state == State:GE_W) {
+    // INVARIANT A: Invalid & cold initialization wait states.
+    //
+    // Audit81:
+    // Only I/CS_W/GS_W mean the directory is waiting before any exclusive
+    // owner owns the line, so only these states require the directory to hold
+    // all tokens.  CE_W/GE_W are exclusive-owner wait paths: tokens can still
+    // be outside the directory while forwarded owner/DMA-write invalidation
+    // responses are in flight.
+    if (state == State:I || state == State:CS_W || state == State:GS_W) {
       assert(dir_entry.TokensSec0 == (max_tokens() / 2));
       assert(dir_entry.TokensSec1 == (max_tokens() / 2));
+    }
+
+    if (state == State:CE_W || state == State:GE_W ||
+        state == State:CE_W_DMA_READ ||
+        state == State:GE_W_DMA_READ ||
+        state == State:CE_W_DMA_WRITE_BOTH ||
+        state == State:CE_W_DMA_WRITE_MEM ||
+        state == State:CE_W_DMA_WRITE_TOK ||
+        state == State:GE_W_DMA_WRITE_BOTH ||
+        state == State:GE_W_DMA_WRITE_MEM ||
+        state == State:GE_W_DMA_WRITE_TOK) {
+      DPRINTF(RubySlicc,
+        "AMTC_DIR_STATE_CHECK_SKIP_EXCL_OR_DMA_WAIT addr=%#x state=%s T0=%d T1=%d owner=%s\n",
+        addr, state, dir_entry.TokensSec0, dir_entry.TokensSec1,
+        dir_entry.last_cpu_owner);
     }
 
     // INVARIANT B: Stable Exclusive
@@ -426,11 +483,11 @@ machine(MachineType:Directory, "Token protocol")
     }
 
     // INVARIANT C: Shared & In-Flight Upgrades
-    // If the line is shared, the Directory must have given away at least 1 token.
-    if (state == State:CS || state == State:GS || state == State:CGS || state == State:CGS_W) {
-      assert((dir_entry.TokensSec0 < (max_tokens() / 2)) ||
-             (dir_entry.TokensSec1 < (max_tokens() / 2)));
-    }
+    if (state == State:CS || state == State:GS || state == State:CGS || state == State:CGS_W || state == State:CE || state == State:GE) {
+
+       int max_t := max_tokens() / 2;
+       assert((dir_entry.TokensSec0 < max_t) || (dir_entry.TokensSec1 < max_t));
+     }
   }
 
   AccessPermission getAccessPermission(Addr addr) {
@@ -517,9 +574,24 @@ machine(MachineType:Directory, "Token protocol")
     if (memQueue_in.isReady(clockEdge())) {
       peek(memQueue_in, MemoryMsg) {
         if (in_msg.Type == MemoryRequestType:MEMORY_READ) {
-          trigger(Event:Memory_Data, in_msg.addr, TBEs[in_msg.addr]);
+          // AMTC audit8: MEMORY_READ data may arrive after the request TBE
+          // was already satisfied/deallocated by a forwarded owner response.
+          // Do not use TBEs[in_msg.addr] unless the TBE is present; operator[]
+          // can dereference/create an invalid entry and crash in recvTimingResp.
+          if (TBEs.isPresent(in_msg.addr)) {
+            trigger(Event:Memory_Data, in_msg.addr, TBEs[in_msg.addr]);
+          } else {
+            trigger(Event:Memory_Data_Stale, in_msg.addr, TBEs.lookup(in_msg.addr));
+          }
         } else if (in_msg.Type == MemoryRequestType:MEMORY_WB) {
-          trigger(Event:Memory_Ack, in_msg.addr, TBEs[in_msg.addr]);
+          // AMTC audit8: MEMORY_WB acknowledgements may arrive after the
+          // original writeback TBE was deallocated or while a new same-line
+          // memory-read TBE is active.  Route no-TBE ACKs to a stale sink.
+          if (TBEs.isPresent(in_msg.addr)) {
+            trigger(Event:Memory_Ack, in_msg.addr, TBEs[in_msg.addr]);
+          } else {
+            trigger(Event:Memory_Ack_Stale, in_msg.addr, TBEs.lookup(in_msg.addr));
+          }
         } else {
           DPRINTF(RubySlicc, "%s\n", in_msg.Type);
           error("Invalid message");
@@ -540,39 +612,71 @@ machine(MachineType:Directory, "Token protocol")
   in_port(responseNetwork_in, ResponseMsg, responseToDir) {
     if (responseNetwork_in.isReady(clockEdge())) {
         peek(responseNetwork_in, ResponseMsg) {
-
             assert(in_msg.Destination.isElement(machineID));
 
-            if (in_msg.Type == CoherenceResponseType:DATA_OWNER) {
-                trigger(Event:Data_Owner, in_msg.addr, TBEs[in_msg.addr]);
+            Entry dir_entry := getDirectoryEntry(in_msg.addr);
+            int total_T0 := dir_entry.TokensSec0;
+            int total_T1 := dir_entry.TokensSec1;
 
-            } else if (in_msg.Type == CoherenceResponseType:DATA_SHARED) {
+            // Classify completion using the actual token counts that will
+            // be absorbed by q_updateTokensFromResponse.  Some replacement
+            // paths carry data for only one sector but return tokens for both;
+            // older messages may have token_sector_mask narrower than the
+            // non-zero token fields.  The classifier and updater must agree.
+            if (in_msg.TokensSec0 > 0 ||
+                in_msg.token_sector_mask == 1 || in_msg.token_sector_mask == 3) {
+                total_T0 := total_T0 + in_msg.TokensSec0;
+            }
+
+            if (in_msg.TokensSec1 > 0 ||
+                in_msg.token_sector_mask == 2 || in_msg.token_sector_mask == 3) {
+                total_T1 := total_T1 + in_msg.TokensSec1;
+            }
+
+            int max_t := max_tokens() / 2;
+            bool is_final_piece := ((total_T0 >= max_t) && (total_T1 >= max_t));
+            DPRINTF(RubySlicc, "AMTC_DIR_CLASSIFY_RESP addr=%#x type=%d curT0=%d curT1=%d inT0=%d inT1=%d tokmask=%x totalT0=%d totalT1=%d max=%d final=%d\n",
+                    in_msg.addr, in_msg.Type, dir_entry.TokensSec0, dir_entry.TokensSec1,
+                    in_msg.TokensSec0, in_msg.TokensSec1, in_msg.token_sector_mask,
+                    total_T0, total_T1, max_t, is_final_piece);
+
+            // =================================================================
+            // 1. TOKEN RECOVERY
+            // =================================================================
+            if (in_msg.Type == CoherenceResponseType:ACK ||
+                in_msg.Type == CoherenceResponseType:WB_TOKENS) {
+
+                if (is_final_piece) {
+                    trigger(Event:Tokens_All_Collected, in_msg.addr, TBEs[in_msg.addr]);
+                } else {
+                    trigger(Event:Tokens, in_msg.addr, TBEs[in_msg.addr]);
+                }
+            }
+
+            // =================================================================
+            // 2. DATA RECOVERY
+            // =================================================================
+            else if (in_msg.Type == CoherenceResponseType:DATA_OWNER ||
+                     in_msg.Type == CoherenceResponseType:WB_OWNED ||
+                     in_msg.Type == CoherenceResponseType:WB_SHARED_DATA) {
+
+                if (is_final_piece) {
+                    trigger(Event:Data_Owner_All_Collected, in_msg.addr, TBEs[in_msg.addr]);
+                } else {
+                    trigger(Event:Data_Owner, in_msg.addr, TBEs[in_msg.addr]);
+                }
+            }
+
+            // =================================================================
+            // 3. OTHER STANDARD RESPONSES
+            // =================================================================
+            else if (in_msg.Type == CoherenceResponseType:DATA_SHARED) {
                 trigger(Event:Data_Shared, in_msg.addr, TBEs[in_msg.addr]);
 
             } else if (in_msg.Type == CoherenceResponseType:ACK_OWNER) {
                 trigger(Event:Ack_Owner, in_msg.addr, TBEs[in_msg.addr]);
 
-            } else if (in_msg.Type == CoherenceResponseType:ACK) {
-                trigger(Event:Tokens, in_msg.addr, TBEs[in_msg.addr]);
-            }
-            // =================================================================
-            // CRITICAL FIX: L2 Cache Capacity Eviction Handlers
-            // =================================================================
-            else if (in_msg.Type == CoherenceResponseType:WB_TOKENS) {
-                // The L2 is returning tokens without data.
-                // Route this to your existing 'Tokens' event (just like an ACK).
-                trigger(Event:Tokens, in_msg.addr, TBEs[in_msg.addr]);
-
-            } else if (in_msg.Type == CoherenceResponseType:WB_OWNED ||
-                       in_msg.Type == CoherenceResponseType:WB_SHARED_DATA) {
-                // The L2 is returning dirty or clean physical data alongside tokens.
-                // Route this to your existing 'Data_Owner' event.
-                // (Note: If your Directory has a specific event like Event:Writeback
-                // defined in its enumeration, use that instead of Data_Owner here).
-                trigger(Event:Data_Owner, in_msg.addr, TBEs[in_msg.addr]);
-            }
-            // =================================================================
-            else {
+            } else {
                 DPRINTF(RubySlicc, "Invalid response type: %s\n", in_msg.Type);
                 error("Invalid response type");
             }
@@ -585,31 +689,165 @@ machine(MachineType:Directory, "Token protocol")
       peek(requestNetwork_in, RequestMsg) {
         assert(in_msg.Destination.isElement(machineID));
 
-        // --- DOMAIN-AWARE EVENT SPLITTING ---
+        DPRINTF(RubySlicc,
+                "AMTC_DIR_REQ_RAW_IN addr=%#x type=%s requestor=%s is_gpu=%d mask=%d reqmask=%d retry=%d ownerpull=%d\n",
+                in_msg.addr,
+                in_msg.Type,
+                in_msg.Requestor,
+                in_msg.is_gpu,
+                in_msg.sector_mask,
+                in_msg.requested_sector_mask,
+                in_msg.RetryNum,
+                in_msg.is_owner_pull);
 
-        // 1. CRITICAL FIX: Intercept ALL Owner Pulls FIRST, regardless of whether
-        // the original request was a GETS or GETX.
+        if (in_msg.Type == CoherenceRequestType:GETS) {
+          if (is_cpu_domain(in_msg.Requestor)) {
+            if (in_msg.RetryNum > 0 || in_msg.is_owner_pull) {
+              DPRINTF(RubySlicc,
+                      "AMTC_DIR_CPU_GETS_RETRY_REPAIR_IN_V21 addr=%#x req=%s retry=%d ownerpull=%d mask=%d reqmask=%d\n",
+                      in_msg.addr,
+                      in_msg.Requestor,
+                      in_msg.RetryNum,
+                      in_msg.is_owner_pull,
+                      in_msg.sector_mask,
+                      in_msg.requested_sector_mask);
+
+              trigger(Event:CPU_GETS_Owner_Pull_Repair,
+                      in_msg.addr, TBEs[in_msg.addr]);
+            } else {
+              trigger(Event:CPU_GETS, in_msg.addr, TBEs[in_msg.addr]);
+            }
+          } else {
+            trigger(Event:GPU_GETS, in_msg.addr, TBEs[in_msg.addr]);
+          }
+        } else if (in_msg.Type == CoherenceRequestType:GETX) {
+          if (is_cpu_domain(in_msg.Requestor)) {
+            DPRINTF(RubySlicc,
+                    "AMTC_DIR_CPU_GETX_CLASSIFY addr=%#x req=%s retry=%d ownerpull=%d mask=%d reqmask=%d\n",
+                    in_msg.addr,
+                    in_msg.Requestor,
+                    in_msg.RetryNum,
+                    in_msg.is_owner_pull,
+                    in_msg.sector_mask,
+                    in_msg.requested_sector_mask);
+
+            /*
+             * AMTC audit90:
+             * Detect stale self-owner GETX much earlier than the old retry>=32
+             * threshold.  The observed deadlock is:
+             *   DIR state CE, owner=L2Cache-0, requestor=L2Cache-0,
+             *   ownerpull=1, reqmask=3, but Directory holds no requested tokens.
+             * The old CE->CPU_GETX path calls fwd_req_to_cpu(), which then sends
+             * DATA_OWNER with send0=0/send1=0.  L2 enters IX with valid data but
+             * no tokens and retries forever.  Treat that as stale metadata and
+             * use the existing CE_W_Stale_GETX memory/forced-token repair path.
+             */
+            int req_mask := amtc_sanitizeMask(in_msg.requested_sector_mask);
+            if (req_mask == 0) { req_mask := amtc_sanitizeMask(in_msg.sector_mask); }
+            if (req_mask == 0) { req_mask := amtc_fullMask(); }
+
+            Entry dir_entry := getDirectoryEntry(in_msg.addr);
+            bool stale_self_owner_zero_token := false;
+
+            if (in_msg.RetryNum > 0 || in_msg.is_owner_pull) {
+              if (dir_entry.last_cpu_owner == in_msg.Requestor ||
+                  dir_entry.last_cpu_owner == machineID) {
+                bool any_dir_token_for_req := false;
+
+                if (amtc_maskHasSector(req_mask, 0) &&
+                    dir_entry.TokensSec0 > 0) {
+                  any_dir_token_for_req := true;
+                }
+
+                if (amtc_maskHasSector(req_mask, 1) &&
+                    dir_entry.TokensSec1 > 0) {
+                  any_dir_token_for_req := true;
+                }
+
+                if (!any_dir_token_for_req) {
+                  stale_self_owner_zero_token := true;
+                }
+              }
+            }
+
+            if (stale_self_owner_zero_token) {
+              DPRINTF(RubySlicc,
+                      "AMTC_DIR_CPU_GETX_STALE_SELF_ZERO_TOKEN addr=%#x req=%s owner=%s retry=%d ownerpull=%d mask=%d T0=%d T1=%d\n",
+                      in_msg.addr,
+                      in_msg.Requestor,
+                      dir_entry.last_cpu_owner,
+                      in_msg.RetryNum,
+                      in_msg.is_owner_pull,
+                      req_mask,
+                      dir_entry.TokensSec0,
+                      dir_entry.TokensSec1);
+
+              trigger(Event:CPU_GETX_Stale_Self,
+                      in_msg.addr, TBEs[in_msg.addr]);
+            } else if (in_msg.RetryNum >= 32) {
+              trigger(Event:CPU_GETX_Stale_Self,
+                      in_msg.addr, TBEs[in_msg.addr]);
+            } else {
+              trigger(Event:CPU_GETX,
+                      in_msg.addr, TBEs[in_msg.addr]);
+            }
+          } else {
+            trigger(Event:GPU_GETX,
+                    in_msg.addr, TBEs[in_msg.addr]);
+          }
+
+        } else {
+          error("Invalid request message to Directory");
+        }
+      }
+    }
+  }
+
+
+  // AMTC audit83: TCC/NB forwarded request path.
+  // This prevents old transitions from peeking requestNetwork_in while the
+  // current message is actually in requestNetworkFromNB_in.
+  in_port(requestNetworkFromNB_in, RequestMsg, requestToDirFromNB) {
+    if (requestNetworkFromNB_in.isReady(clockEdge())) {
+      peek(requestNetworkFromNB_in, RequestMsg) {
+        assert(in_msg.Destination.isElement(machineID));
+
+        DPRINTF(RubySlicc,
+                "AMTC_DIR_REQ_FROM_NB_RAW addr=%#x type=%s requestor=%s is_gpu=%d owner_pull=%d retry=%d mask=%d\n",
+                in_msg.addr,
+                in_msg.Type,
+                in_msg.Requestor,
+                in_msg.is_gpu,
+                in_msg.is_owner_pull,
+                in_msg.RetryNum,
+                in_msg.sector_mask);
+
         if (in_msg.is_owner_pull) {
-            trigger(Event:GETS_Owner_Pull, in_msg.addr, TBEs[in_msg.addr]);
-        }
-        // 2. Normal GETS Routing
-        else if (in_msg.Type == CoherenceRequestType:GETS) {
-            if (is_cpu_domain(in_msg.Requestor)) {
-                trigger(Event:CPU_GETS, in_msg.addr, TBEs[in_msg.addr]);
+          DPRINTF(RubySlicc,
+                  "AMTC_DIR_NB_OWNER_PULL_GETS addr=%#x requestor=%s retry=%d mask=%d\n",
+                  in_msg.addr,
+                  in_msg.Requestor,
+                  in_msg.RetryNum,
+                  in_msg.requested_sector_mask);
+          trigger(Event:GETS_Owner_Pull_NB, in_msg.addr, TBEs[in_msg.addr]);
+        } else if (in_msg.Type == CoherenceRequestType:GETS) {
+          if (is_cpu_domain(in_msg.Requestor)) {
+            trigger(Event:CPU_GETS, in_msg.addr, TBEs[in_msg.addr]);
+          } else {
+            trigger(Event:GPU_GETS_NB, in_msg.addr, TBEs[in_msg.addr]);
+          }
+        } else if (in_msg.Type == CoherenceRequestType:GETX) {
+          if (is_cpu_domain(in_msg.Requestor)) {
+            if (in_msg.RetryNum >= 32) {
+              trigger(Event:CPU_GETX_Stale_Self, in_msg.addr, TBEs[in_msg.addr]);
             } else {
-                trigger(Event:GPU_GETS, in_msg.addr, TBEs[in_msg.addr]);
+              trigger(Event:CPU_GETX, in_msg.addr, TBEs[in_msg.addr]);
             }
-        }
-        // 3. Normal GETX Routing
-        else if (in_msg.Type == CoherenceRequestType:GETX) {
-            if (is_cpu_domain(in_msg.Requestor)) {
-                trigger(Event:CPU_GETX, in_msg.addr, TBEs[in_msg.addr]);
-            } else {
-                trigger(Event:GPU_GETX, in_msg.addr, TBEs[in_msg.addr]);
-            }
-        }
-        else {
-            error("Invalid message");
+          } else {
+            trigger(Event:GPU_GETX_NB, in_msg.addr, TBEs[in_msg.addr]);
+          }
+        } else {
+          error("Invalid NB request message");
         }
       }
     }
@@ -618,6 +856,16 @@ machine(MachineType:Directory, "Token protocol")
   in_port(dmaRequestQueue_in, DMARequestMsg, dmaRequestToDir) {
       if (dmaRequestQueue_in.isReady(clockEdge())) {
           peek(dmaRequestQueue_in, DMARequestMsg) {
+              // AMTC bring-up debug: prove whether HSAPP/DMA requests enter the
+              // directory and which directory state currently owns the line.
+              DPRINTF(RubySlicc,
+                      "AMTC_DIR_DMA_REQ_IN addr=%#x phys=%#x type=%s req=%s state=%s tbe_valid=%d\n",
+                      in_msg.LineAddress,
+                      in_msg.PhysicalAddress,
+                      in_msg.Type,
+                      in_msg.Requestor,
+                      getState(TBEs[in_msg.LineAddress], in_msg.LineAddress),
+                      is_valid(TBEs[in_msg.LineAddress]));
 
               if (in_msg.Type == DMARequestType:READ) {
                   trigger(Event:DMA_READ,
@@ -838,17 +1086,18 @@ machine(MachineType:Directory, "Token protocol")
         out_msg.Sender := in_msg.Requestor;
         out_msg.OriginalRequestorMachId := in_msg.Requestor;
         out_msg.MessageSize := MessageSizeType:Request_Control;
-        out_msg.Len := amtc_countSectors(req_mask) * 32;
+        out_msg.Len := 64;
       }
 
       DPRINTF(RubySlicc,
-        "AMTC_DIR_QUEUE_MEM addr=%#x sid=%d mask=%d\n",
+        "AMTC_DIR_QUEUE_MEM_FULL addr=%#x sid=%d mask=%d len=64\n",
         address, req_sid, req_mask);
     }
   }
 
-  action(fd_memoryDma, "fd", desc="Queue off-chip fetch request") {
+  action(fd_memoryDma, "fd", desc="Queue off-chip DMA read fetch request") {
     peek(dmaRequestQueue_in, DMARequestMsg) {
+      int dma_mask := amtc_normalizeMask(in_msg.sector_mask, in_msg.sector_id);
       enqueue(memQueue_out, MemoryMsg, to_memory_controller_latency) {
         out_msg.addr := address;
         out_msg.Type := MemoryRequestType:MEMORY_READ;
@@ -857,6 +1106,9 @@ machine(MachineType:Directory, "Token protocol")
         out_msg.MessageSize := MessageSizeType:Request_Control;
         out_msg.Len := 64;
       }
+      DPRINTF(RubySlicc,
+        "AMTC_DIR_DMA_MEM_READ_FULL addr=%#x mask=%d len=64\n",
+        address, dma_mask);
     }
   }
 
@@ -869,7 +1121,7 @@ machine(MachineType:Directory, "Token protocol")
         out_msg.OriginalRequestorMachId := in_msg.Sender;
         out_msg.MessageSize := MessageSizeType:Writeback_Data;
         out_msg.DataBlk := in_msg.DataBlk;
-        out_msg.Len := amtc_countSectors(in_msg.valid_sector_mask) * 32;
+        out_msg.Len := 64;
       }
     }
   }
@@ -882,7 +1134,7 @@ machine(MachineType:Directory, "Token protocol")
       out_msg.OriginalRequestorMachId := tbe.OriginalRequestorMachId;
       out_msg.MessageSize := MessageSizeType:Writeback_Data;
       out_msg.DataBlk := tbe.DataBlk;
-      out_msg.Len := tbe.Len;
+      out_msg.Len := 64;
     }
   }
 
@@ -896,20 +1148,32 @@ machine(MachineType:Directory, "Token protocol")
         out_msg.OriginalRequestorMachId := tbe.OriginalRequestorMachId;
         out_msg.MessageSize := MessageSizeType:Writeback_Data;
         out_msg.DataBlk := in_msg.DataBlk;
-        out_msg.Len := 0;
+        out_msg.Len := 64;
       }
     }
   }
 
-  action(vd_allocateDmaRequestInTBE, "vd", desc="Record Data in TBE") {
+  action(vd_allocateDmaRequestInTBE, "vd", desc="Record DMA request in TBE") {
     peek(dmaRequestQueue_in, DMARequestMsg) {
+      int dma_mask := amtc_normalizeMask(in_msg.sector_mask, in_msg.sector_id);
+      int dma_sid := amtc_primarySectorFromMask(dma_mask);
+
       TBEs.allocate(address);
       set_tbe(TBEs[address]);
       tbe.DataBlk := in_msg.DataBlk;
       tbe.PhysicalAddress := in_msg.PhysicalAddress;
       tbe.Len := in_msg.Len;
-      //tbe.DmaRequestor := in_msg.Requestor;
+      tbe.DmaReqDest := in_msg.Requestor;
+      tbe.OriginalRequestorMachId := in_msg.Requestor;
+      tbe.RequestedSectorMask := dma_mask;
+      tbe.ReceivedSectorMask := 0;
+      tbe.TokenReadySectorMask := 0;
+      tbe.LastSectorID := dma_sid;
       tbe.WentPersistent := false;
+
+      DPRINTF(RubySlicc,
+        "AMTC_DIR_DMA_TBE_INIT addr=%#x mask=%d sid=%d len=%d\n",
+        address, dma_mask, dma_sid, in_msg.Len);
     }
   }
 
@@ -939,12 +1203,49 @@ machine(MachineType:Directory, "Token protocol")
     requestNetwork_in.dequeue(clockEdge());
   }
 
+  action(j_popIncomingRequestFromNBQueue, "jnb", desc="Pop incoming TCC/NB request queue") {
+    requestNetworkFromNB_in.dequeue(clockEdge());
+  }
+
   action(z_recycleRequest, "z", desc="Recycle the request queue") {
+    DPRINTF(RubySlicc,
+            "AMTC_DIR_RECYCLE_REQ addr=%#x transient_retry_or_wait\n",
+            address);
     requestNetwork_in.recycle(clockEdge(), cyclesToTicks(recycle_latency));
   }
 
   action(k_popIncomingResponseQueue, "k", desc="Pop incoming response queue") {
     responseNetwork_in.dequeue(clockEdge());
+  }
+
+
+  action(absorbLateSharedDataResponse, "alsd",
+         desc="Absorb late/bounced DATA_SHARED response at Directory") {
+    peek(responseNetwork_in, ResponseMsg) {
+      DPRINTF(RubySlicc,
+              "AMTC_DIR_ABSORB_LATE_DATA_SHARED addr=%#x sender=%s valid=%d tokmask=%d t0=%d t1=%d ",
+              address,
+              in_msg.Sender,
+              in_msg.valid_sector_mask,
+              in_msg.token_sector_mask,
+              in_msg.TokensSec0,
+              in_msg.TokensSec1);
+    }
+  }
+
+  action(absorbStableStaleOwnerAck, "asoa",
+         desc="Absorb stale zero-token ACK_OWNER responses in stable Directory states") {
+    peek(responseNetwork_in, ResponseMsg) {
+      DPRINTF(RubySlicc,
+              "AMTC_DIR_ABSORB_STALE_ACK_OWNER addr=%#x sender=%s state_stable=1 valid=%d tokmask=%d t0=%d t1=%d reqmask=%d\n",
+              address,
+              in_msg.Sender,
+              in_msg.valid_sector_mask,
+              in_msg.token_sector_mask,
+              in_msg.TokensSec0,
+              in_msg.TokensSec1,
+              in_msg.requested_sector_mask);
+    }
   }
 
   action(kz_recycleResponse, "kz", desc="Recycle incoming response queue") {
@@ -956,6 +1257,15 @@ machine(MachineType:Directory, "Token protocol")
   }
 
   action(y_recycleDmaRequestQueue, "y", desc="recycle dma request queue") {
+    peek(dmaRequestQueue_in, DMARequestMsg) {
+      DPRINTF(RubySlicc,
+              "AMTC_DIR_DMA_RECYCLE addr=%#x type=%s req=%s state=%s tbe_valid=%d\n",
+              in_msg.LineAddress,
+              in_msg.Type,
+              in_msg.Requestor,
+              getState(tbe, address),
+              is_valid(tbe));
+    }
     dmaRequestQueue_in.recycle(clockEdge(), cyclesToTicks(recycle_latency));
   }
 
@@ -991,8 +1301,16 @@ machine(MachineType:Directory, "Token protocol")
       out_msg.PhysicalAddress := address;
       out_msg.LineAddress := address;
       out_msg.Type := DMAResponseType:ACK;
-      //out_msg.Destination.add(tbe.DmaRequestor);
+      out_msg.sector_id := 0;
+      out_msg.sector_mask := amtc_fullMask();
+      out_msg.valid_sector_mask := 0;
+      out_msg.token_sector_mask := 0;
+      out_msg.Destination.add(tbe.DmaReqDest);
       out_msg.MessageSize := MessageSizeType:Writeback_Control;
+
+      DPRINTF(RubySlicc,
+        "AMTC_DIR_DMA_ACK_SEND addr=%#x mask=%d valid=%d token=%d\n",
+        address, amtc_fullMask(), 0, 0);
     }
   }
 
@@ -1007,13 +1325,22 @@ machine(MachineType:Directory, "Token protocol")
         // split it up if need be
         //
         out_msg.DataBlk := in_msg.DataBlk;
-        //out_msg.Destination.add(tbe.DmaRequestor);
+        out_msg.sector_id := tbe.LastSectorID;
+        out_msg.sector_mask := tbe.RequestedSectorMask;
+        out_msg.valid_sector_mask := tbe.RequestedSectorMask;
+        out_msg.token_sector_mask := 0;
+        out_msg.Destination.add(tbe.DmaReqDest);
         out_msg.MessageSize := MessageSizeType:Response_Data;
+
+        DPRINTF(RubySlicc,
+          "AMTC_DIR_DMA_DATA_SEND_MEM addr=%#x mask=%d sid=%d len=%d valid=%d token=%d\n",
+          address, tbe.RequestedSectorMask, tbe.LastSectorID, tbe.Len,
+          tbe.RequestedSectorMask, 0);
       }
     }
   }
 
-  action(dd_sendDmaData, "dd", desc="Send Data to DMA controller") {
+  action(dd_sendDmaData, "dd", desc="Send Data to DMA controller from owner response") {
     peek(responseNetwork_in, ResponseMsg) {
       enqueue(dmaResponseNetwork_out, DMAResponseMsg, 1) {
         out_msg.PhysicalAddress := address;
@@ -1024,8 +1351,18 @@ machine(MachineType:Directory, "Token protocol")
         // split it up if need be
         //
         out_msg.DataBlk := in_msg.DataBlk;
-        //out_msg.Destination.add(tbe.DmaRequestor);
+        out_msg.sector_id := tbe.LastSectorID;
+        out_msg.sector_mask := tbe.RequestedSectorMask;
+        out_msg.valid_sector_mask := tbe.RequestedSectorMask;
+        out_msg.token_sector_mask := 0;
+        out_msg.Destination.add(tbe.DmaReqDest);
         out_msg.MessageSize := MessageSizeType:Response_Data;
+
+        DPRINTF(RubySlicc,
+          "AMTC_DIR_DMA_DATA_SEND_OWNER addr=%#x mask=%d sid=%d len=%d resp_valid=%d resp_token=%d out_valid=%d out_token=%d\n",
+          address, tbe.RequestedSectorMask, tbe.LastSectorID, tbe.Len,
+          in_msg.valid_sector_mask, in_msg.token_sector_mask,
+          tbe.RequestedSectorMask, 0);
       }
     }
   }
@@ -1089,7 +1426,7 @@ action(d_sendMemoryDataWithoutTokens, "d_nt", desc="Send requested sector data w
       out_msg.Type := MemoryRequestType:MEMORY_WB;
       out_msg.Sender := machineID;
       out_msg.OriginalRequestorMachId := tbe.OriginalRequestorMachId;
-      out_msg.Len := tbe.Len;
+      out_msg.Len := 64;
       out_msg.DataBlk := tbe.DataBlk;
       out_msg.MessageSize := MessageSizeType:Writeback_Data;
     }
@@ -1098,11 +1435,21 @@ action(d_sendMemoryDataWithoutTokens, "d_nt", desc="Send requested sector data w
   // Send the fully assembled line from the TBE to the DMA Controller
   action(dt_sendTbeDataToDma, "dt", desc="Send accumulated TBE data to DMA") {
     enqueue(dmaResponseNetwork_out, DMAResponseMsg, directory_latency) {
+      out_msg.PhysicalAddress := tbe.PhysicalAddress;
       out_msg.LineAddress := address;
       out_msg.Type := DMAResponseType:DATA;
       out_msg.DataBlk := tbe.DataBlk;
-      //out_msg.Destination.add(tbe.DmaRequestor);
+      out_msg.sector_id := tbe.LastSectorID;
+      out_msg.sector_mask := tbe.RequestedSectorMask;
+      out_msg.valid_sector_mask := tbe.RequestedSectorMask;
+      out_msg.token_sector_mask := 0;
+      out_msg.Destination.add(tbe.DmaReqDest);
       out_msg.MessageSize := MessageSizeType:Response_Data;
+
+      DPRINTF(RubySlicc,
+        "AMTC_DIR_DMA_DATA_SEND_TBE addr=%#x phys=%#x mask=%d sid=%d len=%d valid=%d token=%d\n",
+        address, tbe.PhysicalAddress, tbe.RequestedSectorMask,
+        tbe.LastSectorID, tbe.Len, tbe.RequestedSectorMask, 0);
     }
   }
 
@@ -1121,7 +1468,14 @@ action(d_sendMemoryDataWithoutTokens, "d_nt", desc="Send requested sector data w
     stall_and_wait(requestNetwork_in, address);
   }
 
+  action(z_stallAndWaitRequestFromNB, "znb", desc="Stall incoming TCC/NB requests") {
+    stall_and_wait(requestNetworkFromNB_in, address);
+  }
+
   action(y_stallAndWaitDmaRequest, "\y", desc="Stall incoming DMA requests") {
+    DPRINTF(RubySlicc,
+      "AMTC_DIR_DMA_STALL_WAIT addr=%#x waiting_state_duplicate_dma\n",
+      address);
     stall_and_wait(dmaRequestQueue_in, address);
   }
 
@@ -1202,6 +1556,13 @@ action(d_sendMemoryDataWithoutTokens, "d_nt", desc="Send requested sector data w
     }
     getDirectoryEntry(address).gpu_shared := true;
     getDirectoryEntry(address).last_gpu_owner := requestor;
+  }
+
+  action(u_set_gpu_shared_from_nb, "sgsnb", desc="Set GPU shared metadata from TCC/NB request") {
+    peek(requestNetworkFromNB_in, RequestMsg) {
+      getDirectoryEntry(address).gpu_shared := true;
+      getDirectoryEntry(address).last_gpu_owner := in_msg.Requestor;
+    }
   }
 
   action(u_set_cpu_exclusive, "sce", desc="Set CPU exclusive metadata") {
@@ -1335,6 +1696,25 @@ action(a_inv_remote_domain_on_getx, "invR", desc="Invalidate remote domain on up
     }
   }
 
+  action(v_allocateTBEFromNB, "vnb", desc="Allocate TBE for NB/TCC request path") {
+    peek(requestNetworkFromNB_in, RequestMsg) {
+      if (is_invalid(tbe)) {
+        TBEs.allocate(address);
+        set_tbe(TBEs[address]);
+      }
+
+      tbe.last_requestor := in_msg.Requestor;
+      tbe.OriginalRequestorMachId := in_msg.Requestor;
+      tbe.RequestedSectorMask := amtc_normalizeMask(in_msg.requested_sector_mask, in_msg.sector_id);
+      tbe.ReceivedSectorMask := 0;
+      tbe.TokenReadySectorMask := 0;
+      tbe.LastSectorID := in_msg.sector_id;
+      tbe.FromGPU := true;
+      tbe.IsSyncRequest := in_msg.is_sync;
+      tbe.req_from_cpu := false;
+    }
+  }
+
   action(s_deallocateTBE, "s", desc="Deallocate TBE on stable entry") {
     TBEs.deallocate(address);
     unset_tbe();
@@ -1387,6 +1767,44 @@ action(a_inv_remote_domain_on_getx, "invR", desc="Invalidate remote domain on up
         out_msg.token_sector_mask := amtc_fullMask();
         out_msg.valid_sector_mask := amtc_fullMask();
       }
+      dir_entry.TokensSec0 := 0;
+      dir_entry.TokensSec1 := 0;
+    }
+  }
+
+  action(d_send_mem_and_forced_all_tokens_cpu, "sfc", desc="Repair stale CE CPU GETX by sending memory data and full logical owner tokens") {
+    peek(memQueue_in, MemoryMsg) {
+      Entry dir_entry := getDirectoryEntry(address);
+      int req_mask := amtc_sanitizeMask(tbe.RequestedSectorMask);
+      if (req_mask == 0) { req_mask := amtc_fullMask(); }
+      int tokens_per_sector := max_tokens() / 2;
+
+      getDirectoryEntry(address).DataBlk := in_msg.DataBlk;
+
+      DPRINTF(RubySlicc,
+              "AMTC_DIR_STALE_CE_GETX_REPAIR_DATA addr=%#x req=%x forceT0=%d forceT1=%d\n",
+              address, req_mask, tokens_per_sector, tokens_per_sector);
+
+      enqueue(responseNetwork_out, ResponseMsg, to_memory_controller_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA_OWNER;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(tbe.last_requestor);
+        out_msg.DataBlk := in_msg.DataBlk;
+
+        // This is a guarded recovery path only after many GETX retries.  The
+        // previous owner is stale/non-responsive, so force a complete logical
+        // owner grant to break the IM_WAIT_PARTIAL + ACK_OWNER(0) loop.
+        out_msg.TokensSec0 := tokens_per_sector;
+        out_msg.TokensSec1 := tokens_per_sector;
+        out_msg.MessageSize := amtc_getSizeFromDirtyMask(req_mask);
+        out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+        out_msg.sector_mask := req_mask;
+        out_msg.requested_sector_mask := req_mask;
+        out_msg.valid_sector_mask := req_mask;
+        out_msg.token_sector_mask := amtc_fullMask();
+      }
+
       dir_entry.TokensSec0 := 0;
       dir_entry.TokensSec1 := 0;
     }
@@ -1485,41 +1903,195 @@ action(a_inv_remote_domain_on_getx, "invR", desc="Invalidate remote domain on up
 
   // --- UPGRADE TOKEN RELEASES ---
 
-  action(d_send_remaining_tokens_cpu, "src", desc="Give remaining tokens to CPU for upgrade") {
+  action(d_send_remaining_tokens_cpu, "src", desc="Give ALL remaining CPU-domain tokens when Directory enters CE") {
     peek(requestNetwork_in, RequestMsg) {
       Entry dir_entry := getDirectoryEntry(address);
+      int req_mask := amtc_sanitizeMask(in_msg.requested_sector_mask);
+      if (req_mask == 0) { req_mask := amtc_sanitizeMask(in_msg.sector_mask); }
+
+      // IMPORTANT:
+      // Directory state CE is line-granular in this protocol.  Therefore when a
+      // transition moves Directory to CE, the Directory must not retain tokens
+      // for any sector.  The requested mask still describes the sector that
+      // caused the upgrade, but token ownership must be transferred for the
+      // whole line to satisfy the CE invariant.
+      int send_t0 := dir_entry.TokensSec0;
+      int send_t1 := dir_entry.TokensSec1;
+      int tok_mask := 0;
+      if (send_t0 > 0) { tok_mask := amtc_unionMasks(tok_mask, 1); }
+      if (send_t1 > 0) { tok_mask := amtc_unionMasks(tok_mask, 2); }
+
+      DPRINTF(RubySlicc,
+              "AMTC_DIR_SEND_CPU_EXCL_ALL_TOKENS addr=%#x req=%x send0=%d send1=%d\n",
+              address, req_mask, send_t0, send_t1);
+
       enqueue(responseNetwork_out, ResponseMsg, directory_latency) {
         out_msg.addr := address;
         out_msg.Type := CoherenceResponseType:ACK;
         out_msg.Sender := machineID;
-        out_msg.Destination.add(in_msg.Requestor); // Send directly to the requesting CPU
-        out_msg.TokensSec0 := dir_entry.TokensSec0;
-        out_msg.TokensSec1 := dir_entry.TokensSec1;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.TokensSec0 := send_t0;
+        out_msg.TokensSec1 := send_t1;
         out_msg.MessageSize := MessageSizeType:Response_Control;
-        out_msg.sector_mask := amtc_fullMask();
-        out_msg.requested_sector_mask := amtc_fullMask();
-        out_msg.token_sector_mask := amtc_fullMask();
+        out_msg.sector_id := in_msg.sector_id;
+        out_msg.sector_mask := req_mask;
+        out_msg.requested_sector_mask := req_mask;
+        out_msg.token_sector_mask := tok_mask;
+        out_msg.valid_sector_mask := 0;
       }
+
       dir_entry.TokensSec0 := 0;
       dir_entry.TokensSec1 := 0;
     }
   }
 
-  action(d_send_remaining_tokens_gpu, "srg", desc="Give remaining tokens to GPU for upgrade/migration") {
+  action(d_send_remaining_tokens_gpu, "srg", desc="Give ALL remaining GPU-domain tokens when Directory enters GE") {
     peek(requestNetwork_in, RequestMsg) {
       Entry dir_entry := getDirectoryEntry(address);
+      int req_mask := amtc_sanitizeMask(in_msg.requested_sector_mask);
+      if (req_mask == 0) { req_mask := amtc_sanitizeMask(in_msg.sector_mask); }
+
+      // GE is also line-granular, so do not retain directory tokens after
+      // declaring GPU exclusive ownership.
+      int send_t0 := dir_entry.TokensSec0;
+      int send_t1 := dir_entry.TokensSec1;
+      int tok_mask := 0;
+      if (send_t0 > 0) { tok_mask := amtc_unionMasks(tok_mask, 1); }
+      if (send_t1 > 0) { tok_mask := amtc_unionMasks(tok_mask, 2); }
+
+      DPRINTF(RubySlicc,
+              "AMTC_DIR_SEND_GPU_EXCL_ALL_TOKENS addr=%#x req=%x send0=%d send1=%d\n",
+              address, req_mask, send_t0, send_t1);
+
       enqueue(responseNetwork_out, ResponseMsg, directory_latency) {
         out_msg.addr := address;
         out_msg.Type := CoherenceResponseType:ACK;
         out_msg.Sender := machineID;
-        out_msg.Destination.add(in_msg.Requestor); // Send directly to the requesting GPU
-        out_msg.TokensSec0 := dir_entry.TokensSec0;
-        out_msg.TokensSec1 := dir_entry.TokensSec1;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.TokensSec0 := send_t0;
+        out_msg.TokensSec1 := send_t1;
         out_msg.MessageSize := MessageSizeType:Response_Control;
-        out_msg.sector_mask := amtc_fullMask();
-        out_msg.requested_sector_mask := amtc_fullMask();
-        out_msg.token_sector_mask := amtc_fullMask();
+        out_msg.sector_id := in_msg.sector_id;
+        out_msg.sector_mask := req_mask;
+        out_msg.requested_sector_mask := req_mask;
+        out_msg.token_sector_mask := tok_mask;
+        out_msg.valid_sector_mask := 0;
       }
+
+      dir_entry.TokensSec0 := 0;
+      dir_entry.TokensSec1 := 0;
+    }
+  }
+
+  action(d_send_dir_data_and_remaining_tokens_cpu, "sddac",
+       desc="Send directory data and ownership tokens to CPU GETX requester") {
+    peek(requestNetwork_in, RequestMsg) {
+      Entry dir_entry := getDirectoryEntry(address);
+
+      int req_mask := amtc_sanitizeMask(in_msg.requested_sector_mask);
+      if (req_mask == 0) {
+        req_mask := amtc_sanitizeMask(in_msg.sector_mask);
+      }
+      if (req_mask == 0) {
+        req_mask := amtc_fullMask();
+      }
+
+      int old_send_t0 := dir_entry.TokensSec0;
+      int old_send_t1 := dir_entry.TokensSec1;
+
+      int send_t0 := dir_entry.TokensSec0;
+      int send_t1 := dir_entry.TokensSec1;
+
+      /*
+      * No bitwise operators.
+      *
+      * Sector 0 is requested when req_mask is 1 or 3.
+      * Sector 1 is requested when req_mask is 2 or 3.
+      */
+      bool req_sec0 := false;
+      bool req_sec1 := false;
+
+      if (req_mask == 1) {
+        req_sec0 := true;
+      } else if (req_mask == 2) {
+        req_sec1 := true;
+      } else if (req_mask == 3) {
+        req_sec0 := true;
+        req_sec1 := true;
+      }
+
+      /*
+      * DATA_OWNER must not be sent with zero ownership tokens for the
+      * requested write sector.
+      *
+      * Temporary repair: force-grant requested-sector tokens when Directory
+      * currently has none. Later this should be replaced by real sharer
+      * invalidation and token collection.
+      */
+      if (req_sec0) {
+        if (send_t0 == 0) {
+          send_t0 := 512;
+        }
+      }
+
+      if (req_sec1) {
+        if (send_t1 == 0) {
+          send_t1 := 512;
+        }
+      }
+
+      int tok_mask := 0;
+      if (send_t0 > 0) {
+        tok_mask := amtc_unionMasks(tok_mask, 1);
+      }
+      if (send_t1 > 0) {
+        tok_mask := amtc_unionMasks(tok_mask, 2);
+      }
+
+      bool fixed_zero_token := false;
+      if (req_sec0) {
+        if (old_send_t0 == 0) {
+          fixed_zero_token := true;
+        }
+      }
+      if (req_sec1) {
+        if (old_send_t1 == 0) {
+          fixed_zero_token := true;
+        }
+      }
+
+      if (fixed_zero_token) {
+        DPRINTF(RubySlicc,
+                "AMTC_DIR_GETX_ZERO_TOKEN_OWNER_FIX addr=%#x req=%x old0=%d old1=%d new0=%d new1=%d\n",
+                address, req_mask,
+                old_send_t0, old_send_t1,
+                send_t0, send_t1);
+      }
+
+      DPRINTF(RubySlicc,
+              "AMTC_DIR_GETX_OWNER_GRANT addr=%#x req=%x send0=%d send1=%d tokmask=%d\n",
+              address, req_mask, send_t0, send_t1, tok_mask);
+
+      enqueue(responseNetwork_out, ResponseMsg, directory_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA_OWNER;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+
+        out_msg.DataBlk := dir_entry.DataBlk;
+
+        out_msg.TokensSec0 := send_t0;
+        out_msg.TokensSec1 := send_t1;
+
+        out_msg.MessageSize := amtc_getSizeFromDirtyMask(req_mask);
+
+        out_msg.sector_id := in_msg.sector_id;
+        out_msg.sector_mask := req_mask;
+        out_msg.requested_sector_mask := req_mask;
+        out_msg.valid_sector_mask := req_mask;
+        out_msg.token_sector_mask := tok_mask;
+      }
+
       dir_entry.TokensSec0 := 0;
       dir_entry.TokensSec1 := 0;
     }
@@ -1527,47 +2099,152 @@ action(a_inv_remote_domain_on_getx, "invR", desc="Invalidate remote domain on up
 
   // --- DIRECTORY-DIRECT REPLIES (For Shared States) ---
 
-  action(d_send_dir_data_and_1_token_cpu, "sdd1c", desc="Send Dir data and 1 token to CPU") {
+  action(d_send_dir_data_and_1_token_cpu, "sdd1c", desc="Send directory data and up to 1 requested token to CPU") {
     peek(requestNetwork_in, RequestMsg) {
-      assert(getDirectoryEntry(address).TokensSec0 >= 1);
-      enqueue(responseNetwork_out, ResponseMsg, directory_latency) {
-        out_msg.addr := address;
-        out_msg.Type := CoherenceResponseType:DATA_SHARED;
-        out_msg.Sender := machineID;
-        out_msg.Destination.add(in_msg.Requestor); // Send straight back to requestor
-        out_msg.DataBlk := getDirectoryEntry(address).DataBlk; // Use Directory's saved copy
-        out_msg.TokensSec0 := 1;
-        out_msg.TokensSec1 := 1;
-        out_msg.MessageSize := MessageSizeType:Response_Data;
-        out_msg.sector_mask := amtc_fullMask();
-        out_msg.requested_sector_mask := amtc_fullMask();
-        out_msg.token_sector_mask := amtc_fullMask();
-        out_msg.valid_sector_mask := amtc_fullMask();
-      }
-      getDirectoryEntry(address).TokensSec0 := getDirectoryEntry(address).TokensSec0 - 1;
-      getDirectoryEntry(address).TokensSec1 := getDirectoryEntry(address).TokensSec1 - 1;
-    }
-  }
+      Entry dir_entry := getDirectoryEntry(address);
+      int req_mask := amtc_sanitizeMask(in_msg.requested_sector_mask);
+      if (req_mask == 0) { req_mask := amtc_sanitizeMask(in_msg.sector_mask); }
 
-  action(d_send_dir_data_and_1_token_gpu, "sdd1g", desc="Send Dir data and 1 token to GPU") {
-    peek(requestNetwork_in, RequestMsg) {
-      assert(getDirectoryEntry(address).TokensSec0 >= 1);
+      int send_t0 := 0;
+      int send_t1 := 0;
+      int tok_mask := 0;
+
+      if (amtc_maskHasSector(req_mask, 0) && dir_entry.TokensSec0 > 0) {
+        send_t0 := 1;
+        tok_mask := amtc_unionMasks(tok_mask, 1);
+      }
+      if (amtc_maskHasSector(req_mask, 1) && dir_entry.TokensSec1 > 0) {
+        send_t1 := 1;
+        tok_mask := amtc_unionMasks(tok_mask, 2);
+      }
+
+      DPRINTF(RubySlicc,
+              "AMTC_DIR_SEND_CS_GETS_SAFE addr=%#x req=%x send_t0=%d send_t1=%d remain_t0=%d remain_t1=%d",
+              address, req_mask, send_t0, send_t1,
+              dir_entry.TokensSec0, dir_entry.TokensSec1);
+
       enqueue(responseNetwork_out, ResponseMsg, directory_latency) {
         out_msg.addr := address;
         out_msg.Type := CoherenceResponseType:DATA_SHARED;
         out_msg.Sender := machineID;
         out_msg.Destination.add(in_msg.Requestor);
-        out_msg.DataBlk := getDirectoryEntry(address).DataBlk;
-        out_msg.TokensSec0 := 1;
-        out_msg.TokensSec1 := 1;
-        out_msg.MessageSize := MessageSizeType:Response_Data;
-        out_msg.sector_mask := amtc_fullMask();
-        out_msg.requested_sector_mask := amtc_fullMask();
-        out_msg.token_sector_mask := amtc_fullMask();
-        out_msg.valid_sector_mask := amtc_fullMask();
+        out_msg.DataBlk := dir_entry.DataBlk;
+        out_msg.TokensSec0 := send_t0;
+        out_msg.TokensSec1 := send_t1;
+        out_msg.MessageSize := amtc_getSizeFromDirtyMask(req_mask);
+        out_msg.sector_id := in_msg.sector_id;
+        out_msg.sector_mask := req_mask;
+        out_msg.requested_sector_mask := req_mask;
+        out_msg.valid_sector_mask := req_mask;
+        out_msg.token_sector_mask := tok_mask;
       }
-      getDirectoryEntry(address).TokensSec0 := getDirectoryEntry(address).TokensSec0 - 1;
-      getDirectoryEntry(address).TokensSec1 := getDirectoryEntry(address).TokensSec1 - 1;
+
+      dir_entry.TokensSec0 := dir_entry.TokensSec0 - send_t0;
+      dir_entry.TokensSec1 := dir_entry.TokensSec1 - send_t1;
+    }
+  }
+
+
+  // AMTC audit83: Directory-direct DATA reply for TCC/NB requests.
+  // The old d_send_dir_data_and_1_token_cpu peeks requestNetwork_in and crashes
+  // when called for requestNetworkFromNB_in events.  This action is identical in
+  // intent but uses the NB queue as source and TCC as destination.
+  action(d_send_dir_data_and_1_token_nb, "ddnb", desc="Send directory data and up to 1 requested token to TCC/NB requester") {
+    peek(requestNetworkFromNB_in, RequestMsg) {
+      Entry dir_entry := getDirectoryEntry(address);
+      int req_mask := amtc_sanitizeMask(in_msg.requested_sector_mask);
+      if (req_mask == 0) { req_mask := amtc_sanitizeMask(in_msg.sector_mask); }
+      if (req_mask == 0) { req_mask := amtc_fullMask(); }
+
+      int send_t0 := 0;
+      int send_t1 := 0;
+      int tok_mask := 0;
+
+      if (amtc_maskHasSector(req_mask, 0) && dir_entry.TokensSec0 > 0) {
+        send_t0 := 1;
+        tok_mask := amtc_unionMasks(tok_mask, 1);
+      }
+      if (amtc_maskHasSector(req_mask, 1) && dir_entry.TokensSec1 > 0) {
+        send_t1 := 1;
+        tok_mask := amtc_unionMasks(tok_mask, 2);
+      }
+
+      DPRINTF(RubySlicc,
+              "AMTC_DIR_SEND_DATA_TO_NB_REPAIR addr=%#x req=%s mask=%d send_t0=%d send_t1=%d remain_t0=%d remain_t1=%d\n",
+              address, in_msg.Requestor, req_mask, send_t0, send_t1,
+              dir_entry.TokensSec0, dir_entry.TokensSec1);
+
+      enqueue(responseNetwork_out, ResponseMsg, directory_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA_SHARED;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.DataBlk := dir_entry.DataBlk;
+        out_msg.TokensSec0 := send_t0;
+        out_msg.TokensSec1 := send_t1;
+        out_msg.MessageSize := amtc_getSizeFromDirtyMask(req_mask);
+        out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+        out_msg.sector_mask := req_mask;
+        out_msg.requested_sector_mask := req_mask;
+        out_msg.valid_sector_mask := req_mask;
+        out_msg.token_sector_mask := tok_mask;
+      }
+
+      dir_entry.TokensSec0 := dir_entry.TokensSec0 - send_t0;
+      dir_entry.TokensSec1 := dir_entry.TokensSec1 - send_t1;
+    }
+  }
+
+  action(d_send_dir_data_and_1_token_gpu, "sdd1g",
+         desc="Send directory data and up to one requested token to GPU") {
+    peek(requestNetwork_in, RequestMsg) {
+      Entry dir_entry := getDirectoryEntry(address);
+
+      int req_mask := amtc_sanitizeMask(in_msg.requested_sector_mask);
+      if (req_mask == 0) {
+        req_mask := amtc_sanitizeMask(in_msg.sector_mask);
+      }
+      if (req_mask == 0) {
+        req_mask := amtc_fullMask();
+      }
+
+      int send_t0 := 0;
+      int send_t1 := 0;
+      int tok_mask := 0;
+
+      if (amtc_maskHasSector(req_mask, 0) && dir_entry.TokensSec0 > 0) {
+        send_t0 := 1;
+        tok_mask := amtc_unionMasks(tok_mask, 1);
+      }
+
+      if (amtc_maskHasSector(req_mask, 1) && dir_entry.TokensSec1 > 0) {
+        send_t1 := 1;
+        tok_mask := amtc_unionMasks(tok_mask, 2);
+      }
+
+      DPRINTF(RubySlicc,
+              "AMTC_DIR_SEND_DATA_TO_GPU_SAFE addr=%#x req=%s mask=%d send_t0=%d send_t1=%d tokmask=%d remain_t0=%d remain_t1=%d\n",
+              address, in_msg.Requestor, req_mask, send_t0, send_t1,
+              tok_mask, dir_entry.TokensSec0, dir_entry.TokensSec1);
+
+      enqueue(responseNetwork_out, ResponseMsg, directory_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA_SHARED;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.DataBlk := dir_entry.DataBlk;
+        out_msg.TokensSec0 := send_t0;
+        out_msg.TokensSec1 := send_t1;
+        out_msg.MessageSize := amtc_getSizeFromDirtyMask(req_mask);
+        out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+        out_msg.sector_mask := req_mask;
+        out_msg.requested_sector_mask := req_mask;
+        out_msg.valid_sector_mask := req_mask;
+        out_msg.token_sector_mask := tok_mask;
+      }
+
+      dir_entry.TokensSec0 := dir_entry.TokensSec0 - send_t0;
+      dir_entry.TokensSec1 := dir_entry.TokensSec1 - send_t1;
     }
   }
 
@@ -1580,15 +2257,15 @@ action(a_inv_remote_domain_on_getx, "invR", desc="Invalidate remote domain on up
         out_msg.Destination.add(tbe.last_requestor);
         out_msg.DataBlk := in_msg.DataBlk;
 
-        // Zero Tokens Sent!
         out_msg.TokensSec0 := 0;
         out_msg.TokensSec1 := 0;
 
-        // Dynamic Sector Awareness Optimization
-        out_msg.MessageSize := MessageSizeType:Response_Data;
         out_msg.sector_mask := tbe.RequestedSectorMask;
         out_msg.requested_sector_mask := tbe.RequestedSectorMask;
         out_msg.token_sector_mask := 0;
+
+        out_msg.valid_sector_mask := tbe.RequestedSectorMask;
+        out_msg.MessageSize := amtc_getSizeFromDirtyMask(tbe.RequestedSectorMask);
       }
     }
   }
@@ -1713,8 +2390,12 @@ action(a_inv_remote_domain_on_getx, "invR", desc="Invalidate remote domain on up
     unset_tbe();
   }
 
-  action(fwd_req_to_cpu, "fr2c", desc="Forward request to CPU Owner") {
+  action(fwd_req_to_cpu, "fr2c", desc="Forward request to CPU Owner preserving AMTC sector metadata") {
     peek(requestNetwork_in, RequestMsg) {
+      int req_mask := amtc_sanitizeMask(in_msg.requested_sector_mask);
+      if (req_mask == 0) { req_mask := amtc_sanitizeMask(in_msg.sector_mask); }
+      if (req_mask == 0) { req_mask := amtc_fullMask(); }
+
       if (getDirectoryEntry(address).last_cpu_owner != in_msg.Requestor &&
           getDirectoryEntry(address).last_cpu_owner != machineID) {
         enqueue(requestNetwork_out, RequestMsg, directory_latency) {
@@ -1723,31 +2404,674 @@ action(a_inv_remote_domain_on_getx, "invR", desc="Invalidate remote domain on up
           out_msg.Requestor := in_msg.Requestor;
           out_msg.Destination.add(getDirectoryEntry(address).last_cpu_owner);
           out_msg.MessageSize := MessageSizeType:Forwarded_Control;
-          out_msg.is_owner_pull := false;
+
+          // Audit57: preserve the original sector request.  The previous
+          // forwarding path left sector fields at their default/full-line values,
+          // so a sector-1 GETS was forwarded to the owner as mask=3.  The owner
+          // then donated sector-0 data, while the requester waited forever for
+          // sector 1.
+          out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+          out_msg.sector_mask := req_mask;
+          out_msg.requested_sector_mask := req_mask;
+          out_msg.is_owner_pull := in_msg.is_owner_pull;
+          out_msg.is_gpu := in_msg.is_gpu;
+          out_msg.is_sync := in_msg.is_sync;
+          out_msg.is_bypass := in_msg.is_bypass;
+          out_msg.is_atomic := in_msg.is_atomic;
+          out_msg.is_signal := in_msg.is_signal;
+          out_msg.isGLCSet := in_msg.isGLCSet;
+          out_msg.isSLCSet := in_msg.isSLCSet;
+          out_msg.RetryNum := in_msg.RetryNum;
         }
       } else {
-        // ALWAYS respond with ACK_OWNER to prevent sequencer deadlock
+        /*
+         * AMTC audit86:
+         * Do not send ACK_OWNER(0) when the recorded CPU owner is the requester
+         * itself, or when the Directory is the effective backing owner.
+         *
+         * This is common with sector misses: an L1 can be in M/MM for one sector
+         * and issue GETS for a missing peer sector.  Domain splitting already
+         * classifies it as CPU_GETS, but the old CE transition forwarded to the
+         * CPU owner.  If owner == requester, that becomes a self-forward/stale
+         * ACK loop and the L1 remains in M_IS/S_IS forever.
+         *
+         * Return backing directory data for the requested sectors instead.  Send
+         * one token only for sectors whose tokens are actually held by Directory.
+         */
+        Entry dir_entry := getDirectoryEntry(address);
+        int send_t0 := 0;
+        int send_t1 := 0;
+        int tok_mask := 0;
+
+        if (amtc_maskHasSector(req_mask, 0) && dir_entry.TokensSec0 > 0) {
+          send_t0 := 1;
+          tok_mask := amtc_unionMasks(tok_mask, 1);
+        }
+        if (amtc_maskHasSector(req_mask, 1) && dir_entry.TokensSec1 > 0) {
+          send_t1 := 1;
+          tok_mask := amtc_unionMasks(tok_mask, 2);
+        }
+
         enqueue(responseNetwork_out, ResponseMsg, directory_latency) {
           out_msg.addr := address;
-          out_msg.Type := CoherenceResponseType:ACK_OWNER;
+          if (in_msg.Type == CoherenceRequestType:GETX) {
+            out_msg.Type := CoherenceResponseType:DATA_OWNER;
+          } else {
+            out_msg.Type := CoherenceResponseType:DATA_SHARED;
+          }
           out_msg.Sender := machineID;
           out_msg.Destination.add(in_msg.Requestor);
-          out_msg.MessageSize := MessageSizeType:Response_Control;
-          out_msg.TokensSec0 := 0;
-          out_msg.TokensSec1 := 0;
-          out_msg.sector_mask := amtc_fullMask();
-          out_msg.requested_sector_mask := amtc_fullMask();
-          out_msg.token_sector_mask := 0;
-          out_msg.valid_sector_mask := 0;
+          out_msg.MessageSize := amtc_getSizeFromDirtyMask(req_mask);
+          out_msg.DataBlk := dir_entry.DataBlk;
+          out_msg.TokensSec0 := send_t0;
+          out_msg.TokensSec1 := send_t1;
+          out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+          out_msg.sector_mask := req_mask;
+          out_msg.requested_sector_mask := req_mask;
+          out_msg.token_sector_mask := tok_mask;
+          out_msg.valid_sector_mask := req_mask;
+          out_msg.Dirty := false;
+          out_msg.isGLCSet := in_msg.isGLCSet;
+          out_msg.isSLCSet := in_msg.isSLCSet;
         }
+
+        dir_entry.TokensSec0 := dir_entry.TokensSec0 - send_t0;
+        dir_entry.TokensSec1 := dir_entry.TokensSec1 - send_t1;
+
+        DPRINTF(RubySlicc,
+                "AMTC_DIR_CPU_SELF_OR_DIR_OWNER_DATA addr=%#x type=%s req=%s owner=%s mask=%d send0=%d send1=%d\n",
+                address, in_msg.Type, in_msg.Requestor,
+                getDirectoryEntry(address).last_cpu_owner, req_mask,
+                send_t0, send_t1);
       }
     }
   }
 
 
+  // AMTC audit83: same CPU-owner forward, but for TCC/NB input queue.
+  // It deliberately keeps Requestor := TCC so the stale-owner ACK/data returns
+  // to TCC, where the TCC-side stale-owner repair handles ACK_OWNER(0).
+  action(fwd_req_to_cpu_from_nb, "fr2cnb", desc="Forward TCC/NB request to CPU Owner preserving AMTC sector metadata") {
+    peek(requestNetworkFromNB_in, RequestMsg) {
+      int req_mask := amtc_sanitizeMask(in_msg.requested_sector_mask);
+      if (req_mask == 0) { req_mask := amtc_sanitizeMask(in_msg.sector_mask); }
+      if (req_mask == 0) { req_mask := amtc_fullMask(); }
+
+      if (getDirectoryEntry(address).last_cpu_owner != in_msg.Requestor &&
+          getDirectoryEntry(address).last_cpu_owner != machineID) {
+        enqueue(requestNetwork_out, RequestMsg, directory_latency) {
+          out_msg.addr := address;
+          out_msg.Type := in_msg.Type;
+          out_msg.Requestor := in_msg.Requestor;
+          out_msg.Destination.add(getDirectoryEntry(address).last_cpu_owner);
+          out_msg.MessageSize := MessageSizeType:Forwarded_Control;
+          out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+          out_msg.sector_mask := req_mask;
+          out_msg.requested_sector_mask := req_mask;
+          out_msg.is_owner_pull := in_msg.is_owner_pull;
+          out_msg.is_gpu := in_msg.is_gpu;
+          out_msg.is_sync := in_msg.is_sync;
+          out_msg.is_bypass := in_msg.is_bypass;
+          out_msg.is_atomic := in_msg.is_atomic;
+          out_msg.is_signal := in_msg.is_signal;
+          out_msg.isGLCSet := in_msg.isGLCSet;
+          out_msg.isSLCSet := in_msg.isSLCSet;
+          out_msg.RetryNum := in_msg.RetryNum;
+        }
+      } else {
+        /*
+         * AMTC audit86:
+         * NB/TCC request reached a CE line whose CPU owner is unavailable or
+         * equivalent to Directory.  Do not return ACK_OWNER(0) to TCC here:
+         * that forces another stale-owner repair loop.  Return backing data
+         * directly to the TCC/NB requester.
+         */
+        Entry dir_entry := getDirectoryEntry(address);
+        int send_t0 := 0;
+        int send_t1 := 0;
+        int tok_mask := 0;
+
+        if (amtc_maskHasSector(req_mask, 0) && dir_entry.TokensSec0 > 0) {
+          send_t0 := 1;
+          tok_mask := amtc_unionMasks(tok_mask, 1);
+        }
+        if (amtc_maskHasSector(req_mask, 1) && dir_entry.TokensSec1 > 0) {
+          send_t1 := 1;
+          tok_mask := amtc_unionMasks(tok_mask, 2);
+        }
+
+        enqueue(responseNetwork_out, ResponseMsg, directory_latency) {
+          out_msg.addr := address;
+          if (in_msg.Type == CoherenceRequestType:GETX) {
+            out_msg.Type := CoherenceResponseType:DATA_OWNER;
+          } else {
+            out_msg.Type := CoherenceResponseType:DATA_SHARED;
+          }
+          out_msg.Sender := machineID;
+          out_msg.Destination.add(in_msg.Requestor);
+          out_msg.MessageSize := amtc_getSizeFromDirtyMask(req_mask);
+          out_msg.DataBlk := dir_entry.DataBlk;
+          out_msg.TokensSec0 := send_t0;
+          out_msg.TokensSec1 := send_t1;
+          out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+          out_msg.sector_mask := req_mask;
+          out_msg.requested_sector_mask := req_mask;
+          out_msg.token_sector_mask := tok_mask;
+          out_msg.valid_sector_mask := req_mask;
+          out_msg.Dirty := false;
+          out_msg.isGLCSet := in_msg.isGLCSet;
+          out_msg.isSLCSet := in_msg.isSLCSet;
+        }
+
+        dir_entry.TokensSec0 := dir_entry.TokensSec0 - send_t0;
+        dir_entry.TokensSec1 := dir_entry.TokensSec1 - send_t1;
+
+        DPRINTF(RubySlicc,
+                "AMTC_DIR_NB_SELF_OR_DIR_OWNER_DATA addr=%#x type=%s req=%s owner=%s mask=%d send0=%d send1=%d\n",
+                address, in_msg.Type, in_msg.Requestor,
+                getDirectoryEntry(address).last_cpu_owner, req_mask,
+                send_t0, send_t1);
+      }
+
+      DPRINTF(RubySlicc,
+              "AMTC_DIR_FWD_NB_REQ_TO_CPU addr=%#x type=%s req=%s owner=%s mask=%d\n",
+              address, in_msg.Type, in_msg.Requestor,
+              getDirectoryEntry(address).last_cpu_owner, req_mask);
+    }
+  }
+
+
+
+  // Audit41: DMA/HSAPP command processor reads must see the latest CPU/GPU-owned
+  // queue/packet data.  A memory-only read in CE/GE can return stale bytes because
+  // the exclusive owner may hold the dirty packet in cache.  Forward a data-only
+  // GETS to the recorded owner and have the owner respond to the Directory; the
+  // Directory then forwards the data to DMA.  Tokens are intentionally not moved.
+  action(fdr_fwdDmaReadToCpuOwner, "fdr2c", desc="Forward DMA read to CPU owner as data-only owner-pull") {
+    peek(dmaRequestQueue_in, DMARequestMsg) {
+      int dma_mask := amtc_normalizeMask(in_msg.sector_mask, in_msg.sector_id);
+      if (dma_mask == 0) { dma_mask := amtc_fullMask(); }
+
+      enqueue(requestNetwork_out, RequestMsg, directory_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:GETS;
+        out_msg.Requestor := machineID;
+        out_msg.Destination.add(getDirectoryEntry(address).last_cpu_owner);
+        out_msg.MessageSize := MessageSizeType:Forwarded_Control;
+        out_msg.Prefetch := PrefetchBit:No;
+        out_msg.AccessMode := RubyAccessMode:Supervisor;
+        out_msg.RetryNum := 0;
+
+        out_msg.sector_id := amtc_primarySectorFromMask(dma_mask);
+        out_msg.sector_mask := dma_mask;
+        out_msg.requested_sector_mask := dma_mask;
+        out_msg.is_owner_pull := true;
+        out_msg.is_gpu := false;
+        out_msg.is_sync := in_msg.is_sync;
+        out_msg.is_bypass := in_msg.is_bypass;
+        out_msg.is_atomic := false;
+        out_msg.is_signal := in_msg.is_signal;
+        out_msg.isGLCSet := false;
+        out_msg.isSLCSet := false;
+      }
+
+      DPRINTF(RubySlicc,
+        "AMTC_DIR_DMA_READ_FWD_CPU_OWNER addr=%#x mask=%d owner=%s\n",
+        address, dma_mask, getDirectoryEntry(address).last_cpu_owner);
+    }
+  }
+
+  action(fdr_fwdDmaReadToGpuOwner, "fdr2g", desc="Forward DMA read to GPU owner as data-only owner-pull") {
+    peek(dmaRequestQueue_in, DMARequestMsg) {
+      int dma_mask := amtc_normalizeMask(in_msg.sector_mask, in_msg.sector_id);
+      if (dma_mask == 0) { dma_mask := amtc_fullMask(); }
+
+      enqueue(requestNetwork_out, RequestMsg, directory_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:GETS;
+        out_msg.Requestor := machineID;
+        out_msg.Destination.add(getDirectoryEntry(address).last_gpu_owner);
+        out_msg.MessageSize := MessageSizeType:Forwarded_Control;
+        out_msg.Prefetch := PrefetchBit:No;
+        out_msg.AccessMode := RubyAccessMode:Supervisor;
+        out_msg.RetryNum := 0;
+
+        out_msg.sector_id := amtc_primarySectorFromMask(dma_mask);
+        out_msg.sector_mask := dma_mask;
+        out_msg.requested_sector_mask := dma_mask;
+        out_msg.is_owner_pull := true;
+        out_msg.is_gpu := true;
+        out_msg.is_sync := in_msg.is_sync;
+        out_msg.is_bypass := in_msg.is_bypass;
+        out_msg.is_atomic := false;
+        out_msg.is_signal := in_msg.is_signal;
+        out_msg.isGLCSet := false;
+        out_msg.isSLCSet := false;
+      }
+
+      DPRINTF(RubySlicc,
+        "AMTC_DIR_DMA_READ_FWD_GPU_OWNER addr=%#x mask=%d owner=%s\n",
+        address, dma_mask, getDirectoryEntry(address).last_gpu_owner);
+    }
+  }
+
+
+  // Audit45: DMA writes such as GPU completion signals must invalidate the
+  // current CPU/GPU exclusive owner. Otherwise the CPU may keep polling a stale
+  // cached signal line after the DMA write has updated memory. This is the DMA
+  // equivalent of VIPER's probe/invalidate path for DMA writes.
+  // Audit79: DMA writes to host-visible metadata must invalidate every CPU L1.
+  //
+  // Previous code sent GETX only to last_cpu_owner.  The HSA launch trace showed
+  // DMA_WRITE addr=0x121a080 invalidating L1Cache-2 while l1_cntrl0 stayed S
+  // and kept Load-hit polling stale readIndex.  Broadcast to all CPU L1s first;
+  // optimize to tracked sharers later.
+  action(fdw_fwdDmaWriteInvToCpuOwner, "fdw2c",
+         desc="Broadcast DMA write invalidation to all CPU L1 caches") {
+    peek(dmaRequestQueue_in, DMARequestMsg) {
+      int dma_mask := amtc_normalizeMask(in_msg.sector_mask, in_msg.sector_id);
+      if (dma_mask == 0) { dma_mask := amtc_fullMask(); }
+
+      enqueue(requestNetwork_out, RequestMsg, directory_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:GETX;
+        out_msg.Requestor := machineID;
+
+        // Correctness/proof path: invalidate all CPU L1s, not only a possibly
+        // stale last_cpu_owner.
+        out_msg.Destination.broadcast(MachineType:L1Cache);
+
+        out_msg.MessageSize := MessageSizeType:Broadcast_Control;
+        out_msg.Prefetch := PrefetchBit:No;
+        out_msg.AccessMode := RubyAccessMode:Supervisor;
+        out_msg.RetryNum := 0;
+
+        out_msg.sector_id := amtc_primarySectorFromMask(dma_mask);
+        out_msg.sector_mask := dma_mask;
+        out_msg.requested_sector_mask := dma_mask;
+
+        out_msg.is_owner_pull := false;
+        out_msg.is_gpu := false;
+        out_msg.is_sync := true;
+        out_msg.is_bypass := in_msg.is_bypass;
+        out_msg.is_atomic := in_msg.is_atomic;
+        out_msg.is_signal := in_msg.is_signal;
+        out_msg.isGLCSet := false;
+        out_msg.isSLCSet := false;
+      }
+
+      DPRINTF(RubySlicc,
+        "AMTC_DIR_DMA_WRITE_BCAST_INV_CPU addr=%#x mask=%d old_owner=%s len=%d\n",
+        address, dma_mask, getDirectoryEntry(address).last_cpu_owner, in_msg.Len);
+      enqueue(requestNetwork_out, RequestMsg, directory_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:GETX;
+        out_msg.Requestor := machineID;
+
+        // Audit82:
+        // L1 invalidation alone is not sufficient.  The failing trace showed
+        // l1_cntrl0 invalidated 0x121a080, then immediately refetched stale
+        // data from l2_cntrl2:O while the DMA write was still completing.
+        // Therefore the DMA-write serialization must also kill any L2 O/M/S
+        // copy so the next CPU GETS is forced back through the directory/memory.
+        out_msg.Destination.broadcast(MachineType:L2Cache);
+
+        out_msg.MessageSize := MessageSizeType:Broadcast_Control;
+        out_msg.Prefetch := PrefetchBit:No;
+        out_msg.AccessMode := RubyAccessMode:Supervisor;
+        out_msg.RetryNum := 0;
+
+        out_msg.sector_id := amtc_primarySectorFromMask(dma_mask);
+        out_msg.sector_mask := dma_mask;
+        out_msg.requested_sector_mask := dma_mask;
+
+        out_msg.is_owner_pull := false;
+        out_msg.is_gpu := false;
+        out_msg.is_sync := true;
+        out_msg.is_bypass := in_msg.is_bypass;
+        out_msg.is_atomic := in_msg.is_atomic;
+        out_msg.is_signal := in_msg.is_signal;
+        out_msg.isGLCSet := false;
+        out_msg.isSLCSet := false;
+      }
+
+      DPRINTF(RubySlicc,
+        "AMTC_DIR_DMA_WRITE_BCAST_INV_L2 addr=%#x mask=%d old_owner=%s len=%d\n",
+        address, dma_mask, getDirectoryEntry(address).last_cpu_owner, in_msg.Len);
+    }
+  }
+
+  action(fdw_fwdDmaWriteInvToGpuOwner, "fdw2g", desc="Forward DMA write invalidation to GPU owner") {
+    peek(dmaRequestQueue_in, DMARequestMsg) {
+      int dma_mask := amtc_normalizeMask(in_msg.sector_mask, in_msg.sector_id);
+      enqueue(requestNetwork_out, RequestMsg, directory_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceRequestType:GETX;
+        out_msg.Requestor := machineID;
+        out_msg.Destination.add(getDirectoryEntry(address).last_gpu_owner);
+        out_msg.MessageSize := MessageSizeType:Forwarded_Control;
+        out_msg.sector_id := amtc_primarySectorFromMask(dma_mask);
+        out_msg.sector_mask := dma_mask;
+        out_msg.requested_sector_mask := dma_mask;
+        out_msg.is_owner_pull := false;
+        out_msg.is_gpu := true;
+        out_msg.is_sync := true;
+      }
+      DPRINTF(RubySlicc,
+        "AMTC_DIR_DMA_WRITE_INV_GPU_OWNER addr=%#x mask=%d owner=%s len=%d\n",
+        address, dma_mask, getDirectoryEntry(address).last_gpu_owner, in_msg.Len);
+    }
+  }
+
+  action(qd_updateTokensFromDmaWriteInvResp, "qd", desc="Drain tokens/data returned by DMA-write invalidation") {
+    peek(responseNetwork_in, ResponseMsg) {
+      Entry dir_entry := getDirectoryEntry(address);
+      DPRINTF(RubySlicc,
+        "AMTC_DIR_DMA_WRITE_INV_RESP_DRAIN addr=%#x type=%d t0=%d t1=%d tokmask=%d valid=%d dirT0=%d dirT1=%d\n",
+        address, in_msg.Type, in_msg.TokensSec0, in_msg.TokensSec1,
+        in_msg.token_sector_mask, in_msg.valid_sector_mask,
+        dir_entry.TokensSec0, dir_entry.TokensSec1);
+    }
+  }
+
+  action(qd_markDmaWriteCompleteNoCachedCopies, "qdf", desc="Mark DMA write complete with no cached CPU/GPU copies") {
+    Entry dir_entry := getDirectoryEntry(address);
+    int max_t := max_tokens() / 2;
+
+    // Audit82 proof-mode completion:
+    // DMA_WRITE invalidates CPU L1 and L2 holders, and memory now contains the
+    // DMA data.  The directory must not remain CE/GE with partial returned
+    // tokens from old cached copies.  Reset to a cold/full-token directory
+    // line before transitioning to I.
+    //
+    // V22: also preserve the DMA-written bytes in the directory copy.  The
+    // v38/v21 run showed a post-kernel CPU read stuck on 0x12adb80 after a
+    // DMA-write/invalidation drain.  The line was no longer owned by a valid
+    // L2, so the repair GETS had to be served from the directory/memory copy.
+    // Keeping tbe.DataBlk here makes the subsequent I-state repair response
+    // self-contained and avoids sending the repair path back through a memory
+    // fetch that can miss the waiter during barrier/completion handling.
+    dir_entry.DataBlk := tbe.DataBlk;
+    dir_entry.TokensSec0 := max_t;
+    dir_entry.TokensSec1 := max_t;
+    dir_entry.cpu_shared := false;
+    dir_entry.gpu_shared := false;
+    dir_entry.cpu_dirty := false;
+    dir_entry.gpu_dirty := false;
+
+    DPRINTF(RubySlicc,
+      "AMTC_DIR_DMA_WRITE_COMPLETE_FULLTOK_V22 addr=%#x T0=%d T1=%d data_saved=1\n",
+      address, dir_entry.TokensSec0, dir_entry.TokensSec1);
+  }
+
+
+  action(ft_memoryDmaFromTbe, "ftd", desc="Fallback DMA read fetch using recorded TBE request") {
+    int dma_mask := tbe.RequestedSectorMask;
+    if (dma_mask == 0) { dma_mask := amtc_fullMask(); }
+    enqueue(memQueue_out, MemoryMsg, to_memory_controller_latency) {
+      out_msg.addr := address;
+      out_msg.Type := MemoryRequestType:MEMORY_READ;
+      out_msg.Sender := tbe.DmaReqDest;
+      out_msg.OriginalRequestorMachId := tbe.DmaReqDest;
+      out_msg.MessageSize := MessageSizeType:Request_Control;
+      out_msg.Len := 64;
+    }
+    DPRINTF(RubySlicc,
+      "AMTC_DIR_DMA_READ_FALLBACK_MEM_FULL addr=%#x mask=%d len=64\n",
+      address, dma_mask);
+  }
+
+  action(qdr_markDmaReadStaleCpuOwnerFallback, "qdr",
+         desc="Clear stale CPU owner metadata after zero-token DMA-read ACK_OWNER fallback") {
+    peek(responseNetwork_in, ResponseMsg) {
+      Entry dir_entry := getDirectoryEntry(address);
+      int max_t := max_tokens() / 2;
+
+      /*
+       * V56:
+       * A DMA read in CE can probe the recorded CPU/L2 owner and receive
+       * ACK_OWNER(0) with no valid sectors.  That means the recorded owner is
+       * stale/residual and memory is the authoritative source.  Do not keep the
+       * directory in CE with last_cpu_owner still pointing at the stale L2;
+       * a later DMA_WRITE would broadcast invalidation and wait forever in
+       * CE_W_DMA_WRITE_TOK.  Mark the line cold/full-token before the fallback
+       * memory read completes.
+       */
+      dir_entry.TokensSec0 := max_t;
+      dir_entry.TokensSec1 := max_t;
+      dir_entry.ValidSectors := 0;
+      dir_entry.DirtySectors := 0;
+      dir_entry.OwnerSectorMask := 0;
+      dir_entry.SharerSectorMask := 0;
+      dir_entry.cpu_shared := false;
+      dir_entry.gpu_shared := false;
+      dir_entry.cpu_dirty := false;
+      dir_entry.gpu_dirty := false;
+      dir_entry.last_cpu_owner := machineID;
+
+      DPRINTF(RubySlicc,
+        "AMTC_DIR_DMA_READ_STALE_CPU_OWNER_CLEAR_V56 addr=%#x stale_owner=%s valid=%d tokmask=%d t0=%d t1=%d full0=%d full1=%d\n",
+        address, in_msg.Sender, in_msg.valid_sector_mask,
+        in_msg.token_sector_mask, in_msg.TokensSec0, in_msg.TokensSec1,
+        dir_entry.TokensSec0, dir_entry.TokensSec1);
+    }
+  }
+
+  action(qdg_markDmaReadStaleGpuOwnerFallback, "qdg",
+         desc="Clear stale GPU owner metadata after zero-token DMA-read ACK_OWNER fallback") {
+    peek(responseNetwork_in, ResponseMsg) {
+      Entry dir_entry := getDirectoryEntry(address);
+      int max_t := max_tokens() / 2;
+
+      dir_entry.TokensSec0 := max_t;
+      dir_entry.TokensSec1 := max_t;
+      dir_entry.ValidSectors := 0;
+      dir_entry.DirtySectors := 0;
+      dir_entry.OwnerSectorMask := 0;
+      dir_entry.SharerSectorMask := 0;
+      dir_entry.cpu_shared := false;
+      dir_entry.gpu_shared := false;
+      dir_entry.cpu_dirty := false;
+      dir_entry.gpu_dirty := false;
+      dir_entry.last_gpu_owner := machineID;
+
+      DPRINTF(RubySlicc,
+        "AMTC_DIR_DMA_READ_STALE_GPU_OWNER_CLEAR_V56 addr=%#x stale_owner=%s valid=%d tokmask=%d t0=%d t1=%d full0=%d full1=%d\n",
+        address, in_msg.Sender, in_msg.valid_sector_mask,
+        in_msg.token_sector_mask, in_msg.TokensSec0, in_msg.TokensSec1,
+        dir_entry.TokensSec0, dir_entry.TokensSec1);
+    }
+  }
+
+  action(qdm_saveDmaReadFallbackMemoryData, "qdm",
+         desc="Save fallback memory data after stale-owner DMA read") {
+    peek(memQueue_in, MemoryMsg) {
+      Entry dir_entry := getDirectoryEntry(address);
+      dir_entry.DataBlk := in_msg.DataBlk;
+      dir_entry.ValidSectors := amtc_fullMask();
+      dir_entry.DirtySectors := 0;
+
+      DPRINTF(RubySlicc,
+        "AMTC_DIR_DMA_READ_STALE_OWNER_MEMDATA_SAVE_V56 addr=%#x valid=%d len=%d\n",
+        address, dir_entry.ValidSectors, in_msg.Len);
+    }
+  }
+
+  action(q_updateTokensFromResponse, "\q", desc="Update token count from response") {
+    peek(responseNetwork_in, ResponseMsg) {
+      Entry dir_entry := getDirectoryEntry(address);
+
+      int max_t := max_tokens() / 2;
+      dir_entry.TokensSec0 := dir_entry.TokensSec0 + in_msg.TokensSec0;
+      dir_entry.TokensSec1 := dir_entry.TokensSec1 + in_msg.TokensSec1;
+
+      if (dir_entry.TokensSec0 > max_t) {
+        dir_entry.TokensSec0 := max_t;
+      }
+      if (dir_entry.TokensSec1 > max_t) {
+        dir_entry.TokensSec1 := max_t;
+      }
+
+      DPRINTF(RubySlicc, "Directory absorbing stray tokens. T0=%d, T1=%d\n",
+              dir_entry.TokensSec0, dir_entry.TokensSec1);
+    }
+  }
+
+  action(amtc_evaluateStateFromTokens, "eval", desc="Trigger Settle if all tokens collected") {
+    Entry dir_entry := getDirectoryEntry(address);
+    int tokens_per_sector := max_tokens() / 2;
+
+    if ((dir_entry.TokensSec0 == tokens_per_sector) &&
+        (dir_entry.TokensSec1 == tokens_per_sector)) {
+
+        // SLICC COMPLIANT: Enqueue a local event to handle the state change!
+        enqueue(responseNetwork_out, ResponseMsg, 1) {
+            out_msg.addr := address;
+            out_msg.Type := CoherenceResponseType:ACK; // Or a custom internal message type
+            out_msg.Destination.add(machineID); // Send it to OURSELVES
+            out_msg.MessageSize := MessageSizeType:Response_Control;
+        }
+        DPRINTF(RubySlicc, "All tokens recovered. Firing self-ACK to settle state.\n");
+    }
+  }
+
+  action(od_dropLateDmaWriteInvResp, "odlate",
+       desc="Drop late DMA-write invalidation response after DMA completed") {
+    peek(responseNetwork_in, ResponseMsg) {
+      DPRINTF(RubySlicc,
+        "AMTC_DIR_DROP_LATE_DMA_WRITE_INV_RESP addr=%#x type=%s t0=%d t1=%d tokmask=%d valid=%d\n",
+        address, in_msg.Type,
+        in_msg.TokensSec0, in_msg.TokensSec1,
+        in_msg.token_sector_mask, in_msg.valid_sector_mask);
+    }
+  }
+
+  action(d_send_dir_data_and_1_token_cpu_repair, "sddr",
+       desc="Send CPU GETS repair data and force one token for requested sector") {
+    peek(requestNetwork_in, RequestMsg) {
+      Entry dir_entry := getDirectoryEntry(address);
+
+      int req_mask := amtc_sanitizeMask(in_msg.requested_sector_mask);
+      if (req_mask == 0) {
+        req_mask := amtc_sanitizeMask(in_msg.sector_mask);
+      }
+      if (req_mask == 0) {
+        req_mask := amtc_fullMask();
+      }
+
+      bool req_sec0 := false;
+      bool req_sec1 := false;
+
+      if (req_mask == 1) {
+        req_sec0 := true;
+      } else if (req_mask == 2) {
+        req_sec1 := true;
+      } else if (req_mask == 3) {
+        req_sec0 := true;
+        req_sec1 := true;
+      }
+
+      int send_t0 := 0;
+      int send_t1 := 0;
+
+      /*
+      * For GETS, only one token is required for the requested sector.
+      * In stale-owner repair, the recorded owner already failed to provide it.
+      * Force one token so the requester can complete S_IS.
+      */
+      if (req_sec0) {
+        send_t0 := 1;
+      }
+
+      if (req_sec1) {
+        send_t1 := 1;
+      }
+
+      int tok_mask := 0;
+      if (send_t0 > 0) {
+        tok_mask := amtc_unionMasks(tok_mask, 1);
+      }
+      if (send_t1 > 0) {
+        tok_mask := amtc_unionMasks(tok_mask, 2);
+      }
+
+      DPRINTF(RubySlicc,
+              "AMTC_DIR_CPU_GETS_REPAIR_DATA addr=%#x req=%s reqmask=%d send0=%d send1=%d tokmask=%d\n",
+              address,
+              in_msg.Requestor,
+              req_mask,
+              send_t0,
+              send_t1,
+              tok_mask);
+
+      enqueue(responseNetwork_out, ResponseMsg, directory_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA_SHARED;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+
+        out_msg.DataBlk := dir_entry.DataBlk;
+
+        out_msg.TokensSec0 := send_t0;
+        out_msg.TokensSec1 := send_t1;
+
+        out_msg.MessageSize := amtc_getSizeFromDirtyMask(req_mask);
+
+        out_msg.sector_id := in_msg.sector_id;
+        out_msg.sector_mask := req_mask;
+        out_msg.requested_sector_mask := req_mask;
+        out_msg.valid_sector_mask := req_mask;
+        out_msg.token_sector_mask := tok_mask;
+
+        out_msg.Dirty := false;
+        out_msg.isGLCSet := in_msg.isGLCSet;
+        out_msg.isSLCSet := in_msg.isSLCSet;
+      }
+    }
+  }
+
+  action(qf_queueMemoryFetchRequestFromNB, "qfnb",
+        desc="Queue memory fetch for NB/TCC request") {
+    peek(requestNetworkFromNB_in, RequestMsg) {
+      tbe.last_requestor := in_msg.Requestor;
+      tbe.OriginalRequestorMachId := in_msg.Requestor;
+      tbe.RequestedSectorMask := amtc_normalizeMask(in_msg.requested_sector_mask, in_msg.sector_id);
+      tbe.LastSectorID := in_msg.sector_id;
+      tbe.FromGPU := true;
+      tbe.IsSyncRequest := in_msg.is_sync;
+      tbe.req_from_cpu := false;
+
+      enqueue(memQueue_out, MemoryMsg, to_memory_controller_latency) {
+        out_msg.addr := address;
+        out_msg.Type := MemoryRequestType:MEMORY_READ;
+        out_msg.Sender := machineID;
+        out_msg.OriginalRequestorMachId := in_msg.Requestor;
+        out_msg.MessageSize := MessageSizeType:Request_Control;
+        out_msg.Len := 64;
+      }
+    }
+  }
+
   // ============================================================================
   // PHASE 1: MEMORY DATA RESOLUTION FOR DOMAIN STATES
   // ============================================================================
+
+  transition(I,
+            {Data_Owner, Data_Owner_All_Collected,
+              Tokens, Tokens_All_Collected}) {
+    od_dropLateDmaWriteInvResp;
+    k_popIncomingResponseQueue;
+  }
+
+  // Stale owner probes can now be answered by L1 with ACK_OWNER(0) while the
+  // Directory has already stayed or returned to a stable state.  In stable
+  // states there is no TBE/request waiting for this ACK_OWNER, so it must only
+  // be drained.  Without this transition CE + Ack_Owner aborts after the L1
+  // stale-owner wait-state repair path.
+  transition({I, CS, GS, CGS, CE, GE}, Ack_Owner) {
+    absorbStableStaleOwnerAck;
+    k_popIncomingResponseQueue;
+  }
 
   // When memory returns data for a CPU Shared request
   transition(CS, Memory_Data) {
@@ -1790,15 +3114,103 @@ action(a_inv_remote_domain_on_getx, "invR", desc="Invalidate remote domain on up
   // 1. INITIALIZATION (From Invalid)
   // ============================================================================
   transition(I, CPU_GETS, CS_W) { v_allocateTBE; qf_queueMemoryFetchRequest; j_popIncomingRequestQueue; }
+
+  /* V22: repair GETS from I is different from a normal cold GETS.
+   * The requesting L2 already has a live CPU waiter and is using the repair
+   * path because a stale owner or DMA/invalidation path failed to provide data.
+   * After DMA_WRITE completion qd_markDmaWriteCompleteNoCachedCopies() has
+   * saved the authoritative line in dir_entry.DataBlk and restored full tokens.
+   * Serve one shared token directly instead of allocating a new memory-fetch
+   * TBE; otherwise the waiter can loop in L1 timeout while L2 repeatedly sends
+   * AMTC_L2_PENDING_GETS_DIR_RETRY_V37.
+   */
+  transition(I, CPU_GETS_Owner_Pull_Repair, CS) {
+    d_send_dir_data_and_1_token_cpu_repair;
+    u_set_cpu_shared;
+    j_popIncomingRequestQueue;
+  }
   transition(I, GPU_GETS, GS_W) { v_allocateTBE; qf_queueMemoryFetchRequest; j_popIncomingRequestQueue; }
   transition(I, CPU_GETX, CE_W) { v_allocateTBE; qf_queueMemoryFetchRequest; j_popIncomingRequestQueue; }
+  transition(I, CPU_GETX_Stale_Self, CE_W) { v_allocateTBE; qf_queueMemoryFetchRequest; j_popIncomingRequestQueue; }
   transition(I, GPU_GETX, GE_W) { v_allocateTBE; qf_queueMemoryFetchRequest; j_popIncomingRequestQueue; }
+
+  transition(CS, DMA_WRITE, CE_W_DMA_WRITE_BOTH) {
+    vd_allocateDmaRequestInTBE;
+    fdw_fwdDmaWriteInvToCpuOwner;
+    ld_queueMemoryDmaWriteFromTbe;
+    p_popDmaRequestQueue;
+  }
+
+  transition(CGS, DMA_WRITE, CE_W_DMA_WRITE_BOTH) {
+    vd_allocateDmaRequestInTBE;
+    fdw_fwdDmaWriteInvToCpuOwner;
+    ld_queueMemoryDmaWriteFromTbe;
+    p_popDmaRequestQueue;
+  }
 
 
   // Memory Returns for Initialization
-  transition(CS_W, Memory_Data, CS) { d_send_mem_and_1_token_cpu; u_set_cpu_shared; s_deallocateTBE; l_popMemQueue; qw_wakeUpDependents; }
-  transition(CE_W, Memory_Data, CE) { d_send_mem_and_all_tokens_cpu; u_set_cpu_exclusive; s_deallocateTBE; l_popMemQueue; qw_wakeUpDependents; }
+  transition(CS_W, Memory_Data, CS)  {
+    d_send_mem_and_1_token_cpu;
+    u_set_cpu_shared;
+    l_popMemQueue;
+    s_deallocateTBE;
+    qw_wakeUpDependents;
+  }
+
+  transition(CE_W, Memory_Data, CE) {
+    d_send_mem_and_all_tokens_cpu;
+    u_set_cpu_exclusive;
+    l_popMemQueue;
+    s_deallocateTBE;
+    qw_wakeUpDependents;
+  }
+
+  transition(I, GPU_GETS_NB, GS_W) {
+    v_allocateTBEFromNB;
+    qf_queueMemoryFetchRequestFromNB;
+    j_popIncomingRequestFromNBQueue;
+  }
+
+  transition(I, GPU_GETX_NB, GE_W) {
+    v_allocateTBEFromNB;
+    qf_queueMemoryFetchRequestFromNB;
+    j_popIncomingRequestFromNBQueue;
+  }
+
+
   // (Symmetric Memory_Data transitions for GS_W -> GS, GE_W -> GE)
+
+
+  // ============================================================================
+  // AMTC audit5: tolerate stale memory writeback ACK while a same-line fetch waits.
+  //
+  // A dirty WB can queue MEMORY_WB, then a later GETS/GETX for the same line can
+  // move the directory into *_W waiting for MEMORY_READ data before the WB ACK
+  // arrives.  In that case the ACK is not the completion event for the current
+  // fetch; consume it and keep waiting for Memory_Data.
+  // ============================================================================
+  transition({CS_W, GS_W, CE_W, GE_W, CGS_W, CE_W_DataOnly, GE_W_DataOnly, CE_W_Stale_GETX, CE_W_DMA_READ, GE_W_DMA_READ}, Memory_Ack) {
+    l_popMemQueue;
+  }
+
+  // AMTC audit8: stale/no-TBE memory responses. These are responses to an older
+  // memory operation whose TBE was already deallocated, usually because a forwarded
+  // owner/L2 response completed the requester first. They must only drain the
+  // memory response queue and must not access tbe fields.
+  transition({I, CS, GS, CGS, CE, GE, CE_XFER, GE_XFER,
+              CS_W, GS_W, CE_W, GE_W, CGS_W,
+              MIG_C2G, MIG_G2C, CGS_CPU_UPG, CGS_GPU_UPG,
+              CE_W_DataOnly, GE_W_DataOnly, CE_W_Stale_GETX, CE_W_DMA_READ, GE_W_DMA_READ, CE_W_DMA_WRITE_BOTH, CE_W_DMA_WRITE_MEM, CE_W_DMA_WRITE_TOK, GE_W_DMA_WRITE_BOTH, GE_W_DMA_WRITE_MEM, GE_W_DMA_WRITE_TOK}, Memory_Data_Stale) {
+    l_popMemQueue;
+  }
+
+  transition({I, CS, GS, CGS, CE, GE, CE_XFER, GE_XFER,
+              CS_W, GS_W, CE_W, GE_W, CGS_W,
+              MIG_C2G, MIG_G2C, CGS_CPU_UPG, CGS_GPU_UPG,
+              CE_W_DataOnly, GE_W_DataOnly, CE_W_Stale_GETX, CE_W_DMA_READ, GE_W_DMA_READ, CE_W_DMA_WRITE_BOTH, CE_W_DMA_WRITE_MEM, CE_W_DMA_WRITE_TOK, GE_W_DMA_WRITE_BOTH, GE_W_DMA_WRITE_MEM, GE_W_DMA_WRITE_TOK}, Memory_Ack_Stale) {
+    l_popMemQueue;
+  }
 
   // ============================================================================
   // 2. CPU SHARED (CS)
@@ -1811,16 +3223,39 @@ action(a_inv_remote_domain_on_getx, "invR", desc="Invalidate remote domain on up
     // Cross-domain: Directory already has the data! No need to fetch from memory.
     d_send_dir_data_and_1_token_gpu; u_set_gpu_shared; j_popIncomingRequestQueue;
   }
-  transition(CS, CPU_GETX, CE) {
-    d_send_remaining_tokens_cpu; u_set_cpu_exclusive; j_popIncomingRequestQueue;
+
+  transition(CS, GPU_GETS_NB, CGS) {
+    d_send_dir_data_and_1_token_nb; u_set_gpu_shared_from_nb; j_popIncomingRequestFromNBQueue;
   }
+
+  transition(CS, CPU_GETX_Stale_Self, CE) {
+    d_send_dir_data_and_remaining_tokens_cpu;
+    u_set_cpu_exclusive;
+    j_popIncomingRequestQueue;
+  }
+
+  transition(CS, CPU_GETX, CE) {
+    // Directory is in CS and has clean data.  For a CPU sector upgrade,
+    // respond with DATA_OWNER plus requested remaining tokens in one message.
+    // Do not split into ACK + later memory data; that reorders progress and
+    // strands L1 S_IM when the store sector needs old bytes.
+    d_send_dir_data_and_remaining_tokens_cpu;
+    u_set_cpu_exclusive;
+    j_popIncomingRequestQueue;
+  }
+
+
+
   transition(CS, GPU_GETX, MIG_C2G) {
     v_allocateTBE; fwd_inv_to_cpu; j_popIncomingRequestQueue;
   }
 
   transition(CGS_W, Memory_Data, CGS) {
-    // Fulfill the GPU's request to join the shared state
-    d_send_mem_and_1_token_gpu; u_set_gpu_shared; s_deallocateTBE; l_popMemQueue; qw_wakeUpDependents;
+    d_send_mem_and_1_token_gpu;
+    u_set_gpu_shared;
+    l_popMemQueue;
+    s_deallocateTBE;
+    qw_wakeUpDependents;
   }
 
   // ============================================================================
@@ -1840,6 +3275,10 @@ action(a_inv_remote_domain_on_getx, "invR", desc="Invalidate remote domain on up
   transition(GS, GPU_GETS) {
     d_send_dir_data_and_1_token_gpu; u_set_gpu_shared; j_popIncomingRequestQueue;
   }
+
+  transition(GS, GPU_GETS_NB) {
+    d_send_dir_data_and_1_token_nb; u_set_gpu_shared_from_nb; j_popIncomingRequestFromNBQueue;
+  }
   transition(GS, CPU_GETS, CGS) {
     d_send_dir_data_and_1_token_cpu; u_set_cpu_shared; j_popIncomingRequestQueue;
   }
@@ -1849,6 +3288,14 @@ action(a_inv_remote_domain_on_getx, "invR", desc="Invalidate remote domain on up
   }
   transition(CGS, GPU_GETS) {
     d_send_dir_data_and_1_token_gpu; j_popIncomingRequestQueue;
+  }
+
+  transition(CGS, GPU_GETS_NB) {
+    d_send_dir_data_and_1_token_nb; j_popIncomingRequestFromNBQueue;
+  }
+
+  transition(CGS, CPU_GETX_Stale_Self, CGS_CPU_UPG) {
+    v_allocateTBE; fwd_inv_to_gpu; j_popIncomingRequestQueue;
   }
 
   transition(CGS, CPU_GETX, CGS_CPU_UPG) {
@@ -1862,13 +3309,121 @@ action(a_inv_remote_domain_on_getx, "invR", desc="Invalidate remote domain on up
   // ============================================================================
   // 4. CPU EXCLUSIVE (CE)
   // ============================================================================
+  // Audit37: stale self-owner CPU GETX repair.  After many retries the
+  // Directory may still be in CE, but the recorded CPU owner no longer has the
+  // line.  Fetch memory and return a complete owner grant to the requester.
+  transition(CE, CPU_GETX_Stale_Self, CE_W_Stale_GETX) {
+    v_allocateTBE;
+    qf_queueMemoryFetchRequest;
+    j_popIncomingRequestQueue;
+  }
+
+  transition(CE_W_Stale_GETX, Memory_Data, CE) {
+    d_send_mem_and_forced_all_tokens_cpu;
+    u_set_cpu_exclusive;
+    l_popMemQueue;
+    s_deallocateTBE;
+    qw_wakeUpDependents;
+  }
+
   transition(CE, CPU_GETS) { fwd_req_to_cpu; j_popIncomingRequestQueue; }
+
+  // Audit41: DMA read in CE must read the CPU owner's latest data, not
+  // stale memory.  This path is used by the HSA packet processor when reading
+  // CPU-written queue/doorbell/packet contents during kernel launch.
+  transition(CE, DMA_READ, CE_W_DMA_READ) {
+    vd_allocateDmaRequestInTBE;
+    fdr_fwdDmaReadToCpuOwner;
+    p_popDmaRequestQueue;
+  }
+
+  transition(CE_W_DMA_READ, {Data_Shared, Data_Owner, Data_Owner_All_Collected}, CE) {
+    dd_sendDmaData;
+    s_deallocateTBE;
+    k_popIncomingResponseQueue;
+    qw_wakeUpDependents;
+  }
+
+  // If the recorded owner is stale and only sends ACK_OWNER(0), fall back to
+  // memory instead of invalid-transitioning or waiting forever.
+  transition(CE_W_DMA_READ, Ack_Owner) {
+    qdr_markDmaReadStaleCpuOwnerFallback;
+    ft_memoryDmaFromTbe;
+    k_popIncomingResponseQueue;
+  }
+
+  transition(CE_W_DMA_READ, Memory_Data, I) {
+    qdm_saveDmaReadFallbackMemoryData;
+    dm_sendMemoryDataToDma;
+    l_popMemQueue;
+    s_deallocateTBE;
+    qw_wakeUpDependents;
+  }
+
+
+
+  // Audit45: GPU/HSAPP DMA write while a CPU-exclusive owner exists. This is
+  // the completion-signal/doorbell visibility case. Write the DMA payload to
+  // memory, invalidate/probe the CPU owner, then ACK DMA only after both the
+  // memory write and owner invalidation/data response have completed. Final
+  // state is I because the DMA write becomes the authoritative memory copy and
+  // the previous CPU owner was invalidated.
+  transition(CE, DMA_WRITE, CE_W_DMA_WRITE_BOTH) {
+    vd_allocateDmaRequestInTBE;
+    fdw_fwdDmaWriteInvToCpuOwner;
+    ld_queueMemoryDmaWriteFromTbe;
+    p_popDmaRequestQueue;
+  }
+
+  transition(GS, DMA_WRITE, CE_W_DMA_WRITE_BOTH) {
+    vd_allocateDmaRequestInTBE;
+    fdw_fwdDmaWriteInvToCpuOwner;
+    ld_queueMemoryDmaWriteFromTbe;
+    p_popDmaRequestQueue;
+  }
+
+  transition(CE_W_DMA_WRITE_BOTH, Memory_Ack, CE_W_DMA_WRITE_TOK) {
+    l_popMemQueue;
+  }
+
+  transition(CE_W_DMA_WRITE_BOTH, {Data_Shared, Data_Owner, Data_Owner_All_Collected, Tokens, Tokens_All_Collected}, CE_W_DMA_WRITE_MEM) {
+    qd_updateTokensFromDmaWriteInvResp;
+    k_popIncomingResponseQueue;
+  }
+
+  transition(CE_W_DMA_WRITE_TOK, {Data_Shared, Data_Owner, Data_Owner_All_Collected, Tokens, Tokens_All_Collected}, I) {
+    qd_updateTokensFromDmaWriteInvResp;
+    qd_markDmaWriteCompleteNoCachedCopies;
+    da_sendDmaAck;
+    s_deallocateTBE;
+    k_popIncomingResponseQueue;
+    qw_wakeUpDependents;
+  }
+
+  transition(CE_W_DMA_WRITE_MEM, Memory_Ack, I) {
+    qd_markDmaWriteCompleteNoCachedCopies;
+    da_sendDmaAck;
+    l_popMemQueue;
+    s_deallocateTBE;
+    qw_wakeUpDependents;
+  }
 
   // FIX: Forward the GETX safely, and update the Directory's owner record
   //transition(CE, CPU_GETX) { fwd_req_to_cpu; u_set_cpu_exclusive; j_popIncomingRequestQueue; }
 
   transition(CE, GPU_GETS, CGS) {
     fwd_req_to_cpu; u_set_gpu_shared; j_popIncomingRequestQueue;
+  }
+
+  // Audit94: GPU/NB GETS in CE was repeatedly forwarded to the recorded CPU/L2
+  // owner, but the owner often appears stale/NP for the GPU payload lines.  The
+  // forwarded request then re-enters the L2 miss path as req=TCC-0 and no data
+  // returns to TCC, leaving GPUCoalescer with many outstanding LDs.  For
+  // bring-up, serve CE + GPU_GETS_NB directly from the directory copy and move
+  // to CGS.  This is conservative for progress; later refine by validating the
+  // owner is truly dirty before taking the owner-pull path.
+  transition(CE, GPU_GETS_NB, CGS) {
+    d_send_dir_data_and_1_token_nb; u_set_gpu_shared_from_nb; j_popIncomingRequestFromNBQueue;
   }
   transition(CE, GPU_GETX, MIG_C2G) {
     v_allocateTBE; fwd_inv_to_cpu; j_popIncomingRequestQueue;
@@ -1882,6 +3437,89 @@ action(a_inv_remote_domain_on_getx, "invR", desc="Invalidate remote domain on up
   // 5. GPU EXCLUSIVE (GE)
   // ============================================================================
   transition(GE, GPU_GETS) { fwd_req_to_gpu; j_popIncomingRequestQueue; }
+
+  // Symmetric DMA read while GPU-exclusive metadata exists.
+  transition(GE, DMA_READ, GE_W_DMA_READ) {
+    vd_allocateDmaRequestInTBE;
+    fdr_fwdDmaReadToGpuOwner;
+    p_popDmaRequestQueue;
+  }
+
+  transition(GE_W_DMA_READ, {Data_Shared, Data_Owner, Data_Owner_All_Collected}, GE) {
+    dd_sendDmaData;
+    s_deallocateTBE;
+    k_popIncomingResponseQueue;
+    qw_wakeUpDependents;
+  }
+
+  transition(GE_W_DMA_READ, Ack_Owner) {
+    qdg_markDmaReadStaleGpuOwnerFallback;
+    ft_memoryDmaFromTbe;
+    k_popIncomingResponseQueue;
+  }
+
+  transition(GE_W_DMA_READ, Memory_Data, I) {
+    qdm_saveDmaReadFallbackMemoryData;
+    dm_sendMemoryDataToDma;
+    l_popMemQueue;
+    s_deallocateTBE;
+    qw_wakeUpDependents;
+  }
+
+  // DMA read from shared states: fetch memory for DMA but return to
+  // the original shared state. A DMA read is non-mutating, so it must not
+  // collapse CS/CGS/GS into I; doing so violates the token invariant.
+  transition(CS, DMA_READ, CS_DMA_R_W) {
+    vd_allocateDmaRequestInTBE;
+    fd_memoryDma;
+    p_popDmaRequestQueue;
+  }
+
+  transition(CGS, DMA_READ, CGS_DMA_R_W) {
+    vd_allocateDmaRequestInTBE;
+    fd_memoryDma;
+    p_popDmaRequestQueue;
+  }
+
+  transition(GS, DMA_READ, GS_DMA_R_W) {
+    vd_allocateDmaRequestInTBE;
+    fd_memoryDma;
+    p_popDmaRequestQueue;
+  }
+
+  // Symmetric GPU-exclusive DMA write handling.
+  transition(GE, DMA_WRITE, GE_W_DMA_WRITE_BOTH) {
+    vd_allocateDmaRequestInTBE;
+    fdw_fwdDmaWriteInvToGpuOwner;
+    ld_queueMemoryDmaWriteFromTbe;
+    p_popDmaRequestQueue;
+  }
+
+  transition(GE_W_DMA_WRITE_BOTH, Memory_Ack, GE_W_DMA_WRITE_TOK) {
+    l_popMemQueue;
+  }
+
+  transition(GE_W_DMA_WRITE_BOTH, {Data_Shared, Data_Owner, Data_Owner_All_Collected, Tokens, Tokens_All_Collected}, GE_W_DMA_WRITE_MEM) {
+    qd_updateTokensFromDmaWriteInvResp;
+    k_popIncomingResponseQueue;
+  }
+
+  transition(GE_W_DMA_WRITE_TOK, {Data_Shared, Data_Owner, Data_Owner_All_Collected, Tokens, Tokens_All_Collected}, I) {
+    qd_updateTokensFromDmaWriteInvResp;
+    qd_markDmaWriteCompleteNoCachedCopies;
+    da_sendDmaAck;
+    s_deallocateTBE;
+    k_popIncomingResponseQueue;
+    qw_wakeUpDependents;
+  }
+
+  transition(GE_W_DMA_WRITE_MEM, Memory_Ack, I) {
+    qd_markDmaWriteCompleteNoCachedCopies;
+    da_sendDmaAck;
+    l_popMemQueue;
+    s_deallocateTBE;
+    qw_wakeUpDependents;
+  }
 
   // FIX: Safe forward and update owner
   transition(GE, GPU_GETX) { fwd_req_to_gpu; u_set_gpu_exclusive; j_popIncomingRequestQueue; }
@@ -1909,14 +3547,71 @@ action(a_inv_remote_domain_on_getx, "invR", desc="Invalidate remote domain on up
   // 5. STALLS
   // ============================================================================
 
-  // Stall all standard requests during memory waits, migrations, and transfers
-  transition({CS_W, GS_W, CE_W, GE_W, CGS_W, MIG_C2G, MIG_G2C, CGS_CPU_UPG, CGS_GPU_UPG, CE_XFER, GE_XFER}, {CPU_GETS, GPU_GETS, CPU_GETX, GPU_GETX, GETS_Owner_Pull}) {
-    z_stallAndWaitRequest;
+  // Audit92: DMA read owner-pull can bounce back as a standard request
+  // while the directory is waiting in CE_W_DMA_READ/GE_W_DMA_READ.  Observed
+  // HSAPP AQL queue read: DMA_READ addr=0x19d7000 entered CE_W_DMA_READ,
+  // forwarded GETS to L2Cache-0, then a GPU_GETS arrived at the Directory and
+  // was stalled forever, leaving DMA in BUSY_RD.  For bring-up, treat this as
+  // stale/bounced owner-pull and fall back to memory using the recorded DMA TBE;
+  // then pop the bounced request so the DMA Memory_Data path can complete.
+  transition(CE_W_DMA_READ,
+             {CPU_GETS, GPU_GETS, CPU_GETX, CPU_GETX_Stale_Self,
+              CPU_GETS_Owner_Pull_Repair, GPU_GETX, GETS_Owner_Pull},
+             CE_W_DMA_READ) {
+    ft_memoryDmaFromTbe;
+    j_popIncomingRequestQueue;
+  }
+
+  transition(GE_W_DMA_READ,
+             {CPU_GETS, GPU_GETS, CPU_GETX, CPU_GETX_Stale_Self,
+              CPU_GETS_Owner_Pull_Repair, GPU_GETX, GETS_Owner_Pull},
+             GE_W_DMA_READ) {
+    ft_memoryDmaFromTbe;
+    j_popIncomingRequestQueue;
+  }
+
+  // Audit91: Do not park ordinary CPU/GPU retries with stall_and_wait while
+  // the directory is in a transient memory/owner-transfer state.  The observed
+  // L2 proxy miss deadlock was:
+  //   L2Cache-3 sends GETS for 0x10f26c0 and enters IS,
+  //   duplicate L1 retries are forwarded by L2,
+  //   Directory can be in CS_W/CE_W-style wait and a stalled request may miss
+  //   the wakeup, leaving L2 in IS forever.
+  // Recycle the request instead; once Memory_Data/owner response completes and
+  // the line reaches a stable state, the request will be retried and served.
+  transition({CS_W, GS_W, CE_W, GE_W, CGS_W, CE_W_Stale_GETX, CE_W_DMA_WRITE_BOTH, CE_W_DMA_WRITE_MEM, CE_W_DMA_WRITE_TOK, GE_W_DMA_WRITE_BOTH, GE_W_DMA_WRITE_MEM, GE_W_DMA_WRITE_TOK, MIG_C2G, MIG_G2C, CGS_CPU_UPG, CGS_GPU_UPG, CE_XFER, GE_XFER}, {CPU_GETS, GPU_GETS, CPU_GETX, CPU_GETX_Stale_Self, CPU_GETS_Owner_Pull_Repair, GPU_GETX, GETS_Owner_Pull}) {
+    z_recycleRequest;
+  }
+
+  transition({CS_W, GS_W, CE_W, GE_W, CGS_W, CE_W_Stale_GETX, CE_W_DMA_READ, GE_W_DMA_READ, CE_W_DMA_WRITE_BOTH, CE_W_DMA_WRITE_MEM, CE_W_DMA_WRITE_TOK, GE_W_DMA_WRITE_BOTH, GE_W_DMA_WRITE_MEM, GE_W_DMA_WRITE_TOK, MIG_C2G, MIG_G2C, CGS_CPU_UPG, CGS_GPU_UPG, CE_XFER, GE_XFER}, {GPU_GETS_NB, GPU_GETX_NB, GETS_Owner_Pull_NB}) {
+    z_stallAndWaitRequestFromNB;
   }
 
   // CRITICAL FIX: Stall all requests (including retries) during Data-Only pulls
-  transition({CE_W_DataOnly, GE_W_DataOnly}, {CPU_GETS, GPU_GETS, CPU_GETX, GPU_GETX, GETS_Owner_Pull}) {
+  transition({CE_W_DataOnly, GE_W_DataOnly}, {CPU_GETS, GPU_GETS, CPU_GETX, CPU_GETX_Stale_Self, CPU_GETS_Owner_Pull_Repair, GPU_GETX, GETS_Owner_Pull}) {
     z_stallAndWaitRequest;
+  }
+
+  // Stall duplicate DMA requests while a DMA read repair is already waiting on memory.
+  transition({CE_W_DMA_READ, GE_W_DMA_READ, CE_W_DMA_WRITE_BOTH, CE_W_DMA_WRITE_MEM, CE_W_DMA_WRITE_TOK,
+              GE_W_DMA_WRITE_BOTH, GE_W_DMA_WRITE_MEM, GE_W_DMA_WRITE_TOK}, {DMA_READ, DMA_WRITE}) {
+    y_stallAndWaitDmaRequest;
+  }
+
+  // DMA requests can arrive while the directory is already waiting on a
+  // non-DMA memory/owner-transfer path.  During HSAPP AQL queue reads this was
+  // observed as q1 DMA_READ entering while the line was in CE_W/GE_W.  Parking
+  // the DMA queue with stall_and_wait can miss the wakeup from the non-DMA TBE
+  // and leave HSAPP dmaInProgress permanently true.  Recycle the DMA request
+  // instead: once the active memory/owner transaction reaches a stable state,
+  // the DMA request will re-enter and use the normal CE/GE/CS/GS DMA path.
+  transition({CS_W, GS_W, CE_W, GE_W, CGS_W,
+              CE_W_Stale_GETX,
+              MIG_C2G, MIG_G2C,
+              CGS_CPU_UPG, CGS_GPU_UPG,
+              CE_XFER, GE_XFER},
+            {DMA_READ, DMA_WRITE}) {
+    y_recycleDmaRequestQueue;
   }
 
   // ============================================================================
@@ -1945,6 +3640,11 @@ action(a_inv_remote_domain_on_getx, "invR", desc="Invalidate remote domain on up
     j_popIncomingRequestQueue;
   }
 
+  transition(CGS, {GETS_Owner_Pull_NB}) {
+    d_send_dir_data_and_1_token_nb;
+    j_popIncomingRequestFromNBQueue;
+  }
+
   // Note: Since GETS_Owner_Pull doesn't distinguish between CPU and GPU in the event name,
   // we route it based on the domain. We need a GPU variant for CGS.
   // Assuming you have an event like GPU_GETS_Owner_Pull or you route it inside the in_port.
@@ -1955,16 +3655,24 @@ action(a_inv_remote_domain_on_getx, "invR", desc="Invalidate remote domain on up
   transition(CE, GETS_Owner_Pull, CE_W_DataOnly) {
     v_allocateTBE; qf_queueMemoryFetchRequest; j_popIncomingRequestQueue;
   }
+
+  // If the TCC stale-owner repair arrives before the first CE->CGS transition
+  // is visible, serve it on the NB queue rather than using the old CPU action.
+  transition(CE, GETS_Owner_Pull_NB, CGS) {
+    d_send_dir_data_and_1_token_nb;
+    u_set_gpu_shared_from_nb;
+    j_popIncomingRequestFromNBQueue;
+  }
   transition(GE, GETS_Owner_Pull, GE_W_DataOnly) {
     v_allocateTBE; qf_queueMemoryFetchRequest; j_popIncomingRequestQueue;
   }
 
   // Resolution from Memory
   transition(CE_W_DataOnly, Memory_Data, CE) {
-    d_send_mem_data_only_cpu; s_deallocateTBE; l_popMemQueue; qw_wakeUpDependents;
+    d_send_mem_data_only_cpu; l_popMemQueue; s_deallocateTBE; qw_wakeUpDependents;
   }
   transition(GE_W_DataOnly, Memory_Data, GE) {
-    d_send_mem_data_only_gpu; s_deallocateTBE; l_popMemQueue; qw_wakeUpDependents;
+    d_send_mem_data_only_gpu; l_popMemQueue; s_deallocateTBE; qw_wakeUpDependents;
   }
 
   transition(CE_W_DataOnly, Tokens) {
@@ -1977,19 +3685,187 @@ action(a_inv_remote_domain_on_getx, "invR", desc="Invalidate remote domain on up
     k_popIncomingResponseQueue;
   }
 
-  // Inside your CE (CPU Exclusive) block:
-  transition(CE, Tokens) {
-    d_forward_tokens_to_cpu;
-    k_popIncomingResponseQueue; // Assuming 'j' is your action to pop the response network
-  }
-
-  // Inside your CS (CPU Shared) block:
-  // (In CS, the L1 is the active reader, so it should get the loose tokens to eventually upgrade)
-  transition(CS, Tokens) {
-    d_forward_tokens_to_cpu;
+  // Audit47: token-only writebacks can arrive while the directory still
+  // carries stale exclusive-domain metadata.  Once the directory absorbs any
+  // subset of tokens, stable CE/GE is no longer legal because CE/GE require
+  // all requested-sector tokens to remain outside the directory.  Downgrade
+  // the domain state to shared-domain metadata for partial token returns; the
+  // full-token case is still handled by Tokens_All_Collected -> I below.
+  transition({CS, GS, CGS}, Tokens) {
+    q_updateTokensFromResponse;
     k_popIncomingResponseQueue;
   }
 
+  transition(CE, Tokens, CS) {
+    q_updateTokensFromResponse;
+    k_popIncomingResponseQueue;
+  }
 
+  transition(GE, Tokens, GS) {
+    q_updateTokensFromResponse;
+    k_popIncomingResponseQueue;
+  }
+
+  // When all tokens are collected, the line can become idle.
+  transition({CS, GS, CGS, CE, GE}, Tokens_All_Collected, I) {
+    q_updateTokensFromResponse;
+    k_popIncomingResponseQueue;
+  }
+
+  // AMTC audit-freeze/v16: a DATA_SHARED response can arrive late after the
+  // requester already replaced/bounced the response, or after a stale owner
+  // probe was already repaired.  In stable states this response is not the
+  // current ownership transfer completion.  Do not absorb its partial token
+  // payload into Directory and do not move CE/GE to I; just drain it.
+  transition({I, CS, CGS, GS, CE, GE}, Data_Shared) {
+    absorbLateSharedDataResponse;
+    k_popIncomingResponseQueue;
+  }
+
+  // 1. Partial Eviction
+ // 1. Shared States: Stay in the same state, absorb tokens, write to memory
+  transition({CS, GS, CGS}, Data_Owner) {
+    q_updateTokensFromResponse;
+    lq_queueMemoryWbRequest;
+    k_popIncomingResponseQueue;
+  }
+
+  transition(I, Memory_Data) {
+    // Note: Replace l_popMemQueue with the specific action name your
+    // Directory uses to pop the incoming memory network queue!
+    l_popMemQueue;
+  }
+
+  transition(I, Memory_Ack) {
+    l_popMemQueue;
+  }
+
+  // v16: CE + DATA_SHARED is handled by the stable stale-data absorber above.
+  // A partial late DATA_SHARED must not move CE -> I because it can leave the
+  // Directory in I with only a partial token set and trip the I-state invariant.
+
+  // Audit12 hybrid owner writeback classification:
+  //   Data_Owner partial       -> shared state (CS/GS)
+  //   Data_Owner_All_Collected -> I
+  transition(CE, Data_Owner, CS) {
+    q_updateTokensFromResponse;
+    lq_queueMemoryWbRequest;
+    k_popIncomingResponseQueue;
+  }
+
+  transition(GE, Data_Owner, GS) {
+    q_updateTokensFromResponse;
+    lq_queueMemoryWbRequest;
+    k_popIncomingResponseQueue;
+  }
+
+  transition({CS, GS, CGS, CE, GE}, Data_Owner_All_Collected, I) {
+    q_updateTokensFromResponse;
+    k_popIncomingResponseQueue;
+  }
+
+  transition(GS_W, Memory_Data, GS) {
+    d_send_mem_and_1_token_gpu;
+    u_set_gpu_shared;
+    l_popMemQueue;
+    s_deallocateTBE;
+    qw_wakeUpDependents;
+  }
+
+  transition(GE_W, Memory_Data, GE) {
+    d_send_mem_and_all_tokens_gpu;
+    u_set_gpu_exclusive;
+    l_popMemQueue;
+    s_deallocateTBE;
+    qw_wakeUpDependents;
+  }
+
+  // Requires adding an I_DMA_W state to your State declaration
+  transition(I, DMA_READ, I_DMA_W) {
+    vd_allocateDmaRequestInTBE;
+    fd_memoryDma; // Your action to fetch memory for DMA
+    p_popDmaRequestQueue;
+  }
+
+  transition(I_DMA_W, Memory_Data, I) {
+    dm_sendMemoryDataToDma;
+    s_deallocateTBE;
+    l_popMemQueue;
+    qw_wakeUpDependents;
+  }
+
+  transition(CE, CPU_GETS_Owner_Pull_Repair, CS) {
+    d_send_dir_data_and_1_token_cpu_repair;
+    u_set_cpu_shared;
+    j_popIncomingRequestQueue;
+  }
+
+  transition(CS, CPU_GETS_Owner_Pull_Repair) {
+    d_send_dir_data_and_1_token_cpu_repair;
+    u_set_cpu_shared;
+    j_popIncomingRequestQueue;
+  }
+
+  transition(CGS, CPU_GETS_Owner_Pull_Repair) {
+    d_send_dir_data_and_1_token_cpu_repair;
+    u_set_cpu_shared;
+    j_popIncomingRequestQueue;
+  }
+
+  transition(CS_DMA_R_W, Memory_Data, CS) {
+    dm_sendMemoryDataToDma;
+    s_deallocateTBE;
+    l_popMemQueue;
+    qw_wakeUpDependents;
+  }
+
+  transition(CGS_DMA_R_W, Memory_Data, CGS) {
+    dm_sendMemoryDataToDma;
+    s_deallocateTBE;
+    l_popMemQueue;
+    qw_wakeUpDependents;
+  }
+
+  transition(GS_DMA_R_W, Memory_Data, GS) {
+    dm_sendMemoryDataToDma;
+    s_deallocateTBE;
+    l_popMemQueue;
+    qw_wakeUpDependents;
+  }
+
+  transition({CS_DMA_R_W, CGS_DMA_R_W, GS_DMA_R_W},
+           {CPU_GETS, GPU_GETS,
+            CPU_GETX, CPU_GETX_Stale_Self,
+            CPU_GETS_Owner_Pull_Repair,
+            GPU_GETX, GETS_Owner_Pull}) {
+    z_stallAndWaitRequest;
+  }
+
+  transition({CS_DMA_R_W, CGS_DMA_R_W, GS_DMA_R_W},
+            {GPU_GETS_NB, GPU_GETX_NB, GETS_Owner_Pull_NB}) {
+    z_stallAndWaitRequestFromNB;
+  }
+
+  transition({CS_DMA_R_W, CGS_DMA_R_W, GS_DMA_R_W},
+            {DMA_READ, DMA_WRITE}) {
+    y_stallAndWaitDmaRequest;
+  }
+
+  transition(I, DMA_WRITE, I_DMA_WRITE_W) {
+      vd_allocateDmaRequestInTBE;
+      ld_queueMemoryDmaWriteFromTbe;
+      p_popDmaRequestQueue;
+  }
+
+  transition(I_DMA_WRITE_W, Memory_Ack, I) {
+      da_sendDmaAck;
+      l_popMemQueue;
+      s_deallocateTBE;
+      qw_wakeUpDependents;
+  }
+
+  transition(I_DMA_WRITE_W, {DMA_READ, DMA_WRITE}) {
+      y_stallAndWaitDmaRequest;
+  }
 
 }

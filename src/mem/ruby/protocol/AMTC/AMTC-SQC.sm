@@ -1,4 +1,5 @@
 /*
+ * AMTC-SQC.sm
  * Copyright (c) 2012-2015 Advanced Micro Devices, Inc.
  * Copyright (c) 2023 Matthew D. Sinclair
  * All rights reserved.
@@ -48,6 +49,7 @@ machine(MachineType:SQC, "GPU SQC (L1 I Cache)")
 {
   state_declaration(State, desc="SQC Cache States", default="SQC_State_I") {
     I, AccessPermission:Invalid, desc="Invalid";
+    IS, AccessPermission:Busy, desc="Invalid, fetch request issued and waiting for data";
     V, AccessPermission:Read_Only, desc="Valid";
   }
 
@@ -106,21 +108,23 @@ machine(MachineType:SQC, "GPU SQC (L1 I Cache)")
   Tick clockEdge();
 
 
+  // AMTC is strict 2-sector / 64B line:
+  // sector 0 = bytes [0..31], sector 1 = bytes [32..63]
   int getSector(Addr addr) {
-  Addr offset;
+    if ((addr % 64) < 32) { return 0; }
+    else { return 1; }
+  }
 
-  offset := addr % 128;
+  int amtc_singleSectorMaskFromId(int sid) {
+    if (sid == 1) { return 2; }
+    else { return 1; }
+  }
 
-  if (offset < 32) {
-    return 0;
-  } else if (offset < 64) {
-    return 1;
-  } else if (offset < 96) {
-    return 2;
-  } else {
+  int amtc_normalizeMask(int mask, int sid) {
+    if (mask == 1 || mask == 2 || mask == 3) { return mask; }
+    if (mask == 0) { return amtc_singleSectorMaskFromId(sid); }
     return 3;
   }
-}
 
   Entry getCacheEntry(Addr address), return_by_pointer="yes" {
     Entry cache_entry := static_cast(Entry, "pointer", L1cache.lookup(address));
@@ -292,6 +296,9 @@ machine(MachineType:SQC, "GPU SQC (L1 I Cache)")
       out_msg.MessageSize := MessageSizeType:Request_Control;
       //out_msg.InitialRequestTime := curCycle();
       out_msg.sector_id := getSector(address);
+      out_msg.sector_mask := amtc_singleSectorMaskFromId(out_msg.sector_id);
+      out_msg.requested_sector_mask := out_msg.sector_mask;
+      out_msg.is_gpu := true;
     }
   }
 
@@ -307,6 +314,10 @@ machine(MachineType:SQC, "GPU SQC (L1 I Cache)")
 
   action(pr_popResponseQueue, "pr", desc="Pop Response Queue") {
     responseToSQC_in.dequeue(clockEdge());
+  }
+
+  action(st_stallMandatoryQueue, "st", desc="Stall mandatory queue while SQC miss is pending") {
+    DPRINTF(RubySlicc, "AMTC_SQC_STALL_PENDING_FETCH addr=%#x\n", address);
   }
 
   action(l_loadDoneHit, "ldh", desc="local load done (hits in SQC)") {
@@ -330,6 +341,9 @@ machine(MachineType:SQC, "GPU SQC (L1 I Cache)")
       assert(is_valid(cache_entry));
       cache_entry.DataBlk := in_msg.DataBlk;
       cache_entry.Dirty := false;
+      DPRINTF(RubySlicc, "AMTC_SQC_FILL addr=%#x sid=%d reqmask=%d validmask=%d tokmask=%d\n",
+              address, in_msg.sector_id, in_msg.requested_sector_mask,
+              in_msg.valid_sector_mask, in_msg.token_sector_mask);
     }
   }
 
@@ -354,6 +368,12 @@ machine(MachineType:SQC, "GPU SQC (L1 I Cache)")
     ic_invCache;
   }
 
+  transition(IS, Repl, IS) {TagArrayRead, TagArrayWrite} {
+    // A replacement/flush can race with an outstanding scalar miss.
+    // Keep IS so the returning Data can still complete the miss.
+    ic_invCache;
+  }
+
   transition({I, V}, Evict, I) {TagArrayRead, TagArrayWrite} {
     // since we're evicting something, don't bother classifying as hit/miss
     ic_invCache;
@@ -361,18 +381,47 @@ machine(MachineType:SQC, "GPU SQC (L1 I Cache)")
     p_popMandatoryQueue;
   }
 
+  // AMTC bring-up fix v2: tolerate a Data response that arrives after
+  // the SQC line has returned to I due to invalidate/flush/replacement ordering.
+  // The response still corresponds to an outstanding Sequencer read, so complete
+  // it as a normal miss fill instead of panicking on I + Data.
   transition(I, Data, V) {TagArrayRead, TagArrayWrite, DataArrayRead} {
     a_allocate;
-    // don't profile this as a hit/miss since it's a reponse from L2,
-    // so we already counted it
     w_writeCache;
     l_loadDoneMiss;
     pr_popResponseQueue;
   }
 
-  transition(I, Fetch) {TagArrayRead, TagArrayWrite} {
+  transition(IS, Data, V) {TagArrayRead, TagArrayWrite, DataArrayRead} {
+    a_allocate;
+    // Don't profile this as a hit/miss since it is a response from TCC,
+    // so we already counted the original Fetch as a miss.
+    w_writeCache;
+    l_loadDoneMiss;
+    pr_popResponseQueue;
+  }
+
+  // AMTC bring-up fix: keep an explicit miss-pending state.
+  // Without IS, repeated scalar Fetches to the same missing line keep issuing
+  // GETS requests while the first response is still pending.  VIPERSequencer
+  // then accumulates several read-table entries for one cache line, but the
+  // SQC controller only receives one Data response and calls readCallback once,
+  // causing Sequencer deadlock on lines such as 0x19d7000.
+  transition(I, Fetch, IS) {TagArrayRead, TagArrayWrite} {
     nS_issueRdBlkS;
-    uu_profileDataMiss; // since line wasn't in SQC, we missed
+    uu_profileDataMiss;
+    p_popMandatoryQueue;
+  }
+
+  transition(IS, Fetch) {TagArrayRead} {
+    st_stallMandatoryQueue;
+  }
+
+  // Kernel/SQC invalidation can arrive while a miss is pending.  Complete the
+  // invalidate command but keep the outstanding miss state.
+  transition(IS, Evict, IS) {TagArrayRead, TagArrayWrite} {
+    ic_invCache;
+    inv_invDone;
     p_popMandatoryQueue;
   }
 

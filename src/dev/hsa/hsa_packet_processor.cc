@@ -71,6 +71,40 @@
 namespace gem5
 {
 
+namespace
+{
+
+constexpr uint32_t AmtcHsappMaxDebugQueues = 256;
+
+struct AmtcHsappDmaDebugState
+{
+    bool valid = false;
+    uint32_t rlIdx = 0;
+    int pid = -1;
+    uint32_t dmaStartIx = 0;
+    uint32_t numPkts = 0;
+    uint32_t bytes = 0;
+    uint32_t qRd = 0;
+    uint32_t qWr = 0;
+    Addr host = 0;
+    void *dest = nullptr;
+    Tick issueTick = 0;
+};
+
+AmtcHsappDmaDebugState amtcHsappDmaDebug[AmtcHsappMaxDebugQueues];
+
+AmtcHsappDmaDebugState *
+amtcHsappDmaState(uint32_t rl_idx)
+{
+    if (rl_idx >= AmtcHsappMaxDebugQueues)
+        return nullptr;
+
+    return &amtcHsappDmaDebug[rl_idx];
+}
+
+} // anonymous namespace
+
+
 HSAPP_EVENT_DESCRIPTION_GENERATOR(QueueProcessEvent)
 
 HSAPacketProcessor::HSAPacketProcessor(const Params &p)
@@ -238,6 +272,27 @@ HSAPacketProcessor::cmdQueueCmdDma(HSAPacketProcessor *hsaPP, int pid,
         hsaPP->regdQList[rl_idx]->qCntxt.aqlBuf;
     HSAQueueDescriptor* qDesc =
         hsaPP->regdQList[rl_idx]->qCntxt.qDesc;
+    AmtcHsappDmaDebugState *dbg_state = amtcHsappDmaState(rl_idx);
+    warn("AMTC_HSAPP_DMA_CALLBACK_ENTER tick=%llu rl_idx=%u pid=%d "
+         "isRead=%d ix_start=%u num_pkts=%u pktsRemaining=%u "
+         "dest=%p q_rd=%u q_wr=%u dma_busy=%d inflight_valid=%d "
+         "inflight_ix=%u inflight_host=%#llx inflight_dest=%p "
+         "issue_tick=%llu age=%llu\n",
+         (unsigned long long)curTick(), rl_idx, pid, isRead, ix_start,
+         num_pkts, series_ctx->pkts_2_go, dest_4debug,
+         qDesc->readIndex, qDesc->writeIndex, qDesc->dmaInProgress,
+         dbg_state ? dbg_state->valid : false,
+         dbg_state ? dbg_state->dmaStartIx : 0,
+         (unsigned long long)(dbg_state ? dbg_state->host : 0),
+         dbg_state ? dbg_state->dest : nullptr,
+         (unsigned long long)(dbg_state ? dbg_state->issueTick : 0),
+         (unsigned long long)((dbg_state && dbg_state->valid) ?
+             curTick() - dbg_state->issueTick : 0));
+    warn("AMTC_HSAPP_DMA_DONE tick=%llu rl_idx=%u pid=%d isRead=%d "
+         "ix_start=%u num_pkts=%u pktsRemaining=%u dest=%p q_rd=%u q_wr=%u\n",
+         (unsigned long long)curTick(), rl_idx, pid, isRead, ix_start,
+         num_pkts, series_ctx->pkts_2_go, dest_4debug,
+         qDesc->readIndex, qDesc->writeIndex);
     DPRINTF(HSAPacketProcessor, ">%s, ix = %d, npkts = %d," \
             " pktsRemaining = %d, active list ID = %d\n", __FUNCTION__,
             ix_start, num_pkts, series_ctx->pkts_2_go,
@@ -247,6 +302,13 @@ HSAPacketProcessor::cmdQueueCmdDma(HSAPacketProcessor *hsaPP, int pid,
         if (series_ctx->pkts_2_go == 0) {
             // Mark DMA as completed
             qDesc->dmaInProgress = false;
+            if (dbg_state)
+                dbg_state->valid = false;
+            warn("AMTC_HSAPP_DMA_SERIES_COMPLETE tick=%llu rl_idx=%u "
+                 "rdIdx=%u wrIdx=%u aql_rd=%u aql_wr=%u disp=%u\n",
+                 (unsigned long long)curTick(), rl_idx, qDesc->readIndex,
+                 qDesc->writeIndex, aqlRingBuffer->rdIdx(),
+                 aqlRingBuffer->wrIdx(), aqlRingBuffer->dispIdx());
             DPRINTF(HSAPacketProcessor,
                     "%s: schedule Qwakeup next cycle, rdIdx %d, wrIdx %d," \
                     " dispIdx %d, active list ID = %d\n",
@@ -263,6 +325,10 @@ void
 HSAPacketProcessor::schedAQLProcessing(uint32_t rl_idx, Tick delay)
 {
     RQLEntry *queue = regdQList[rl_idx];
+    warn("AMTC_HSAPP_SCHED_AQL_REQ tick=%llu rl_idx=%u delay=%llu "
+         "already=%d\n",
+         (unsigned long long)curTick(), rl_idx,
+         (unsigned long long)delay, queue->aqlProcessEvent.scheduled());
     if (!queue->aqlProcessEvent.scheduled()) {
         Tick processingTick = curTick() + delay;
         schedule(queue->aqlProcessEvent, processingTick);
@@ -293,6 +359,11 @@ HSAPacketProcessor::processPkt(void* pkt, uint32_t rl_idx, Addr host_pkt_addr)
     // have header information at offset zero
     auto disp_pkt = (_hsa_dispatch_packet_t *)pkt;
     hsa_packet_type_t pkt_type = PKT_TYPE(disp_pkt);
+    warn("AMTC_HSAPP_PKT_SEEN tick=%llu rl_idx=%u host=%#llx "
+         "header=%#x type=%u barrier=%u\n",
+         (unsigned long long)curTick(), rl_idx,
+         (unsigned long long)host_pkt_addr, disp_pkt->header, pkt_type,
+         IS_BARRIER(disp_pkt));
     if (IS_BARRIER(disp_pkt) &&
         regdQList[rl_idx]->compltnPending() > 0) {
         // If this packet is using the "barrier bit" to enforce ordering with
@@ -436,6 +507,12 @@ HSAPacketProcessor::QueueProcessEvent::process()
             " dispIdx %d, active list ID = %d\n",
             __FUNCTION__, aqlRingBuffer->rdIdx(),
             aqlRingBuffer->wrIdx(), aqlRingBuffer->dispIdx(), rqIdx);
+    warn("AMTC_HSAPP_QWAKE tick=%llu rl_idx=%u rd=%u wr=%u disp=%u "
+         "pending=%d barrier=%d\n",
+         (unsigned long long)curTick(), rqIdx, aqlRingBuffer->rdIdx(),
+         aqlRingBuffer->wrIdx(), aqlRingBuffer->dispIdx(),
+         hsaPP->regdQList[rqIdx]->dispPending(),
+         hsaPP->regdQList[rqIdx]->getBarrierBit());
     // If barrier bit is set, then this wakeup is a dummy wakeup
     // just to model the processing time. Do nothing.
     if (hsaPP->regdQList[rqIdx]->getBarrierBit()) {
@@ -505,6 +582,26 @@ HSAPacketProcessor::getCommandsFromHost(int pid, uint32_t rl_idx)
             qDesc->writeIndex, pid, qDesc->doorbellPointer);
 
     if (qDesc->dmaInProgress) {
+        AmtcHsappDmaDebugState *dbg_state = amtcHsappDmaState(rl_idx);
+        warn("AMTC_HSAPP_DMA_BUSY_RETURN tick=%llu rl_idx=%u pid=%d "
+             "rdIdx=%u wrIdx=%u doorbell=%#x space=%u\n",
+             (unsigned long long)curTick(), rl_idx, pid,
+             qDesc->readIndex, qDesc->writeIndex, qDesc->doorbellPointer,
+             qDesc->spaceUsed());
+        warn("AMTC_HSAPP_DMA_BUSY_RETURN_DETAIL tick=%llu rl_idx=%u pid=%d "
+             "rdIdx=%u wrIdx=%u doorbell=%#x space=%u "
+             "inflight_valid=%d inflight_ix=%u inflight_host=%#llx "
+             "inflight_dest=%p inflight_bytes=%u issue_tick=%llu age=%llu\n",
+             (unsigned long long)curTick(), rl_idx, pid,
+             qDesc->readIndex, qDesc->writeIndex, qDesc->doorbellPointer,
+             qDesc->spaceUsed(), dbg_state ? dbg_state->valid : false,
+             dbg_state ? dbg_state->dmaStartIx : 0,
+             (unsigned long long)(dbg_state ? dbg_state->host : 0),
+             dbg_state ? dbg_state->dest : nullptr,
+             dbg_state ? dbg_state->bytes : 0,
+             (unsigned long long)(dbg_state ? dbg_state->issueTick : 0),
+             (unsigned long long)((dbg_state && dbg_state->valid) ?
+                 curTick() - dbg_state->issueTick : 0));
         // we'll try again when this dma transfer completes in updateReadIndex
         return;
     }
@@ -517,6 +614,11 @@ HSAPacketProcessor::getCommandsFromHost(int pid, uint32_t rl_idx)
     // Available AQL buffer size. If the available buffer is less than
     // demanded, number of available buffer is returned
     uint32_t got_aql_buf = aqlRingBuffer->allocEntry(num_umq);
+    warn("AMTC_HSAPP_ALLOC_RESULT tick=%llu rl_idx=%u pid=%d "
+         "num_umq=%u got=%u q_rd_before=%u q_wr=%u aql_wr=%u aql_rd=%u\n",
+         (unsigned long long)curTick(), rl_idx, pid, num_umq, got_aql_buf,
+         qDesc->readIndex, qDesc->writeIndex,
+         aqlRingBuffer->wrIdx(), aqlRingBuffer->rdIdx());
     qDesc->readIndex += got_aql_buf;
     uint32_t dma_start_ix = (aqlRingBuffer->wrIdx() - got_aql_buf) %
         ttl_aql_buf;
@@ -551,8 +653,37 @@ HSAPacketProcessor::getCommandsFromHost(int pid, uint32_t rl_idx)
             [ = ] (const uint32_t &dma_data)
                 { this->cmdQueueCmdDma(this, pid, true, dma_start_ix,
                                 num_2_xfer, series_ctx, aql_buf); }, 0);
-        dmaReadVirt(qDesc->ptr(umq_nxt), num_2_xfer * qDesc->objSize(),
-                    cb, aql_buf);
+        Addr host_pkt_addr = qDesc->ptr(umq_nxt);
+        uint32_t dma_bytes = num_2_xfer * qDesc->objSize();
+        if (AmtcHsappDmaDebugState *dbg_state = amtcHsappDmaState(rl_idx)) {
+            dbg_state->valid = true;
+            dbg_state->rlIdx = rl_idx;
+            dbg_state->pid = pid;
+            dbg_state->dmaStartIx = dma_start_ix;
+            dbg_state->numPkts = num_2_xfer;
+            dbg_state->bytes = dma_bytes;
+            dbg_state->qRd = qDesc->readIndex;
+            dbg_state->qWr = qDesc->writeIndex;
+            dbg_state->host = host_pkt_addr;
+            dbg_state->dest = aql_buf;
+            dbg_state->issueTick = curTick();
+        }
+        warn("AMTC_HSAPP_DMA_ISSUE_DETAIL tick=%llu rl_idx=%u pid=%d "
+             "host=%#llx dest=%p dma_start_ix=%u num2xfer=%u bytes=%u "
+             "q_rd=%u q_wr=%u aql_wr=%u aql_disp=%u dma_busy=%d\n",
+             (unsigned long long)curTick(), rl_idx, pid,
+             (unsigned long long)host_pkt_addr, aql_buf, dma_start_ix,
+             num_2_xfer, dma_bytes, qDesc->readIndex, qDesc->writeIndex,
+             aqlRingBuffer->wrIdx(), aqlRingBuffer->dispIdx(),
+             qDesc->dmaInProgress);
+        warn("AMTC_HSAPP_DMA_ISSUE tick=%llu rl_idx=%u pid=%d "
+             "host=%#llx dest=%p dma_start_ix=%u num2xfer=%u bytes=%u "
+             "q_rd=%u q_wr=%u aql_wr=%u aql_disp=%u\n",
+             (unsigned long long)curTick(), rl_idx, pid,
+             (unsigned long long)host_pkt_addr, aql_buf, dma_start_ix,
+             num_2_xfer, dma_bytes, qDesc->readIndex, qDesc->writeIndex,
+             aqlRingBuffer->wrIdx(), aqlRingBuffer->dispIdx());
+        dmaReadVirt(host_pkt_addr, dma_bytes, cb, aql_buf);
 
         aqlRingBuffer->saveHostDispAddr(qDesc->ptr(umq_nxt), num_2_xfer,
                                         dma_start_ix);

@@ -48,11 +48,13 @@
 #include <vector>
 
 #include "base/intmath.hh"
+#include "base/logging.hh"
 #include "base/types.hh"
 #include "dev/hsa/hsa_packet.hh"
 #include "dev/hsa/hsa_queue.hh"
 #include "enums/GfxVersion.hh"
 #include "gpu-compute/kernel_code.hh"
+#include "sim/cur_tick.hh"
 
 namespace gem5
 {
@@ -362,7 +364,16 @@ class HSAQueueEntry
     void
     updateOutstandingInvs(int val)
     {
+        int before = _outstandingInvs;
         _outstandingInvs += val;
+        warn("AMTC_HSAQE_INV_UPDATE tick=%llu task=%p dispatch_id=%d queue_id=%u val=%d before=%d after=%d\n",
+             (unsigned long long)curTick(), this, _dispatchId, _queueId,
+             val, before, _outstandingInvs);
+        if (_outstandingInvs < 0) {
+            warn("AMTC_HSAQE_INV_NEGATIVE tick=%llu task=%p dispatch_id=%d queue_id=%u val=%d before=%d after=%d\n",
+                 (unsigned long long)curTick(), this, _dispatchId, _queueId,
+                 val, before, _outstandingInvs);
+        }
         assert(_outstandingInvs >= 0);
     }
 
@@ -372,6 +383,9 @@ class HSAQueueEntry
     void
     markInvDone()
     {
+        warn("AMTC_HSAQE_INV_MARK_DONE tick=%llu task=%p dispatch_id=%d queue_id=%u before=%d after=0\n",
+             (unsigned long long)curTick(), this, _dispatchId, _queueId,
+             _outstandingInvs);
         _outstandingInvs = 0;
     }
 
@@ -381,6 +395,11 @@ class HSAQueueEntry
     bool
     isInvDone() const
     {
+        if (_outstandingInvs < 0) {
+            warn("AMTC_HSAQE_INV_DONE_NEGATIVE tick=%llu task=%p dispatch_id=%d queue_id=%u outstanding=%d\n",
+                 (unsigned long long)curTick(), this, _dispatchId, _queueId,
+                 _outstandingInvs);
+        }
         assert(_outstandingInvs >= 0);
         return (_outstandingInvs == 0);
     }

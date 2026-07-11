@@ -143,6 +143,7 @@ class Sequencer : public RubyPort
     void completeHitCallback(std::vector<PacketPtr>& list);
     void invL1Callback();
     void invL1();
+    void invL1CallbackIfPending();
 
     RequestStatus makeRequest(PacketPtr pkt) override;
     virtual bool empty() const;

@@ -38,3 +38,22 @@ configs/dram/lowp_sweep.cfg
 .vscode
 typings
 .DS_Store
+
+# AMTC local backup / bring-up copies
+src/mem/ruby/protocol/AMTC/*_PASSED
+src/mem/ruby/protocol/AMTC/*_success_*
+src/mem/ruby/protocol/AMTC/*_stale_ack*
+src/mem/ruby/protocol/AMTC/*_84
+src/mem/ruby/protocol/AMTC/*_86
+src/mem/ruby/protocol/AMTC/*_87
+src/mem/ruby/protocol/AMTC/*_90
+src/mem/ruby/protocol/AMTC/*.bak
+src/mem/ruby/protocol/AMTC/old/
+src/mem/ruby/protocol/AMTC/old_16B/
+src/mem/ruby/protocol/AMTC/working*/
+m5out*/
+m5out-*/
+*.log
+build_log.txt
+debug.log
+run.log
