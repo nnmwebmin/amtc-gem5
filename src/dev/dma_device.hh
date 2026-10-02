@@ -42,8 +42,9 @@
 #define __DEV_DMA_DEVICE_HH__
 
 #include <deque>
-#include <optional>
 #include <memory>
+#include <optional>
+#include <string>
 
 #include "base/addr_range_map.hh"
 #include "base/chunk_generator.hh"
@@ -170,6 +171,22 @@ class DmaPort : public RequestPort, public Drainable
 
     /** Event used to schedule a future sending from the transmit list. */
     EventFunctionWrapper sendEvent;
+
+    /**
+     * AMTC debug-only watchdog for timing DMA requests that were accepted by
+     * the memory system but never produced a timing response.  This does not
+     * change DMA behavior; it only preserves the last accepted in-flight
+     * packet after transmitList has been popped.
+     */
+    EventFunctionWrapper amtcDmaWatchdogEvent;
+
+    bool amtcDmaTraceValid = false;
+    Addr amtcDmaTraceAddr = 0;
+    unsigned amtcDmaTraceSize = 0;
+    std::string amtcDmaTraceCmd;
+    Tick amtcDmaTraceIssueTick = 0;
+
+    void amtcDmaWatchdog();
 
     /** Number of outstanding packets the dma port has. */
     uint32_t pendingCount = 0;

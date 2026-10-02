@@ -5,12 +5,12 @@
  * All rights reserved.
  *
  * Heterogeneous Sector Token Coherence (AMTC) - GPU TCP (L1 Data Cache)
- * Phase 1: Strict 2-Sector Minimal Viable AMTC + Token Conservation Lock
+ * V10.3: strict 2-sector replacement + correct GPU coalescer callbacks
  */
 
 
 machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
- : VIPERCoalescer* coalescer; // GPU CU/TCP frontend; use when use_seq_not_coal == false
+ : VIPERCoalescer* coalescer; // Retained for python config binding, unused in logic
    Sequencer* sequencer;
    bool use_seq_not_coal;
    CacheMemory * L1cache;
@@ -27,6 +27,8 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
   MessageBuffer * probeToTCP, network="From", virtual_network="1", vnet_type="request";
   MessageBuffer * responseToTCP, network="From", virtual_network="3", vnet_type="response";
   MessageBuffer * mandatoryQueue;
+
+
 {
   state_declaration(State, desc="TCP Cache States", default="TCP_State_I") {
     I, AccessPermission:Invalid,   desc="Invalid";
@@ -37,13 +39,16 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
 
   enumeration(Event, desc="TCP Events") {
     // Core initiated
-    Load,            desc="Load";
+    Load,            desc="Load hit in the requested AMTC sector(s)";
+    LoadMiss,        desc="Load miss in one or more requested AMTC sectors";
     Store,           desc="Store to L1 (L1 is dirty)";
-    StoreThrough,    desc="Store directly to L2(L1 is clean)";
+    StoreThrough,    desc="Store through an existing requested sector";
+    StoreNoAlloc,    desc="Store/atomic write-through without TCP allocation";
 
     // Disabled Stage 2.1 paths
     // LoadBypassEvict, desc="Bypass L1 on a load.";
-    // Atomic,          desc="Atomic";
+    Atomic,          desc="GPU atomic request";
+    AtomicData,      desc="Atomic result returned from TCC";
     // Flush,           desc="Flush if dirty(wbL1 for Store Release)";
     // Evict,           desc="Evict if clean(invL1 for Load Acquire)";
 
@@ -51,7 +56,6 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
     Repl,            desc="Replacing block from cache for response-side allocation";
     Local_Repl,      desc="Replacement request from local TCP/Sequencer cache walk";
     InvL2,           desc="Invalidate to L2";
-    InvL2Resp,       desc="Invalidate L2 completed";
 
     // AMTC Network Responses
     Data_Shared,     desc="Data response from network (DATA_SHARED/DATA_OWNER)";
@@ -285,10 +289,32 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
     return (max_tokens() / 2) * active;
   }
 
-  // STRICT 2-SECTOR MATH
+  // Calculate the exact sector set touched by a GPU memory request.
+  // LineAddress is 64-byte aligned, so it must never be used by itself to
+  // infer the 32-byte sector.  PhysicalAddress and Size carry that detail.
+  int amtc_getRequiredSectorMask(Addr line_addr, Addr phys_addr, int size) {
+    int offset := getOffset(phys_addr);
+    int end_byte := offset + size - 1;
+    int mask := 0;
+
+    if (offset < 32) {
+      mask := mask + 1;
+    }
+    if (end_byte >= 32) {
+      mask := mask + 2;
+    }
+
+    // Defensive fallback for malformed zero-sized requests.
+    if (mask == 0) {
+      mask := amtc_fullMask();
+    }
+    return amtc_sanitizeMask(mask);
+  }
+
+  // Retained only for inputs that are known to contain the byte address.
+  // Do not call this helper with RubyRequest.LineAddress.
   int getSector(Addr addr) {
-    if ((addr % 64) < 32) { return 0; }
-    else { return 1; }
+    return amtc_sectorFromAddr(addr);
   }
 
   int amtc_singleSectorMaskFromId(int sid) {
@@ -410,7 +436,17 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
 
         if (in_msg.Type == CoherenceResponseType:DATA_SHARED ||
             in_msg.Type == CoherenceResponseType:DATA_OWNER) {
-          if (disableL1 || in_msg.isGLCSet || in_msg.isSLCSet) {
+
+          // Atomic responses use the same AMTC data response type, but the
+          // pending TCP TBE is in State:A.  Complete them with
+          // coalescer.atomicCallback() instead of the normal read/fill path.
+          if (getState(tbe, cache_entry, in_msg.addr) == State:A) {
+            DPRINTF(RubySlicc,
+                    "AMTC_TCP_ATOMIC_DATA_IN addr=%#x type=%s sender=%s\n",
+                    in_msg.addr, in_msg.Type, in_msg.Sender);
+            trigger(Event:AtomicData, in_msg.addr, cache_entry, tbe);
+
+          } else if (disableL1 || in_msg.isGLCSet || in_msg.isSLCSet) {
               trigger(Event:Bypass, in_msg.addr, cache_entry, tbe);
           } else {
             if (is_valid(cache_entry) || L1cache.cacheAvail(in_msg.addr)) {
@@ -429,8 +465,6 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
                     "AMTC_TCP_STALE_OWNER_ACK_IN addr=%#x sender=%s mask=%d ",
                     in_msg.addr, in_msg.Sender, in_msg.requested_sector_mask);
             trigger(Event:StaleOwnerAck, in_msg.addr, cache_entry, tbe);
-        } else if (in_msg.Type == CoherenceResponseType:InvL2Resp) {
-            trigger(Event:InvL2Resp, in_msg.addr, cache_entry, tbe);
         } else if (in_msg.Type == CoherenceResponseType:ACK) {
             trigger(Event:Ack, in_msg.addr, cache_entry, tbe);
         } else {
@@ -448,47 +482,83 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
 
         // 1. FLUSH & No-Addr Requests
         if (in_msg.Type == RubyRequestType:hasNoAddr || in_msg.Type == RubyRequestType:FLUSH) {
-          // CRITICAL FIX: Unblock the correct front-end object.  Normal CU TCPs
-          // use VIPERCoalescer; command-processor TCPs use RubySequencer.
+          // Unblock the frontend which owns this request.  VIPERCoalescer's
+          // AMTC-msg signature is readCallback(Addr, MachineType, DataBlock,
+          // bool), where the final bool records hit/external-hit status.
           if (use_seq_not_coal) {
-            DPRINTF(RubySlicc,
-                    "AMTC_TCP_SEQ_READ_CALLBACK_NOADDR addr=%#x type=%s\n",
-                    in_msg.LineAddress, in_msg.Type);
             sequencer.readCallback(in_msg.LineAddress, cache_entry.DataBlk,
                                    true, MachineType:L1Cache);
           } else {
-            DPRINTF(RubySlicc,
-                    "AMTC_TCP_COAL_READ_CALLBACK_NOADDR addr=%#x type=%s\n",
-                    in_msg.LineAddress, in_msg.Type);
             coalescer.readCallback(in_msg.LineAddress, MachineType:L1Cache,
                                    cache_entry.DataBlk, true);
           }
           mandatoryQueue_in.dequeue(clockEdge());
         }
-        // 2. Standard Loads
+        // 2. Standard Loads.  A TCP line in V is a hit only when every
+        // requested 32-byte sector is locally valid.
         else if (in_msg.Type == RubyRequestType:LD) {
-          trigger(Event:Load, in_msg.LineAddress, cache_entry, tbe);
+          int needed_mask := amtc_getRequiredSectorMask(in_msg.LineAddress,
+                                                        in_msg.PhysicalAddress,
+                                                        in_msg.Size);
+          int local_valid_mask := 0;
+          if (is_valid(cache_entry)) {
+            local_valid_mask := cache_entry.ValidSectors;
+          }
+          DPRINTF(RubySlicc,
+                  "AMTC_TCP_MANDATORY_MASK line=%#x phys=%#x size=%d mask=%d type=%s valid=%d\n",
+                  in_msg.LineAddress, in_msg.PhysicalAddress, in_msg.Size,
+                  needed_mask, in_msg.Type, local_valid_mask);
+
+          if (is_valid(cache_entry) &&
+              getState(tbe, cache_entry, in_msg.LineAddress) == State:V &&
+              amtc_maskContainsAll(cache_entry.ValidSectors, needed_mask)) {
+            trigger(Event:Load, in_msg.LineAddress, cache_entry, tbe);
+          } else {
+            trigger(Event:LoadMiss, in_msg.LineAddress, cache_entry, tbe);
+          }
         }
-        // 3. Stores AND Atomics
-        else if (in_msg.Type == RubyRequestType:ST || in_msg.Type == RubyRequestType:ATOMIC) {
-          // CRITICAL FIX: Treat ATOMICs as StoreThroughs so the data reaches L2
-          if(disableL1 || in_msg.isGLCSet || in_msg.isSLCSet || in_msg.Type == RubyRequestType:ATOMIC) {
+        // 3a. GPU atomics that require the real atomic protocol path.
+        // ATOMIC_RETURN must return the pre-RMW value to GPUCoalescer, so do
+        // not collapse it into the store/write-through path.
+        else if (in_msg.Type == RubyRequestType:ATOMIC_RETURN ||
+                 in_msg.Type == RubyRequestType:ATOMIC_NO_RETURN) {
+          DPRINTF(RubySlicc,
+                  "AMTC_TCP_ATOMIC_IN line=%#x phys=%#x size=%d type=%s seq=%llu\n",
+                  in_msg.LineAddress, in_msg.PhysicalAddress, in_msg.Size,
+                  in_msg.Type, in_msg.instSeqNum);
+          trigger(Event:Atomic, in_msg.LineAddress, cache_entry, tbe);
+        }
+        // 3b. Stores and legacy RubyRequestType:ATOMIC.  Keep the existing
+        // write-through behavior for the generic ATOMIC case to avoid
+        // regressing earlier AMTC functional tests.
+        else if (in_msg.Type == RubyRequestType:ST ||
+                 in_msg.Type == RubyRequestType:ATOMIC) {
+          int needed_mask := amtc_getRequiredSectorMask(in_msg.LineAddress,
+                                                        in_msg.PhysicalAddress,
+                                                        in_msg.Size);
+          int local_valid_mask := 0;
+          if (is_valid(cache_entry)) {
+            local_valid_mask := cache_entry.ValidSectors;
+          }
+          DPRINTF(RubySlicc,
+                  "AMTC_TCP_MANDATORY_MASK line=%#x phys=%#x size=%d mask=%d type=%s valid=%d\n",
+                  in_msg.LineAddress, in_msg.PhysicalAddress, in_msg.Size,
+                  needed_mask, in_msg.Type, local_valid_mask);
+
+          if (is_valid(cache_entry) &&
+              getState(tbe, cache_entry, in_msg.LineAddress) == State:V &&
+              amtc_maskContainsAll(cache_entry.ValidSectors, needed_mask)) {
             trigger(Event:StoreThrough, in_msg.LineAddress, cache_entry, tbe);
           } else {
-            if (is_valid(cache_entry) || L1cache.cacheAvail(in_msg.LineAddress)) {
-              trigger(Event:StoreThrough, in_msg.LineAddress, cache_entry, tbe);
-            } else {
-              Addr victim := L1cache.cacheProbe(in_msg.LineAddress);
-              trigger(Event:Repl, victim, getCacheEntry(victim), TBEs.lookup(victim));
-            }
+            trigger(Event:StoreNoAlloc, in_msg.LineAddress, cache_entry, tbe);
           }
         }
         // 4. Replacements & Invalidations
         else if (in_msg.Type == RubyRequestType:REPLACEMENT) {
-          // Kernel-launch INV_L1 MemSyncReq may reach TCP as replacement-style
-          // local invalidate.  Completion must remain guarded because cache-walk
-          // can generate invalid addr=0 replacement entries with no pending
-          // Sequencer cache-invalidate packet.
+          // Kernel-launch INV_L1 MemSyncReq reaches TCP as a replacement-style
+          // local invalidate.  It must complete with sequencer.invL1Callback(),
+          // mirroring AMTC-SQC's Evict path, otherwise GPUDispatcher waits
+          // forever with outstandingInvs > 0.
           DPRINTF(RubySlicc,
                   "AMTC_TCP_MANDATORY_REPLACEMENT_INV addr=%#x type=%s state=%s\n",
                   in_msg.LineAddress, in_msg.Type, getState(tbe, cache_entry, in_msg.LineAddress));
@@ -500,15 +570,9 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
         else {
           DPRINTF(RubySlicc, "Dropping unsupported mandatory request %s\n", in_msg.Type);
           if (use_seq_not_coal) {
-            DPRINTF(RubySlicc,
-                    "AMTC_TCP_SEQ_READ_CALLBACK_DROP addr=%#x type=%s\n",
-                    in_msg.LineAddress, in_msg.Type);
             sequencer.readCallback(in_msg.LineAddress, cache_entry.DataBlk,
                                    true, MachineType:L1Cache);
           } else {
-            DPRINTF(RubySlicc,
-                    "AMTC_TCP_COAL_READ_CALLBACK_DROP addr=%#x type=%s\n",
-                    in_msg.LineAddress, in_msg.Type);
             coalescer.readCallback(in_msg.LineAddress, MachineType:L1Cache,
                                    cache_entry.DataBlk, true);
           }
@@ -538,6 +602,114 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
   // ==========================================================
   // Actions
   // ==========================================================
+
+  // Invalidate exactly the sectors touched by the current mandatory
+  // request.  The write-through action must run first so selected tokens and
+  // data reach TCC before local ownership is cleared.
+  action(ysm_invalidateMandatorySectors, "ysm",
+         desc="invalidate sectors selected by mandatory PhysicalAddress/Size") {
+    peek(mandatoryQueue_in, RubyRequest) {
+      int req_mask := amtc_getRequiredSectorMask(in_msg.LineAddress,
+                                                  in_msg.PhysicalAddress,
+                                                  in_msg.Size);
+      if (is_valid(cache_entry)) {
+        if (amtc_maskHasSector(req_mask, 0)) {
+          cache_entry.TokensSec0 := 0;
+        }
+        if (amtc_maskHasSector(req_mask, 1)) {
+          cache_entry.TokensSec1 := 0;
+        }
+
+        cache_entry.ValidSectors :=
+            amtc_subtractMask(cache_entry.ValidSectors, req_mask);
+
+        // TCP stores are write-through.  No modified data remains pending
+        // after wt_writeThrough/wtna_writeThroughNoAlloc has enqueued it.
+        cache_entry.Dirty := false;
+        cache_entry.writeMask.clear();
+
+        DPRINTF(RubySlicc,
+                "AMTC_TCP_INVALIDATE_MANDATORY addr=%#x mask=%d remain=%d t0=%d t1=%d\n",
+                address, req_mask, cache_entry.ValidSectors,
+                cache_entry.TokensSec0, cache_entry.TokensSec1);
+
+        if (cache_entry.ValidSectors == 0) {
+          assert(cache_entry.TokensSec0 == 0);
+          assert(cache_entry.TokensSec1 == 0);
+          L1cache.deallocate(address);
+          unset_cache_entry();
+        }
+      }
+    }
+  }
+
+  // Response-side and local cache-walk replacements reclaim a complete 64B
+  // TCP allocation.  TCP data stores are write-through, so eviction only has
+  // to return the exact sector-token payload before the tag is deallocated.
+  action(rv_returnVictimTokensToTCC, "rvt",
+         desc="return all TCP victim tokens to TCC before replacement") {
+    if (is_valid(cache_entry)) {
+      int token_mask := amtc_payloadTokenMask(cache_entry.TokensSec0,
+                                               cache_entry.TokensSec1);
+      if (token_mask != 0) {
+        enqueue(responseNetwork_out, ResponseMsg, issue_latency) {
+          out_msg.addr := address;
+          out_msg.sector_id := amtc_primarySectorFromMask(token_mask);
+          out_msg.Sender := machineID;
+          out_msg.Destination.add(mapAddressToRange(address, MachineType:TCC,
+                                  TCC_select_low_bit, TCC_select_num_bits));
+          out_msg.Type := CoherenceResponseType:WB_TOKENS;
+          out_msg.MessageSize := MessageSizeType:Writeback_Control;
+          out_msg.sector_mask := token_mask;
+          out_msg.requested_sector_mask := token_mask;
+          out_msg.valid_sector_mask := 0;
+          out_msg.token_sector_mask := token_mask;
+          out_msg.TokensSec0 := cache_entry.TokensSec0;
+          out_msg.TokensSec1 := cache_entry.TokensSec1;
+          out_msg.DataBlk := cache_entry.DataBlk;
+          out_msg.Dirty := false;
+          out_msg.isGLCSet := false;
+          out_msg.isSLCSet := false;
+        }
+      }
+
+      DPRINTF(RubySlicc,
+              "AMTC_TCP_REPL_RETURN_TOKENS addr=%#x state=%s valid=%d mask=%d t0=%d t1=%d dirty=%d\n",
+              address, getState(tbe, cache_entry, address),
+              cache_entry.ValidSectors, token_mask,
+              cache_entry.TokensSec0, cache_entry.TokensSec1,
+              cache_entry.Dirty);
+
+      cache_entry.TokensSec0 := 0;
+      cache_entry.TokensSec1 := 0;
+    }
+  }
+
+  action(rv_deallocateVictim, "rvd",
+         desc="deallocate complete TCP victim after token return") {
+    if (is_valid(cache_entry)) {
+      assert(cache_entry.TokensSec0 == 0);
+      assert(cache_entry.TokensSec1 == 0);
+
+      DPRINTF(RubySlicc,
+              "AMTC_TCP_REPL_RECLAIM_WHOLE_LINE addr=%#x state=%s valid=%d\n",
+              address, getState(tbe, cache_entry, address),
+              cache_entry.ValidSectors);
+
+      cache_entry.ValidSectors := 0;
+      cache_entry.Dirty := false;
+      cache_entry.writeMask.clear();
+      L1cache.deallocate(address);
+      unset_cache_entry();
+
+      DPRINTF(RubySlicc,
+              "AMTC_TCP_REPL_RECLAIM_DONE addr=%#x\n", address);
+    } else {
+      DPRINTF(RubySlicc,
+              "AMTC_TCP_REPL_NO_LIVE_ENTRY addr=%#x state=%s\n",
+              address, getState(tbe, cache_entry, address));
+    }
+  }
 
   action(ys_invalidateSector, "ys", desc="invalidate only requested sector") {
     if (is_valid(cache_entry)) {
@@ -582,28 +754,73 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
             getState(tbe, cache_entry, address));
   }
 
-  action(n_issueRdBlk, "n", desc="Issue AMTC GETS") {
-    enqueue(requestNetwork_out, RequestMsg, issue_latency) {
-      out_msg.addr := address;
-      out_msg.sector_id := getSector(address);
-      out_msg.Type := CoherenceRequestType:GETS;
-      out_msg.Requestor := machineID;
-      out_msg.Destination.add(mapAddressToRange(address,MachineType:TCC,
-                              TCC_select_low_bit, TCC_select_num_bits));
-      out_msg.MessageSize := MessageSizeType:Request_Control;
-
-      // Request exact sector mask
-      if (out_msg.sector_id == 0) {
-        out_msg.requested_sector_mask := 1;
-      } else {
-        out_msg.requested_sector_mask := 2;
-      }
-      out_msg.sector_mask := out_msg.requested_sector_mask;
-      out_msg.is_gpu := true;
-
-      peek(mandatoryQueue_in, RubyRequest) {
+  action(n_issueRdBlk, "n", desc="Issue AMTC GETS for exact request sectors") {
+    peek(mandatoryQueue_in, RubyRequest) {
+      int req_mask := amtc_getRequiredSectorMask(in_msg.LineAddress,
+                                                  in_msg.PhysicalAddress,
+                                                  in_msg.Size);
+      enqueue(requestNetwork_out, RequestMsg, issue_latency) {
+        out_msg.addr := in_msg.LineAddress;
+        out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+        out_msg.Type := CoherenceRequestType:GETS;
+        out_msg.Requestor := machineID;
+        out_msg.Destination.add(mapAddressToRange(in_msg.LineAddress,
+                                MachineType:TCC, TCC_select_low_bit,
+                                TCC_select_num_bits));
+        out_msg.MessageSize := MessageSizeType:Request_Control;
+        out_msg.requested_sector_mask := req_mask;
+        out_msg.sector_mask := req_mask;
+        out_msg.is_gpu := true;
         out_msg.isGLCSet := in_msg.isGLCSet;
         out_msg.isSLCSet := in_msg.isSLCSet;
+
+        DPRINTF(RubySlicc,
+                "AMTC_TCP_GETS_OUT line=%#x phys=%#x size=%d mask=%d sid=%d\n",
+                in_msg.LineAddress, in_msg.PhysicalAddress, in_msg.Size,
+                req_mask, out_msg.sector_id);
+      }
+    }
+  }
+
+  action(at_atomicThrough, "at", desc="send GPU atomic request to AMTC TCC") {
+    peek(mandatoryQueue_in, RubyRequest) {
+      int req_mask := amtc_getRequiredSectorMask(in_msg.LineAddress,
+                                                  in_msg.PhysicalAddress,
+                                                  in_msg.Size);
+
+      enqueue(requestNetwork_out, RequestMsg, issue_latency) {
+        out_msg.addr := in_msg.LineAddress;
+        out_msg.Requestor := machineID;
+        out_msg.Destination.add(mapAddressToRange(in_msg.LineAddress,
+                                MachineType:TCC, TCC_select_low_bit,
+                                TCC_select_num_bits));
+        out_msg.MessageSize := MessageSizeType:Data;
+
+        if (in_msg.Type == RubyRequestType:ATOMIC_RETURN) {
+          out_msg.Type := CoherenceRequestType:AtomicReturn;
+        } else {
+          assert(in_msg.Type == RubyRequestType:ATOMIC_NO_RETURN);
+          out_msg.Type := CoherenceRequestType:AtomicNoReturn;
+        }
+
+        // Preserve the Ruby atomic operation descriptor.  TCC will consume
+        // this mask with DataBlock::atomicPartial().
+        out_msg.writeMask.clear();
+        out_msg.writeMask.orMask(in_msg.writeMask);
+        out_msg.instSeqNum := in_msg.instSeqNum;
+
+        out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+        out_msg.sector_mask := req_mask;
+        out_msg.requested_sector_mask := req_mask;
+        out_msg.is_gpu := true;
+        out_msg.is_atomic := true;
+        out_msg.isGLCSet := in_msg.isGLCSet;
+        out_msg.isSLCSet := in_msg.isSLCSet;
+
+        DPRINTF(RubySlicc,
+                "AMTC_TCP_ATOMIC_OUT line=%#x phys=%#x type=%s seq=%llu mask=%d sid=%d\n",
+                in_msg.LineAddress, in_msg.PhysicalAddress, out_msg.Type,
+                in_msg.instSeqNum, req_mask, out_msg.sector_id);
       }
     }
   }
@@ -612,77 +829,136 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
     peek(responseToTCP_in, ResponseMsg) {
       DataBlock tmp:= in_msg.DataBlk;
       if (use_seq_not_coal) {
-        DPRINTF(RubySlicc,
-                "AMTC_TCP_SEQ_READ_CALLBACK_BYPASS addr=%#x\n",
-                address);
         sequencer.readCallback(address, tmp, false, MachineType:L1Cache);
       } else {
-        DPRINTF(RubySlicc,
-                "AMTC_TCP_COAL_READ_CALLBACK_BYPASS addr=%#x\n",
-                address);
         coalescer.readCallback(address, MachineType:L1Cache, tmp, false);
       }
+      DPRINTF(RubySlicc,
+              "AMTC_TCP_READ_CALLBACK_BYPASS addr=%#x use_seq=%d\n",
+              address, use_seq_not_coal);
       if(is_valid(cache_entry)) { unset_cache_entry(); }
     }
   }
 
-  action(wtna_writeThroughNoAlloc, "wtna", desc="Write through without allocation") {
-      peek(mandatoryQueue_in, RubyRequest) {
-          enqueue(responseNetwork_out, ResponseMsg, issue_latency) {
-              out_msg.addr := address;
-              out_msg.sector_id := getSector(address);
-              out_msg.Sender := machineID;
-              out_msg.DataBlk.copyPartial(in_msg.WTData, in_msg.writeMask);
-              out_msg.Destination.add(mapAddressToRange(address, MachineType:TCC,
-                                      TCC_select_low_bit, TCC_select_num_bits));
-              out_msg.MessageSize := MessageSizeType:Data;
-              out_msg.Type := CoherenceResponseType:WB_SHARED_DATA;
-              out_msg.sector_mask := amtc_singleSectorMaskFromId(out_msg.sector_id);
-              out_msg.requested_sector_mask := out_msg.sector_mask;
-              out_msg.valid_sector_mask := out_msg.sector_mask;
-              out_msg.token_sector_mask := 0;
-              out_msg.TokensSec0 := 0;
-              out_msg.TokensSec1 := 0;
-              DPRINTF(RubySlicc,
-                      "AMTC_TCP_WTNA_WB_SHARED_DATA addr=%#x sec=%d mask=%d glc=%d slc=%d\n",
-                      address, out_msg.sector_id, out_msg.requested_sector_mask,
-                      in_msg.isGLCSet, in_msg.isSLCSet);
-              out_msg.isGLCSet := in_msg.isGLCSet;
-              out_msg.isSLCSet := in_msg.isSLCSet;
-          }
+  action(rb_bypassDoneValidReclaim, "rbvr",
+         desc="Complete bypass response while preserving valid TCP entry for token reclaim") {
+    peek(responseToTCP_in, ResponseMsg) {
+      DataBlock tmp := in_msg.DataBlk;
+
+      DPRINTF(RubySlicc,
+              "AMTC_TCP_BYPASS_VALID_RECLAIM_V85H addr=%#x state=%s valid=%d t0=%d t1=%d glc=%d slc=%d\n",
+              address, getState(tbe, cache_entry, address),
+              cache_entry.ValidSectors,
+              cache_entry.TokensSec0,
+              cache_entry.TokensSec1,
+              in_msg.isGLCSet,
+              in_msg.isSLCSet);
+
+      if (use_seq_not_coal) {
+        sequencer.readCallback(address, tmp, false, MachineType:L1Cache);
+      } else {
+        coalescer.readCallback(address, MachineType:L1Cache, tmp, false);
       }
+
+      DPRINTF(RubySlicc,
+              "AMTC_TCP_BYPASS_COALESCER_CALLBACK_V85I addr=%#x use_seq=%d\\n",
+              address, use_seq_not_coal);
+    }
   }
 
-  action(wt_writeThrough, "wt", desc="Flush dirty data") {
+
+
+  action(wtna_writeThroughNoAlloc, "wtna",
+         desc="write through exact request sectors without TCP allocation") {
+    peek(mandatoryQueue_in, RubyRequest) {
+      int req_mask := amtc_getRequiredSectorMask(in_msg.LineAddress,
+                                                  in_msg.PhysicalAddress,
+                                                  in_msg.Size);
+      enqueue(responseNetwork_out, ResponseMsg, issue_latency) {
+        out_msg.addr := in_msg.LineAddress;
+        out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+        out_msg.Sender := machineID;
+        out_msg.DataBlk.copyPartial(in_msg.WTData, in_msg.writeMask);
+        out_msg.Destination.add(mapAddressToRange(in_msg.LineAddress,
+                                MachineType:TCC, TCC_select_low_bit,
+                                TCC_select_num_bits));
+        out_msg.MessageSize := MessageSizeType:Data;
+        out_msg.Type := CoherenceResponseType:WB_SHARED_DATA;
+        out_msg.sector_mask := req_mask;
+        out_msg.requested_sector_mask := req_mask;
+        out_msg.valid_sector_mask := req_mask;
+        out_msg.token_sector_mask := 0;
+        out_msg.TokensSec0 := 0;
+        out_msg.TokensSec1 := 0;
+        out_msg.Dirty := false;
+        out_msg.isGLCSet := in_msg.isGLCSet;
+        out_msg.isSLCSet := in_msg.isSLCSet;
+
+        DPRINTF(RubySlicc,
+                "AMTC_TCP_WTNA_WB_SHARED_DATA line=%#x phys=%#x size=%d mask=%d glc=%d slc=%d\n",
+                in_msg.LineAddress, in_msg.PhysicalAddress, in_msg.Size,
+                req_mask, in_msg.isGLCSet, in_msg.isSLCSet);
+      }
+    }
+  }
+
+  action(wt_writeThrough, "wt",
+         desc="write through cached request sectors and return selected tokens") {
+    peek(mandatoryQueue_in, RubyRequest) {
+      int req_mask := amtc_getRequiredSectorMask(in_msg.LineAddress,
+                                                  in_msg.PhysicalAddress,
+                                                  in_msg.Size);
+      int send_t0 := 0;
+      int send_t1 := 0;
+      if (amtc_maskHasSector(req_mask, 0)) {
+        send_t0 := cache_entry.TokensSec0;
+      }
+      if (amtc_maskHasSector(req_mask, 1)) {
+        send_t1 := cache_entry.TokensSec1;
+      }
+
       WTcnt := WTcnt + 1;
       enqueue(responseNetwork_out, ResponseMsg, issue_latency) {
-          out_msg.addr := address;
-          out_msg.sector_id := getSector(address);
-          out_msg.Sender := machineID;
-          assert(is_valid(cache_entry));
-          out_msg.DataBlk := cache_entry.DataBlk;
-          out_msg.Destination.add(mapAddressToRange(address, MachineType:TCC,
-                                  TCC_select_low_bit, TCC_select_num_bits));
-          out_msg.MessageSize := MessageSizeType:Data;
-          out_msg.Type := CoherenceResponseType:WB_SHARED_DATA;
-          out_msg.sector_mask := amtc_singleSectorMaskFromId(out_msg.sector_id);
-          out_msg.requested_sector_mask := out_msg.sector_mask;
-          out_msg.valid_sector_mask := out_msg.sector_mask;
-          out_msg.token_sector_mask := amtc_payloadTokenMask(cache_entry.TokensSec0, cache_entry.TokensSec1);
-          out_msg.TokensSec0 := cache_entry.TokensSec0;
-          out_msg.TokensSec1 := cache_entry.TokensSec1;
+        out_msg.addr := in_msg.LineAddress;
+        out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+        out_msg.Sender := machineID;
+        assert(is_valid(cache_entry));
+        out_msg.DataBlk := cache_entry.DataBlk;
+        out_msg.Destination.add(mapAddressToRange(in_msg.LineAddress,
+                                MachineType:TCC, TCC_select_low_bit,
+                                TCC_select_num_bits));
+        out_msg.MessageSize := MessageSizeType:Data;
+        out_msg.Type := CoherenceResponseType:WB_SHARED_DATA;
+        out_msg.sector_mask := req_mask;
+        out_msg.requested_sector_mask := req_mask;
+        out_msg.valid_sector_mask := req_mask;
+        out_msg.token_sector_mask := amtc_payloadTokenMask(send_t0, send_t1);
+        out_msg.TokensSec0 := send_t0;
+        out_msg.TokensSec1 := send_t1;
+        out_msg.Dirty := false;
+        out_msg.isGLCSet := in_msg.isGLCSet;
+        out_msg.isSLCSet := in_msg.isSLCSet;
 
-          peek(mandatoryQueue_in, RubyRequest) {
-              out_msg.isGLCSet := in_msg.isGLCSet;
-              out_msg.isSLCSet := in_msg.isSLCSet;
-          }
+        DPRINTF(RubySlicc,
+                "AMTC_TCP_WT_WB_SHARED_DATA line=%#x phys=%#x size=%d mask=%d t0=%d t1=%d\n",
+                in_msg.LineAddress, in_msg.PhysicalAddress, in_msg.Size,
+                req_mask, send_t0, send_t1);
       }
+    }
   }
 
-  action(a_allocate, "a", desc="allocate block") {
-      if (is_invalid(cache_entry)) {
-          set_cache_entry(L1cache.allocate(address, new Entry));
-      }
+  action(a_allocate, "a", desc="allocate and initialize TCP block") {
+    if (is_invalid(cache_entry)) {
+      set_cache_entry(L1cache.allocate(address, new Entry));
+      cache_entry.CacheState := State:I;
+      cache_entry.Dirty := false;
+      cache_entry.FromL2 := false;
+      cache_entry.ValidSectors := 0;
+      cache_entry.TokensSec0 := 0;
+      cache_entry.TokensSec1 := 0;
+      cache_entry.retry_count := 0;
+      cache_entry.writeMask.clear();
+    }
   }
 
   action(t_allocateTBE, "t", desc="allocate TBE Entry") {
@@ -709,108 +985,71 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
   action(l_loadDoneHit, "ldh", desc="local load done (hits in TCP)") {
     assert(is_valid(cache_entry));
     if (use_seq_not_coal) {
-      DPRINTF(RubySlicc,
-              "AMTC_TCP_SEQ_READ_CALLBACK_HIT addr=%#x\n",
-              address);
-      sequencer.readCallback(address, cache_entry.DataBlk,
-                             true, MachineType:L1Cache);
+      sequencer.readCallback(address, cache_entry.DataBlk, true, MachineType:L1Cache);
     } else {
-      DPRINTF(RubySlicc,
-              "AMTC_TCP_COAL_READ_CALLBACK_HIT addr=%#x\n",
-              address);
       coalescer.readCallback(address, MachineType:L1Cache,
                              cache_entry.DataBlk, true);
     }
+    DPRINTF(RubySlicc,
+            "AMTC_TCP_READ_CALLBACK_HIT addr=%#x use_seq=%d\n",
+            address, use_seq_not_coal);
   }
 
   action(l_loadDoneMiss, "ldm", desc="local load done (misses in TCP)") {
     assert(is_valid(cache_entry));
     if (use_seq_not_coal) {
-      DPRINTF(RubySlicc,
-              "AMTC_TCP_SEQ_READ_CALLBACK_MISS addr=%#x\n",
-              address);
-      sequencer.readCallback(address, cache_entry.DataBlk,
-                             false, MachineType:L1Cache);
+      sequencer.readCallback(address, cache_entry.DataBlk, false, MachineType:L1Cache);
     } else {
-      DPRINTF(RubySlicc,
-              "AMTC_TCP_COAL_READ_CALLBACK_MISS addr=%#x\n",
-              address);
       coalescer.readCallback(address, MachineType:L1Cache,
                              cache_entry.DataBlk, false);
+    }
+    DPRINTF(RubySlicc,
+            "AMTC_TCP_READ_CALLBACK_MISS addr=%#x use_seq=%d\n",
+            address, use_seq_not_coal);
+  }
+
+  action(ad_atomicDone, "ad", desc="complete GPU atomic using returned TCC DataBlock") {
+    peek(responseToTCP_in, ResponseMsg) {
+      assert(!use_seq_not_coal);
+      coalescer.atomicCallback(address, MachineType:L1Cache, in_msg.DataBlk);
+      DPRINTF(RubySlicc,
+              "AMTC_TCP_ATOMIC_CALLBACK addr=%#x sender=%s\n",
+              address, in_msg.Sender);
     }
   }
 
   action(s_storeDoneHit, "sdh", desc="local store done (hits in TCP)") {
     assert(is_valid(cache_entry));
-    peek(mandatoryQueue_in, RubyRequest) {
-      if (in_msg.Type == RubyRequestType:ATOMIC) {
-        if (use_seq_not_coal) {
-          DPRINTF(RubySlicc,
-                  "AMTC_TCP_SEQ_WRITE_CALLBACK_ATOMIC_HIT addr=%#x\n",
-                  address);
-          sequencer.writeCallback(address, cache_entry.DataBlk,
-                                  true, MachineType:L1Cache);
-        } else {
-          DPRINTF(RubySlicc,
-                  "AMTC_TCP_COAL_ATOMIC_CALLBACK_HIT addr=%#x\n",
-                  address);
-          coalescer.atomicCallback(address, MachineType:L1Cache,
-                                   cache_entry.DataBlk);
-        }
-      } else {
-        if (use_seq_not_coal) {
-          DPRINTF(RubySlicc,
-                  "AMTC_TCP_SEQ_WRITE_CALLBACK_HIT addr=%#x\n",
-                  address);
-          sequencer.writeCallback(address, cache_entry.DataBlk,
-                                  true, MachineType:L1Cache);
-        } else {
-          DPRINTF(RubySlicc,
-                  "AMTC_TCP_COAL_WRITE_CALLBACK_HIT addr=%#x\n",
-                  address);
-          coalescer.writeCallback(address, MachineType:L1Cache,
-                                  cache_entry.DataBlk);
-        }
-      }
+    if (use_seq_not_coal) {
+      sequencer.writeCallback(address, cache_entry.DataBlk, true,
+                              MachineType:L1Cache);
+    } else {
+      coalescer.writeCallback(address, MachineType:L1Cache,
+                              cache_entry.DataBlk);
     }
+    DPRINTF(RubySlicc,
+            "AMTC_TCP_WRITE_CALLBACK_HIT addr=%#x use_seq=%d\n",
+            address, use_seq_not_coal);
     cache_entry.Dirty := true;
   }
 
   action(sna_storeDoneMissNoAlloc, "sna", desc="local store done (misses in TCP)") {
     peek(mandatoryQueue_in, RubyRequest) {
       DataBlock tmp := in_msg.WTData;
-      if (in_msg.Type == RubyRequestType:ATOMIC) {
-        if (use_seq_not_coal) {
-          DPRINTF(RubySlicc,
-                  "AMTC_TCP_SEQ_WRITE_CALLBACK_ATOMIC_MISS addr=%#x\n",
-                  address);
-          sequencer.writeCallback(address, tmp, false, MachineType:L1Cache);
-        } else {
-          DPRINTF(RubySlicc,
-                  "AMTC_TCP_COAL_ATOMIC_CALLBACK_MISS addr=%#x\n",
-                  address);
-          coalescer.atomicCallback(address, MachineType:L1Cache, tmp);
-        }
+      if (use_seq_not_coal) {
+        sequencer.writeCallback(address, tmp, false, MachineType:L1Cache);
       } else {
-        if (use_seq_not_coal) {
-          DPRINTF(RubySlicc,
-                  "AMTC_TCP_SEQ_WRITE_CALLBACK_MISS addr=%#x\n",
-                  address);
-          sequencer.writeCallback(address, tmp, false, MachineType:L1Cache);
-        } else {
-          DPRINTF(RubySlicc,
-                  "AMTC_TCP_COAL_WRITE_CALLBACK_MISS addr=%#x\n",
-                  address);
-          coalescer.writeCallback(address, MachineType:L1Cache, tmp);
-        }
+        coalescer.writeCallback(address, MachineType:L1Cache, tmp);
       }
+      DPRINTF(RubySlicc,
+              "AMTC_TCP_WRITE_CALLBACK_MISS addr=%#x use_seq=%d\n",
+              address, use_seq_not_coal);
     }
   }
 
   action(il2_invL2, "il2", desc="Invalidate address in L2") {
     enqueue(requestNetwork_out, RequestMsg, issue_latency) {
       out_msg.addr := address;
-      out_msg.Type := CoherenceRequestType:InvCache;
       out_msg.sector_id := getSector(address);
       out_msg.Requestor := machineID;
       out_msg.Destination.add(mapAddressToRange(address,MachineType:TCC,
@@ -830,32 +1069,9 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
 
   action(inv_invDone, "inv", desc="complete kernel launch INV_L1 / local replacement invalidate") {
     DPRINTF(RubySlicc,
-            "AMTC_TCP_KERNEL_INV_DONE addr=%#x state=%s use_seq_not_coal=%d\n",
-            address, getState(tbe, cache_entry, address), use_seq_not_coal);
-
-    // CPU-only/debug TCPs are driven by the normal Ruby Sequencer.
-    // GPU CU TCPs are driven by VIPERCoalescer/GPUCoalescer and must retire
-    // INV_L1 through the coalescer so the CU-side MemSync/invalidate state is
-    // released correctly.
-    if (use_seq_not_coal) {
-      sequencer.invL1Callback();
-    } else {
-      coalescer.invTCPCallback(address);
-    }
-  }
-
-  action(i2r_invL2Resp, "i2r", desc="complete kernel launch INV_L2") {
-    DPRINTF(RubySlicc,
-            "AMTC_TCP_INV_L2_RESP addr=%#x state=%s use_seq_not_coal=%d\n",
-            address, getState(tbe, cache_entry, address), use_seq_not_coal);
-
-    // INV_L2 completion belongs to the GPU coalescer in GPU mode.  Keep the
-    // old Sequencer callback only for CPU-only protocol bring-up.
-    if (use_seq_not_coal) {
-      sequencer.invL1CallbackIfPending();
-    } else {
-      coalescer.invTCCCallback(address);
-    }
+            "AMTC_TCP_KERNEL_INV_DONE addr=%#x state=%s\n",
+            address, getState(tbe, cache_entry, address));
+    sequencer.invL1Callback();
   }
 
   action(dw_dirtyWrite, "dw", desc="update write mask"){
@@ -1027,19 +1243,12 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
   }
 
   action(inv_invDoneIfPending, "invp",
-        desc="Complete local TCP invalidate only if frontend has pending cache-walk invalidate") {
+        desc="Complete local TCP invalidate only if sequencer has pending cache-walk invalidate") {
     DPRINTF(RubySlicc,
-            "AMTC_TCP_KERNEL_INV_DONE_IF_PENDING addr=%#x use_seq_not_coal=%d\n",
-            address, use_seq_not_coal);
+            "AMTC_TCP_KERNEL_INV_DONE_IF_PENDING addr=%#x\n",
+            address);
 
-    // Local TCP invalidate completion must go back to the frontend that issued
-    // the request.  Sequencer is valid only for CPU/debug mode; VIPERCoalescer
-    // is required for GPU CU mode.
-    if (use_seq_not_coal) {
-      sequencer.invL1CallbackIfPending();
-    } else {
-      coalescer.invTCPCallback(address);
-    }
+    sequencer.invL1CallbackIfPending();
   }
 
 
@@ -1053,11 +1262,29 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
     p_popMandatoryQueue;
   }
 
+  transition({I, V}, LoadMiss) {TagArrayRead} {
+    n_issueRdBlk;
+    uu_profileDataMiss;
+    p_popMandatoryQueue;
+  }
+
   transition(V, Load) {TagArrayRead, DataArrayRead} {
     l_loadDoneHit;
     mru_updateMRU;
     uu_profileDataHit;
     p_popMandatoryQueue;
+  }
+
+  transition({I, V}, Atomic, A) {TagArrayRead} {
+    t_allocateTBE;
+    at_atomicThrough;
+    p_popMandatoryQueue;
+  }
+
+  transition(A, AtomicData, I) {
+    ad_atomicDone;
+    d_deallocateTBE;
+    pr_popResponseQueue;
   }
 
   transition(I, StoreThrough) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
@@ -1067,12 +1294,27 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
     p_popMandatoryQueue;
   }
 
-  transition(V, StoreThrough, I) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+  transition(I, StoreNoAlloc) {TagArrayRead, DataArrayWrite} {
+    sna_storeDoneMissNoAlloc;
+    uu_profileDataMiss;
+    wtna_writeThroughNoAlloc;
+    p_popMandatoryQueue;
+  }
+
+  transition(V, StoreNoAlloc) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+    sna_storeDoneMissNoAlloc;
+    uu_profileDataMiss;
+    wtna_writeThroughNoAlloc;
+    ysm_invalidateMandatorySectors;
+    p_popMandatoryQueue;
+  }
+
+  transition(V, StoreThrough) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
     dw_dirtyWrite;
     s_storeDoneHit;
     uu_profileDataHit;
     wt_writeThrough;
-    ys_invalidateSector;
+    ysm_invalidateMandatorySectors;
     p_popMandatoryQueue;
   }
 
@@ -1090,44 +1332,59 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
     pr_popResponseQueue;
   }
 
+  /*
+   * V85H: Bypass is response classification, not proof that the TCP tag is
+   * absent.  If a TCP copy is V, complete this bypassed request from the
+   * returned data, then reclaim the old TCP line exactly like replacement:
+   * return every real token to TCC before deallocation.
+   */
+  transition(V, Bypass, I) {TagArrayRead, TagArrayWrite} {
+    rb_bypassDoneValidReclaim;
+    rv_returnVictimTokensToTCC;
+    rv_deallocateVictim;
+    pr_popResponseQueue;
+  }
+
+
+  // A sector miss can return while another sector of the same 64B line is
+  // already valid.  Merge the response, absorb its exact tokens, and complete
+  // the original load rather than silently dropping the response.
   transition(V, Data_Shared, V) {TagArrayRead, TagArrayWrite, DataArrayRead, DataArrayWrite} {
-    // A response may arrive for a request whose line has already been installed
-    // by an earlier/merged path.  Do not silently drop it: the GPU coalescer
-    // still needs the callback to retire the waiting wavefront instruction.
     w_writeCache;
     tk_initTcpTokensOnFill;
     l_loadDoneMiss;
+    mru_updateMRU;
     pr_popResponseQueue;
     zz_traceTokens;
   }
 
-  // Response-side victim replacement.  Do not pop mandatoryQueue here:
-  // this path is entered while responseToTCP_in still holds the fill that
-  // will be retried after victim space is freed.
-  transition(I, Repl, I) {TagArrayRead} {
-    rdi_replDropInvalid;
+  // Reclaim the complete victim allocation.  The input that selected Repl
+  // remains queued and retries after the tag has been freed.
+  transition(I, Repl, I) {TagArrayRead, TagArrayWrite} {
+    rv_returnVictimTokensToTCC;
+    rv_deallocateVictim;
   }
 
   transition(V, Repl, I) {TagArrayRead, TagArrayWrite} {
-    ys_invalidateSector;
+    rv_returnVictimTokensToTCC;
+    rv_deallocateVictim;
   }
 
-  // Local replacement/cache-walk request.  This path must consume the
-  // mandatory queue entry; otherwise addr=0 invalid replacements spin forever.
-  transition(I, Local_Repl, I) {TagArrayRead} {
-    rdi_replDropInvalid;
+  // Local cache-walk invalidation also returns ownership before removing the
+  // complete TCP line, then consumes the mandatory request and completes the
+  // pending dispatcher invalidate.
+  transition(I, Local_Repl, I) {TagArrayRead, TagArrayWrite} {
+    rv_returnVictimTokensToTCC;
+    rv_deallocateVictim;
     inv_invDoneIfPending;
     p_popMandatoryQueue;
   }
 
   transition(V, Local_Repl, I) {TagArrayRead, TagArrayWrite} {
-    ys_invalidateSector;
+    rv_returnVictimTokensToTCC;
+    rv_deallocateVictim;
     inv_invDoneIfPending;
     p_popMandatoryQueue;
-  }
-
-  transition({A, F}, InvL2) {
-    st_stallAndWaitRequest;
   }
 
   transition(I, InvL2) {
@@ -1141,11 +1398,6 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
     p_popMandatoryQueue;
   }
 
-  transition({I, V, A, F}, InvL2Resp) {
-    i2r_invL2Resp;
-    pr_popResponseQueue;
-  }
-
   transition({V, I}, Ack) {
     ack_implicitDone;
     pr_popResponseQueue;
@@ -1157,8 +1409,9 @@ machine(MachineType:TCP, "GPU TCP (L1 Data Cache)")
   }
 
   transition(V, CPU_GETX, I) {TagArrayWrite, DataArrayWrite} {
+    // y_yieldTokensToCPU already clears exactly the requested sectors and
+    // deallocates the line when no valid sector remains.
     y_yieldTokensToCPU;
-    ys_invalidateSector;
     q_popRequestQueue;
     zz_traceTokens;
   }

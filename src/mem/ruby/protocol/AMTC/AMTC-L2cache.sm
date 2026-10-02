@@ -89,13 +89,15 @@ machine(MachineType:L2Cache, "Token protocol")
     L1_GETS,             desc="local L1 GETS request";
     L1_GETX,             desc="local L1 GETX request";
     L1_INV,              desc="L1 no longer has tokens";
+    Dir_Local_GETX_Recall, desc="Directory self-gateway GETX recall for a live pending L1 writer";
+    Dir_Local_GETX_Recall_Stale, desc="Obsolete Directory self-gateway GETX recall after pending L1 completion";
+    L1_Completed_Epoch_Retry_Stale, desc="Retry from an L1 transaction already completed by this L2";
+    L1_GETX_Contender_Stall, desc="New/contending L1 GETX must wait behind live IX writer";
     Transient_GETX,      desc="A GetX from another processor";
     Transient_GETS,      desc="A GetS from another processor";
     Dir_Owner_GETS,      desc="Directory owner-pull GETS to stale/transient L2 owner";
     L1_GETS_Force_Restart, desc="Force restart of long-stuck L2 GETS path without data/tokens";
     L1_GETS_Partial_Miss, desc="Stable L2 GETS cannot satisfy requested sector; convert to tracked miss";
-    L1_GETX_Force_Local_Grant, desc="Force local owner grant for long-stuck L2 IX GETX miss";
-    L1_GETX_Force_Local_Grant_TriggerQ, desc="Force local owner grant from trigger queue without popping L1 queue";
     L1_GETX_Force_Dir_Restart, desc="Force fresh Directory GETX replay for empty IX without held tokens";
     L1_GETX_Force_Dir_Bcast_Retry, desc="Broadcast owner-pull Directory GETX retry for empty IX without held tokens";
 
@@ -114,7 +116,7 @@ machine(MachineType:L2Cache, "Token protocol")
     // Internal Triggers:
     L2_Accumulation_Done, desc="L2 now has all required tokens/sectors";
     L2_Gets_Accumulation_Done, desc="L2 has enough shared data/tokens to satisfy pending GETS";
-    L2_Gets_Local_Escape_Drop, desc="Local GETS escape completed L1; drop poisoned IX entry";
+    L2_Gets_DataOnly_Done, desc="Pending GETS has valid data but no physical tokens; complete as data-only bypass";
 
     L2_Replacement_Transient_Force, desc="Force replacement of long-stuck transient L2 victim";
 
@@ -140,6 +142,12 @@ machine(MachineType:L2Cache, "Token protocol")
     // Audit90: saved local L1 request for an outstanding L2 -> Directory miss.
     // The L1 request queue is popped after forwarding to Directory, so response
     // completion must not peek L1requestNetwork_in.
+    // V85S-r4: per-L1 completion tombstones.  A timeout retry can already be
+    // in flight when the DATA response completes at L1.  Remember every L1
+    // completed by the current pending window so that those old RetryNum>0
+    // messages cannot create a new pending transaction after clearPending.
+    NetDest CompletedL1RetryGuard, desc="L1 requestors whose most recent pending epoch completed";
+
     bool PendingL1Valid, default="false", desc="L2 has saved a pending local L1 miss";
     MachineID PendingL1Requestor, desc="Saved L1 requester for pending miss";
     int PendingReqMask, default="0", desc="Saved requested sector mask for pending miss";
@@ -299,20 +307,16 @@ machine(MachineType:L2Cache, "Token protocol")
       clean := amtc_fullMask();
     }
 
+    // V85S-r3: ownership does not prove that the requested bytes are valid.
+    // A token-only sector must miss for data even if it owns all 512 tokens.
     bool valid_complete := amtc_maskContainsAll(cache_entry.ValidSectors, clean);
-
-    bool owner_data0 := (!amtc_maskHasSector(clean, 0)) ||
-                        (cache_entry.TokensSec0 == (max_tokens() / 2));
-    bool owner_data1 := (!amtc_maskHasSector(clean, 1)) ||
-                        (cache_entry.TokensSec1 == (max_tokens() / 2));
-    bool owner_data_complete := owner_data0 && owner_data1;
 
     bool token0_ready := (!amtc_maskHasSector(clean, 0)) ||
                          (cache_entry.TokensSec0 > 0);
     bool token1_ready := (!amtc_maskHasSector(clean, 1)) ||
                          (cache_entry.TokensSec1 > 0);
 
-    return (valid_complete || owner_data_complete) && token0_ready && token1_ready;
+    return valid_complete && token0_ready && token1_ready;
   }
 
   int amtc_primarySectorFromMask(int mask) {
@@ -450,28 +454,45 @@ machine(MachineType:L2Cache, "Token protocol")
   void setState(Entry cache_entry, Addr addr, State state) {
   if (is_valid(cache_entry)) {
 
-    // --- AMTC FIX: Dynamic Invalidation ---
-    // If a transition attempts to keep us in a stable state (M, O, S)
-    // but we've given away all our tokens (ValidSectors == 0),
-    // force the state to NP (Not Present/Invalid).
+    // V85S-r3: a 64B line can become data-empty while still retaining
+    // physical ownership for the *other* 32B sector.  Example: a sector-0
+    // GETS donates L2's last sector-0 token while sector 1 still has a token
+    // but no locally valid bytes.  That is a legal token-only L2 entry.
+    //
+    // I is already the protocol's token-only/idle state (NP + WB_TOKENS -> I).
+    // Never force such an entry to NP, because NP requires zero physical
+    // tokens and would either assert or lose ownership.  Only a truly empty
+    // entry may collapse to NP.
     State intermediate_state := state;
     if ((state == State:M || state == State:O || state == State:S) &&
         (cache_entry.ValidSectors == 0)) {
-        intermediate_state := State:NP;
+        if (cache_entry.TokensSec0 == 0 && cache_entry.TokensSec1 == 0) {
+            intermediate_state := State:NP;
+        } else {
+            intermediate_state := State:I;
+            DPRINTF(RubySlicc,
+                    "AMTC_L2_STABLE_TO_TOKEN_ONLY_I_V85S_R3 addr=%#x requested=%s old=%s T0=%d T1=%d\n",
+                    addr, state, cache_entry.CacheState,
+                    cache_entry.TokensSec0, cache_entry.TokensSec1);
+        }
     }
 
     // Basic sanity checks: No sector can have negative tokens
     assert(cache_entry.TokensSec0 >= 0);
     assert(cache_entry.TokensSec1 >= 0);
 
-    // Ensure no transition sets state==I during a GETX upgrade path.
-    if (cache_entry.CacheState == State:IS ||
-        cache_entry.CacheState == State:IX ||
-        cache_entry.CacheState == State:SX ||
-        cache_entry.CacheState == State:OX ||
-        cache_entry.CacheState == State:MX) {
-      assert(intermediate_state != State:I);
-    }
+    // V85S-r5: I is the canonical non-accessible/token-only L2 state.
+    // Do not reject it solely because the source state was transient.  In
+    // particular, IS is a GETS miss: after the requested sector is returned
+    // to L1, L2 may have no valid bytes but still retain physical token(s) for
+    // the other 32B sector.  The S/O/M -> I canonicalization above is then the
+    // required sector-aware result.
+    //
+    // The previous source-state assertion also incorrectly treated IS as a
+    // GETX upgrade state.  True GETX completion is governed by the IX pending
+    // transaction and exact-token completion path; the target-state invariants
+    // below remain authoritative (NP must have zero tokens; S/O require valid
+    // data plus tokens; M requires exclusive tokens for valid sectors).
 
     int tokens_per_sector := max_tokens() / 2;
 
@@ -647,7 +668,47 @@ machine(MachineType:L2Cache, "Token protocol")
 
         Entry cache_entry := getCacheEntry(in_msg.addr);
 
-        if (is_valid(cache_entry)) {
+        /*
+         * V85S-r2: Directory same-gateway GETX recalls can be delivered on the
+         * L1RequestToL2Cache queue with Requestor == this L2.  They are not new
+         * L1 GETX requests.  A recall is actionable only while IX still owns a
+         * live pending L1 GETX.  Once that pending request completed and was
+         * cleared, the recall belongs to an already-queued retry and must be
+         * retired instead of rebuilding an empty IX transaction.
+         */
+        bool real_l1_request :=
+            (machineIDToMachineType(in_msg.Requestor) == MachineType:L1Cache &&
+             (in_msg.Type == CoherenceRequestType:GETS ||
+              in_msg.Type == CoherenceRequestType:GETX));
+
+        bool completed_epoch_retry :=
+            (real_l1_request &&
+             in_msg.RetryNum > 0 &&
+             is_valid(cache_entry) &&
+             cache_entry.CompletedL1RetryGuard.isElement(in_msg.Requestor));
+
+        bool self_gateway_dir_getx :=
+            (in_msg.Type == CoherenceRequestType:GETX &&
+             in_msg.Requestor == machineID &&
+             machineIDToMachineType(in_msg.Requestor) == MachineType:L2Cache);
+
+        if (completed_epoch_retry) {
+          trigger(Event:L1_Completed_Epoch_Retry_Stale,
+                  in_msg.addr, cache_entry);
+
+        } else if (self_gateway_dir_getx) {
+          if (is_valid(cache_entry) &&
+              cache_entry.CacheState == State:IX &&
+              cache_entry.PendingL1Valid &&
+              cache_entry.PendingIsGetX &&
+              machineIDToMachineType(cache_entry.PendingL1Requestor) ==
+                  MachineType:L1Cache) {
+            trigger(Event:Dir_Local_GETX_Recall, in_msg.addr, cache_entry);
+          } else {
+            trigger(Event:Dir_Local_GETX_Recall_Stale, in_msg.addr, cache_entry);
+          }
+
+        } else if (is_valid(cache_entry)) {
           if (in_msg.Type == CoherenceRequestType:GETS) {
             if (in_msg.is_owner_pull &&
                 machineIDToMachineType(in_msg.Requestor) == MachineType:Directory) {
@@ -672,16 +733,6 @@ machine(MachineType:L2Cache, "Token protocol")
                         cache_entry.TokensSec0, cache_entry.TokensSec1);
                 trigger(Event:L1_GETS_Partial_Miss, in_msg.addr, cache_entry);
               }
-            } else if (cache_entry.CacheState == State:IS &&
-                      cache_entry.PendingL1Valid &&
-                      in_msg.RetryNum >= 1) {
-              DPRINTF(RubySlicc,
-                      "AMTC_L2_IS_GETS_FORCE_LOCAL_FILL_TRIGGER_V22 addr=%#x req=%s retry=%d valid=%d T0=%d T1=%d pending=%d sent=%d reqmask=%d\n",
-                      in_msg.addr, in_msg.Requestor, in_msg.RetryNum,
-                      cache_entry.ValidSectors, cache_entry.TokensSec0,
-                      cache_entry.TokensSec1, cache_entry.PendingL1Valid,
-                      cache_entry.PendingRetrySent, cache_entry.PendingReqMask);
-              trigger(Event:L1_GETS_Force_Restart, in_msg.addr, cache_entry);
             } else if (cache_entry.CacheState == State:IX &&
                        in_msg.RetryNum >= 64 &&
                        cache_entry.PendingL1Valid &&
@@ -727,108 +778,19 @@ machine(MachineType:L2Cache, "Token protocol")
               trigger(Event:L1_GETS, in_msg.addr, cache_entry);
             }
           } else if (in_msg.Type == CoherenceRequestType:GETX) {
+            /*
+             * V85S-r4: while IX owns a live writer, only RetryNum>0 from the
+             * exact saved writer is a retry of that transaction.  A fresh
+             * RetryNum==0 or a different L1 is a distinct operation and must
+             * serialize behind IX instead of rewriting PendingReqMask.
+             */
             if (cache_entry.CacheState == State:IX &&
-                in_msg.RetryNum >= 8 &&
                 cache_entry.PendingL1Valid &&
                 cache_entry.PendingIsGetX &&
-                cache_entry.PendingRetrySent &&
-                machineIDToMachineType(cache_entry.PendingL1Requestor) == MachineType:L1Cache &&
-                cache_entry.ValidSectors == 0 &&
-                cache_entry.TokensSec0 == 0 &&
-                cache_entry.TokensSec1 == 0 &&
-                ((cache_entry.PendingReqMask == 1 &&
-                  cache_entry.PendingRequesterHeldTokensSec0 > 0) ||
-                 (cache_entry.PendingReqMask == 2 &&
-                  cache_entry.PendingRequesterHeldTokensSec1 > 0) ||
-                 (cache_entry.PendingReqMask == 3 &&
-                  cache_entry.PendingRequesterHeldTokensSec0 > 0 &&
-                  cache_entry.PendingRequesterHeldTokensSec1 > 0))) {
-              /* V47: v46 was useful but too broad: it fired even when
-               * PendingRequesterHeldTokensSec0/1 were both zero.  Only use
-               * this synthetic owner-grant escape when the saved L1 GETX
-               * actually holds the requested sector token(s).
-               *
-               * v45 moved the run past the stale GETS poison, but the
-               * rep=1 AQL fetch then spends long periods in an IX GETX retry
-               * window such as:
-               *   type=Write retry=18..64 valid=0 T0=0 T1=0 held0=1 held1=1
-               * The older bring-up force grant only fired at retry 64, so each
-               * such store burned 64 guarded-resend cycles before making
-               * progress.  Fire the same existing local owner-grant escape much
-               * earlier, only for the narrow empty-IX pending-L1-GETX signature
-               * with held tokens covering PendingReqMask.
-               */
-              DPRINTF(RubySlicc,
-                      "AMTC_L2_IX_GETX_FORCE_LOCAL_GRANT_TRIGGER_V47 addr=%#x req=%s retry=%d valid=%d T0=%d T1=%d held0=%d held1=%d pending=%d sent=%d reqmask=%d\n",
-                      in_msg.addr, in_msg.Requestor, in_msg.RetryNum,
-                      cache_entry.ValidSectors, cache_entry.TokensSec0,
-                      cache_entry.TokensSec1,
-                      cache_entry.PendingRequesterHeldTokensSec0,
-                      cache_entry.PendingRequesterHeldTokensSec1,
-                      cache_entry.PendingL1Valid,
-                      cache_entry.PendingRetrySent, cache_entry.PendingReqMask);
-              trigger(Event:L1_GETX_Force_Local_Grant, in_msg.addr, cache_entry);
-            } else if (cache_entry.CacheState == State:IX &&
-                       in_msg.RetryNum >= 512 &&
-                       cache_entry.PendingL1Valid &&
-                       cache_entry.PendingIsGetX &&
-                       cache_entry.PendingRetrySent &&
-                       machineIDToMachineType(cache_entry.PendingL1Requestor) == MachineType:L1Cache &&
-                       cache_entry.ValidSectors == 0 &&
-                       cache_entry.TokensSec0 <= 1 &&
-                       cache_entry.TokensSec1 <= 1 &&
-                       cache_entry.PendingRequesterHeldTokensSec0 == 0 &&
-                       cache_entry.PendingRequesterHeldTokensSec1 == 0) {
-              /* V51 diagnostic escape: v50 proved the forced L2->L1 owner-data path
-               * can move the earlier zero-token stuck line.  The next stuck
-               * line (0x1081400) has the same pending GETX shape but carries
-               * residual one-token crumbs in L2 (T0=1/T1=1), so the exact
-               * zero-token v50 guard intentionally does not fire.  Treat
-               * <=1 token/sector as poisoned residual metadata for this
-               * bring-up diagnostic and force the same late local owner grant.
-               * This is not the final coherence rule; it is to verify forward
-               * progress past residual-token IX GETX poison.
-               */
-              DPRINTF(RubySlicc,
-                      "AMTC_L2_IX_RESIDUAL_GETX_EMERG_LOCAL_GRANT_V51 addr=%#x req=%s retry=%d valid=%d T0=%d T1=%d held0=%d held1=%d pending=%d sent=%d reqmask=%d\n",
-                      in_msg.addr, in_msg.Requestor, in_msg.RetryNum,
-                      cache_entry.ValidSectors, cache_entry.TokensSec0,
-                      cache_entry.TokensSec1,
-                      cache_entry.PendingRequesterHeldTokensSec0,
-                      cache_entry.PendingRequesterHeldTokensSec1,
-                      cache_entry.PendingL1Valid,
-                      cache_entry.PendingRetrySent, cache_entry.PendingReqMask);
-              trigger(Event:L1_GETX_Force_Local_Grant, in_msg.addr, cache_entry);
-            } else if (cache_entry.CacheState == State:IX &&
-                       in_msg.RetryNum >= 8 &&
-                       cache_entry.PendingL1Valid &&
-                       cache_entry.PendingIsGetX &&
-                       cache_entry.PendingRetrySent &&
-                       machineIDToMachineType(cache_entry.PendingL1Requestor) == MachineType:L1Cache &&
-                       cache_entry.ValidSectors == 0 &&
-                       cache_entry.TokensSec0 == 0 &&
-                       cache_entry.TokensSec1 == 0 &&
-                       cache_entry.PendingRequesterHeldTokensSec0 == 0 &&
-                       cache_entry.PendingRequesterHeldTokensSec1 == 0) {
-              /* V49: V48 proved that clearing/restarting IX simply re-enters the
-               * same exact-home Directory send path, but Directory still never
-               * logs REQ_RAW_IN for the failing occurrence.  Do not clear the
-               * pending L1 state.  Instead keep IX/pending intact and send an
-               * explicit owner-pull GETX repair as a Directory broadcast.  This
-               * is a safe forward-progress probe because it does not fabricate
-               * tokens; it only asks the true home/any reachable Directory to
-               * repair the empty pending GETX through memory/owner state.
-               */
-              DPRINTF(RubySlicc,
-                      "AMTC_L2_IX_EMPTY_GETX_DIR_BCAST_TRIGGER_V49 addr=%#x req=%s retry=%d valid=%d T0=%d T1=%d held0=%d held1=%d pending=%d sent=%d reqmask=%d\n",
-                      in_msg.addr, in_msg.Requestor, in_msg.RetryNum,
-                      cache_entry.ValidSectors, cache_entry.TokensSec0,
-                      cache_entry.TokensSec1,
-                      cache_entry.PendingRequesterHeldTokensSec0,
-                      cache_entry.PendingRequesterHeldTokensSec1,
-                      cache_entry.PendingL1Valid,
-                      cache_entry.PendingRetrySent, cache_entry.PendingReqMask);
-              trigger(Event:L1_GETX_Force_Dir_Bcast_Retry, in_msg.addr, cache_entry);
+                (in_msg.Requestor != cache_entry.PendingL1Requestor ||
+                 in_msg.RetryNum == 0)) {
+              trigger(Event:L1_GETX_Contender_Stall,
+                      in_msg.addr, cache_entry);
             } else {
               trigger(Event:L1_GETX, in_msg.addr, cache_entry);
             }
@@ -979,13 +941,44 @@ machine(MachineType:L2Cache, "Token protocol")
         if (out_mask == 0) {
           out_mask := amtc_fullMask();
         }
-        if (machineIDToMachineType(in_msg.Requestor) == MachineType:L1Cache) {
-          out_mask := amtc_fullMask();
-        }
+        /*
+         * AMTC sector-exact CPU GETX path:
+         *
+         * CPU L1 may issue a sector-specific GETX/write when it already owns
+         * one sector and only needs the other.  Do not widen such requests to
+         * full-line at the L2->Directory proxy path.
+         */
         int out_sid := in_msg.sector_id;
         if (out_mask == amtc_fullMask()) {
           out_sid := 0;
+        } else {
+          out_sid := amtc_primarySectorFromMask(out_mask);
         }
+
+        int cpu_held0 := in_msg.requester_held_tokens_sec0;
+        int cpu_held1 := in_msg.requester_held_tokens_sec1;
+        int cpu_max_t := max_tokens() / 2;
+
+        if (in_msg.Type == CoherenceRequestType:GETX &&
+            is_valid(cache_entry)) {
+          cpu_held0 := cpu_held0 + cache_entry.TokensSec0;
+          cpu_held1 := cpu_held1 + cache_entry.TokensSec1;
+        }
+
+        // V85S: credit describes physical tokens retained in the CPU domain.
+        // Never clamp a duplicated credit; fail conservation immediately.
+        assert(cpu_held0 >= 0);
+        assert(cpu_held1 >= 0);
+        assert(cpu_held0 <= cpu_max_t);
+        assert(cpu_held1 <= cpu_max_t);
+
+        DPRINTF(RubySlicc,
+                "AMTC_L2_CPU_DOMAIN_HELD_CREDIT_V85D addr=%#x type=%s l1held0=%d l1held1=%d l2t0=%d l2t1=%d eff0=%d eff1=%d\n",
+                address, in_msg.Type,
+                in_msg.requester_held_tokens_sec0,
+                in_msg.requester_held_tokens_sec1,
+                cache_entry.TokensSec0, cache_entry.TokensSec1,
+                cpu_held0, cpu_held1);
 
         enqueue(globalRequestNetwork_out,
                 RequestMsg,
@@ -1028,7 +1021,17 @@ machine(MachineType:L2Cache, "Token protocol")
             * GPU/sync/bypass/atomic/signal traffic where the safer broad route
             * is still useful for TCP/TCC/SQC bring-up.
             */
+           /*
+            * Keep CPU GETS exact-home for performance, but broadcast CPU GETX
+            * during AMTC sector/owner-repair bring-up.  The observed failure:
+            *
+            *   AMTC_L2_DIR_PROXY_HOME_V30 addr=0xc674c0 type=GETX
+            *
+            * had no matching AMTC_DIR_REQ_RAW_IN later.  Broadcasting GETX avoids
+            * losing ownership repair behind a stale/mis-mapped L2 owner state.
+            */
            if (machineIDToMachineType(in_msg.Requestor) == MachineType:L1Cache &&
+               in_msg.Type == CoherenceRequestType:GETS &&
                in_msg.is_gpu == false &&
                in_msg.is_sync == false &&
                in_msg.is_bypass == false &&
@@ -1053,6 +1056,15 @@ machine(MachineType:L2Cache, "Token protocol")
            out_msg.sector_mask := out_mask;
 
            out_msg.requested_sector_mask := out_mask;
+
+           out_msg.requester_held_tokens_sec0 := cpu_held0;
+           out_msg.requester_held_tokens_sec1 := cpu_held1;
+
+           DPRINTF(RubySlicc,
+                   "AMTC_L2_GETX_HELD_PROXY_V85A addr=%#x orig=%s proxy=%s type=%s mask=%d held0=%d held1=%d\n",
+                   address, in_msg.Requestor, machineID, out_msg.Type, out_mask,
+                   cpu_held0,
+                   cpu_held1);
 
            out_msg.is_gpu := in_msg.is_gpu;
            out_msg.is_sync := in_msg.is_sync;
@@ -1199,12 +1211,67 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
       cache_entry.TokensSec1 := 0;
   }
 
-  action(cl2_checkL2Accumulation, "cl2", desc="Check if L2 line is whole") {
-    // Audit84: use the active pending L1 request mask while IX is serving a
-    // blocked L1 GETX/GETS. RequestedSectorMask may contain stale/merged
-    // sectors from earlier retries and can prevent a ready pending requester
-    // from receiving L2_Accumulation_Done. This caused addr=0x675c0 to loop
-    // with PendingReqMask=1, ValidSectors=1, T0=512, but no send to L1.
+  action(maybeCompletePendingGetsDataOnlyV85Q, "gdo85q",
+         desc="Complete pending GETS only from a real zero-token data response") {
+    peek(responseNetwork_in, ResponseMsg) {
+      int req_mask := amtc_sanitizeMask(cache_entry.PendingReqMask);
+      if (req_mask == 0) {
+        req_mask := amtc_fullMask();
+      }
+
+      int all_waiter_mask := req_mask;
+      if (cache_entry.PendingL1SecondValid) {
+        int second_mask := amtc_sanitizeMask(cache_entry.PendingL1SecondReqMask);
+        if (second_mask == 0) { second_mask := amtc_fullMask(); }
+        all_waiter_mask := amtc_unionMasks(all_waiter_mask, second_mask);
+      }
+      if (cache_entry.PendingL1ThirdValid) {
+        int third_mask := amtc_sanitizeMask(cache_entry.PendingL1ThirdReqMask);
+        if (third_mask == 0) { third_mask := amtc_fullMask(); }
+        all_waiter_mask := amtc_unionMasks(all_waiter_mask, third_mask);
+      }
+      if (cache_entry.PendingL1FourthValid) {
+        int fourth_mask := amtc_sanitizeMask(cache_entry.PendingL1FourthReqMask);
+        if (fourth_mask == 0) { fourth_mask := amtc_fullMask(); }
+        all_waiter_mask := amtc_unionMasks(all_waiter_mask, fourth_mask);
+      }
+
+      bool pending_gets := cache_entry.PendingL1Valid &&
+                           !cache_entry.PendingIsGetX &&
+                           machineIDToMachineType(cache_entry.PendingL1Requestor) == MachineType:L1Cache;
+      bool zero_token_response := in_msg.TokensSec0 == 0 &&
+                                  in_msg.TokensSec1 == 0 &&
+                                  in_msg.token_sector_mask == 0;
+      bool zero_local_tokens := cache_entry.TokensSec0 == 0 &&
+                                cache_entry.TokensSec1 == 0;
+      bool have_all_waiter_data := cache_entry.ValidSectors != 0 &&
+                                   amtc_maskContainsAll(cache_entry.ValidSectors,
+                                                        all_waiter_mask);
+      bool clean_data_only := !in_msg.Dirty && !cache_entry.Dirty &&
+                              cache_entry.DirtySectors == 0;
+
+      if (!cache_entry.AccumulationPending &&
+          pending_gets && zero_token_response && zero_local_tokens &&
+          have_all_waiter_data && clean_data_only) {
+        cache_entry.AccumulationPending := true;
+
+        DPRINTF(RubySlicc,
+                "AMTC_L2_GETS_DATA_ONLY_TRIGGER_V85Q addr=%#x req=%s reqmask=%d allmask=%d valid=%d T0=%d T1=%d in_valid=%d in_tokmask=%d\n",
+                address, cache_entry.PendingL1Requestor, req_mask,
+                all_waiter_mask, cache_entry.ValidSectors,
+                cache_entry.TokensSec0, cache_entry.TokensSec1,
+                in_msg.valid_sector_mask, in_msg.token_sector_mask);
+
+        enqueue(triggerQueue_out, TriggerMsg, 1) {
+          out_msg.addr := address;
+          out_msg.Type := Event:L2_Gets_DataOnly_Done;
+        }
+      }
+    }
+  }
+
+  action(cl2_checkL2Accumulation, "cl2",
+         desc="Check exact pending L1 data/token convergence") {
     int need_mask := cache_entry.RequestedSectorMask;
     if (cache_entry.PendingL1Valid) {
       need_mask := cache_entry.PendingReqMask;
@@ -1212,134 +1279,91 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
     if (need_mask == 0) {
       need_mask := amtc_fullMask();
     }
+    need_mask := amtc_sanitizeMask(need_mask);
 
-    // Audit85: IX completion for a pending sub-line GETX must be checked
-    // against the pending request mask, not against the full cache line.  The
-    // previous amtc_L2_hasAllTokens() required both 32B sectors to hold all
-    // tokens.  That can strand a valid sector-1-only write miss forever, e.g.
-    // addr=0x19c4c00 with PendingReqMask=2, because L2 may correctly hold all
-    // sector-1 tokens while sector-0 tokens are absent/irrelevant.
     int tokens_per_sector := max_tokens() / 2;
     int held_t0 := 0;
     int held_t1 := 0;
+
     if (cache_entry.PendingL1Valid && cache_entry.PendingIsGetX) {
+      // These are exact physical tokens retained by the pending L1 requester.
       held_t0 := cache_entry.PendingRequesterHeldTokensSec0;
       held_t1 := cache_entry.PendingRequesterHeldTokensSec1;
-      if (held_t0 < 0) { held_t0 := 0; }
-      if (held_t1 < 0) { held_t1 := 0; }
-      if (held_t0 > tokens_per_sector) { held_t0 := tokens_per_sector; }
-      if (held_t1 > tokens_per_sector) { held_t1 := tokens_per_sector; }
+      assert(held_t0 >= 0);
+      assert(held_t1 >= 0);
+      assert(held_t0 <= tokens_per_sector);
+      assert(held_t1 <= tokens_per_sector);
     }
 
     int eff_t0 := cache_entry.TokensSec0 + held_t0;
     int eff_t1 := cache_entry.TokensSec1 + held_t1;
 
+    // V85S: partial held credits are real.  Do not round 1..511 down to zero
+    // and do not accept >512 as "complete".
+    assert(eff_t0 >= 0);
+    assert(eff_t1 >= 0);
+    assert(eff_t0 <= tokens_per_sector);
+    assert(eff_t1 <= tokens_per_sector);
+
     bool has_tokens := true;
-    if (amtc_maskHasSector(need_mask, 0)) {
-      if (eff_t0 < tokens_per_sector) {
-        has_tokens := false;
-      }
+    if (amtc_maskHasSector(need_mask, 0) &&
+        eff_t0 != tokens_per_sector) {
+      has_tokens := false;
     }
-    if (amtc_maskHasSector(need_mask, 1)) {
-      if (eff_t1 < tokens_per_sector) {
-        has_tokens := false;
-      }
+    if (amtc_maskHasSector(need_mask, 1) &&
+        eff_t1 != tokens_per_sector) {
+      has_tokens := false;
     }
 
-    bool has_data := (cache_entry.ValidSectors != 0) &&
-                     amtc_maskContainsAll(cache_entry.ValidSectors, need_mask);
+    bool has_data :=
+        amtc_maskContainsAll(cache_entry.ValidSectors, need_mask);
 
-    bool pending_l1_ok_v33 := false;
+    bool pending_l1_ok := false;
     if (cache_entry.PendingL1Valid &&
-        machineIDToMachineType(cache_entry.PendingL1Requestor) == MachineType:L1Cache &&
+        machineIDToMachineType(cache_entry.PendingL1Requestor) ==
+            MachineType:L1Cache &&
         cache_entry.PendingReqMask != 0) {
-      pending_l1_ok_v33 := true;
+      pending_l1_ok := true;
     }
 
     if (!cache_entry.AccumulationPending &&
-        getState(cache_entry, address) != State:M) { // STRICT GUARD
-        /* V38: GETS completion is shared-data completion, not owner-token
-         * accumulation.  For a pending GETS waiter, one shared token plus valid
-         * data for each requested sector is enough to complete the L1 read.
-         * The old generic accumulation check required max_tokens()/2 tokens
-         * and therefore kept reissuing Directory repair DATA_SHARED hundreds of
-         * times.  When the line finally approached the owner-token threshold,
-         * the IX L2_Accumulation_Done path used the GETX completion action and
-         * attempted to transition to NP while still holding sector-1 tokens,
-         * triggering the line-476 NP token assert.
-         */
-        bool pending_gets_ready_v38 := false;
-        if (pending_l1_ok_v33 && !cache_entry.PendingIsGetX && has_data) {
-          pending_gets_ready_v38 := true;
-          if (amtc_maskHasSector(need_mask, 0)) {
-            if (cache_entry.TokensSec0 <= 0) {
-              pending_gets_ready_v38 := false;
-            }
-          }
-          if (amtc_maskHasSector(need_mask, 1)) {
-            if (cache_entry.TokensSec1 <= 0) {
-              pending_gets_ready_v38 := false;
-            }
-          }
-        }
+        getState(cache_entry, address) != State:M) {
+      bool pending_gets_ready := false;
 
-        if (pending_gets_ready_v38) {
-          cache_entry.AccumulationPending := true;
-          DPRINTF(RubySlicc,
-                  "AMTC_L2_GETS_ACC_TRIGGER_V38 addr=%#x state=%s need=%d pending=%d req=%s reqmask=%d valid=%d T0=%d T1=%d\n",
-                  address, getState(cache_entry, address), need_mask,
-                  cache_entry.PendingL1Valid, cache_entry.PendingL1Requestor,
-                  cache_entry.PendingReqMask, cache_entry.ValidSectors,
-                  cache_entry.TokensSec0, cache_entry.TokensSec1);
-          enqueue(triggerQueue_out, TriggerMsg, 1) {
-              out_msg.addr := address;
-              out_msg.Type := Event:L2_Gets_Accumulation_Done;
-          }
-        } else if (has_tokens && has_data) {
-          if (pending_l1_ok_v33) {
-            cache_entry.AccumulationPending := true;
-            DPRINTF(RubySlicc,
-                    "AMTC_L2_ACC_TRIGGER_V33 addr=%#x state=%s need=%d pending=%d req=%s reqmask=%d valid=%d T0=%d T1=%d\n",
-                    address, getState(cache_entry, address), need_mask,
-                    cache_entry.PendingL1Valid, cache_entry.PendingL1Requestor,
-                    cache_entry.PendingReqMask, cache_entry.ValidSectors,
-                    cache_entry.TokensSec0, cache_entry.TokensSec1);
-              enqueue(triggerQueue_out, TriggerMsg, 1) {
-                  out_msg.addr := address;
-                  out_msg.Type := Event:L2_Accumulation_Done;
-              }
-          } else {
-            DPRINTF(RubySlicc,
-                    "AMTC_L2_ACC_SKIP_NO_VALID_L1_PENDING_V33 addr=%#x state=%s need=%d pending=%d req=%s reqmask=%d valid=%d T0=%d T1=%d has_tokens=%d has_data=%d\n",
-                    address, getState(cache_entry, address), need_mask,
-                    cache_entry.PendingL1Valid, cache_entry.PendingL1Requestor,
-                    cache_entry.PendingReqMask, cache_entry.ValidSectors,
-                    cache_entry.TokensSec0, cache_entry.TokensSec1,
-                    has_tokens, has_data);
-          }
+      if (pending_l1_ok && !cache_entry.PendingIsGetX && has_data) {
+        pending_gets_ready := true;
+        if (amtc_maskHasSector(need_mask, 0) &&
+            cache_entry.TokensSec0 <= 0) {
+          pending_gets_ready := false;
         }
-    } else {
-        if ((has_tokens && has_data || has_data) && getState(cache_entry, address) == State:IX) {
-          DPRINTF(RubySlicc,
-                  "AMTC_L2_ACC_READY_BUT_GATED addr=%#x pending_flag=%d need=%d valid=%d reqmask=%d pendmask=%d T0=%d T1=%d\n",
-                  address, cache_entry.AccumulationPending, need_mask,
-                  cache_entry.ValidSectors, cache_entry.RequestedSectorMask,
-                  cache_entry.PendingReqMask, cache_entry.TokensSec0,
-                  cache_entry.TokensSec1);
+        if (amtc_maskHasSector(need_mask, 1) &&
+            cache_entry.TokensSec1 <= 0) {
+          pending_gets_ready := false;
         }
+      }
+
+      if (pending_gets_ready) {
+        cache_entry.AccumulationPending := true;
+        enqueue(triggerQueue_out, TriggerMsg, 1) {
+          out_msg.addr := address;
+          out_msg.Type := Event:L2_Gets_Accumulation_Done;
+        }
+      } else if (pending_l1_ok && has_tokens && has_data) {
+        cache_entry.AccumulationPending := true;
+        enqueue(triggerQueue_out, TriggerMsg, 1) {
+          out_msg.addr := address;
+          out_msg.Type := Event:L2_Accumulation_Done;
+        }
+      }
     }
+
     DPRINTF(RubySlicc,
-        "AMTC_L2_GETX_EFFECTIVE_CHECK addr=%#x req=%s reqmask=%d valid=%d L2T0=%d L2T1=%d held0=%d held1=%d eff0=%d eff1=%d\n",
-        address,
-        cache_entry.PendingL1Requestor,
-        cache_entry.PendingReqMask,
-        cache_entry.ValidSectors,
-        cache_entry.TokensSec0,
-        cache_entry.TokensSec1,
-        cache_entry.PendingRequesterHeldTokensSec0,
-        cache_entry.PendingRequesterHeldTokensSec1,
-        eff_t0,
-        eff_t1);
+            "AMTC_L2_GETX_EFFECTIVE_EXACT_V85S addr=%#x req=%s reqmask=%d valid=%d L2T0=%d L2T1=%d held0=%d held1=%d eff0=%d eff1=%d data=%d complete=%d\n",
+            address, cache_entry.PendingL1Requestor,
+            cache_entry.PendingReqMask, cache_entry.ValidSectors,
+            cache_entry.TokensSec0, cache_entry.TokensSec1,
+            held_t0, held_t1, eff_t0, eff_t1,
+            has_data, has_tokens && has_data);
   }
 
   action(d_sendDataWithTokens, "d", desc="Send data and a token from cache to requestor") {
@@ -1490,7 +1514,28 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
 
   action(j_forwardTransientRequestToLocalSharers, "j", desc="Forward external transient request to local sharers") {
     peek(requestNetwork_in, RequestMsg) {
-      if (filtering_enabled && in_msg.RetryNum == 0 && sharersExist(in_msg.addr) == false) {
+      bool directory_getx_recall :=
+          (machineIDToMachineType(in_msg.Requestor) == MachineType:Directory &&
+           in_msg.Type == CoherenceRequestType:GETX);
+
+      if (directory_getx_recall) {
+        /*
+         * V85S-r11: Global Directory probes are broadcast to every L2 bank.
+         * An NP bank legitimately has no cache entry here, but may still need
+         * to fan the probe out to local L1s (localDirectory metadata is
+         * independent of L2 tag residency).  Never dereference cache_entry
+         * merely for diagnostics on this path.
+         */
+        bool resident := is_valid(cache_entry);
+        DPRINTF(RubySlicc,
+                "AMTC_L2_DIR_RECALL_BYPASS_FILTER_V85S_R11 addr=%#x req=%s resident=%d mask=%d\\n",
+                in_msg.addr, in_msg.Requestor, resident,
+                in_msg.requested_sector_mask);
+      }
+
+      if (filtering_enabled && in_msg.RetryNum == 0 &&
+          sharersExist(in_msg.addr) == false &&
+          !directory_getx_recall) {
         //profile_filter_action(1);
         DPRINTF(RubySlicc, "filtered message, Retry Num: %d\n",
                 in_msg.RetryNum);
@@ -1538,6 +1583,199 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
   }
 
 
+  action(jix_forwardSelfDirGetxToLocalSharersV85S1, "jix85s1",
+         desc="IX self-gateway GETX recall: collect real tokens from local L1s except pending writer") {
+    peek(requestNetwork_in, RequestMsg) {
+      bool self_gateway_recall :=
+          (in_msg.Type == CoherenceRequestType:GETX &&
+           in_msg.Requestor == machineID &&
+           cache_entry.PendingL1Valid &&
+           cache_entry.PendingIsGetX);
+
+      if (self_gateway_recall) {
+        assert(machineIDToMachineType(cache_entry.PendingL1Requestor) ==
+               MachineType:L1Cache);
+
+        enqueue(localRequestNetwork_out, RequestMsg, l2_response_latency) {
+          out_msg.addr := in_msg.addr;
+
+          /*
+           * L1 donors return DATA_SHARED + their physical tokens to Requestor.
+           * Keep Requestor as this L2 so IX can strictly add the donations.
+           */
+          out_msg.Requestor := machineID;
+          out_msg.Destination.broadcast(MachineType:L1Cache);
+
+          /*
+           * The pending writer's physical tokens are already represented by
+           * PendingRequesterHeldTokensSec*.  Recalling them again would double
+           * count the same ownership.
+           */
+          out_msg.Destination.remove(cache_entry.PendingL1Requestor);
+
+          out_msg.Type := CoherenceRequestType:GETX;
+          out_msg.isLocal := false;
+          out_msg.RetryNum := in_msg.RetryNum;
+          out_msg.sector_id := in_msg.sector_id;
+          out_msg.sector_mask := in_msg.sector_mask;
+          out_msg.requested_sector_mask := in_msg.requested_sector_mask;
+          out_msg.is_gpu := false;
+          out_msg.is_sync := false;
+          out_msg.is_bypass := false;
+          out_msg.is_atomic := in_msg.is_atomic;
+          out_msg.is_signal := false;
+          out_msg.merged_req := in_msg.merged_req;
+          out_msg.is_owner_pull := false;
+          out_msg.MessageSize := MessageSizeType:Broadcast_Control;
+          out_msg.AccessMode := in_msg.AccessMode;
+          out_msg.Prefetch := in_msg.Prefetch;
+        }
+
+        DPRINTF(RubySlicc,
+                "AMTC_L2_IX_LOCAL_OWNER_RECALL_V85S_R1 addr=%#x pending=%s reqmask=%d held0=%d held1=%d L2T0=%d L2T1=%d\n",
+                address, cache_entry.PendingL1Requestor,
+                cache_entry.PendingReqMask,
+                cache_entry.PendingRequesterHeldTokensSec0,
+                cache_entry.PendingRequesterHeldTokensSec1,
+                cache_entry.TokensSec0, cache_entry.TokensSec1);
+      } else {
+        DPRINTF(RubySlicc,
+                "AMTC_L2_IX_EXTERNAL_GETX_COALESCE_V85S_R1 addr=%#x req=%s pending_valid=%d pending=%s\n",
+                address, in_msg.Requestor, cache_entry.PendingL1Valid,
+                cache_entry.PendingL1Requestor);
+      }
+    }
+  }
+
+
+  action(jix_forwardSelfDirGetxFromL1QueueV85S2, "jix85s2",
+         desc="L1-queue Directory self-gateway GETX recall: collect real tokens except pending writer") {
+    peek(L1requestNetwork_in, RequestMsg) {
+      assert(in_msg.Type == CoherenceRequestType:GETX);
+      assert(in_msg.Requestor == machineID);
+      assert(cache_entry.PendingL1Valid);
+      assert(cache_entry.PendingIsGetX);
+      assert(machineIDToMachineType(cache_entry.PendingL1Requestor) ==
+             MachineType:L1Cache);
+
+      enqueue(localRequestNetwork_out, RequestMsg, l2_response_latency) {
+        out_msg.addr := in_msg.addr;
+        out_msg.Requestor := machineID;
+        out_msg.Destination.broadcast(MachineType:L1Cache);
+
+        /*
+         * PendingRequesterHeldTokensSec* already credits the writer's physical
+         * tokens.  Never recall those same tokens a second time.
+         */
+        out_msg.Destination.remove(cache_entry.PendingL1Requestor);
+
+        out_msg.Type := CoherenceRequestType:GETX;
+        out_msg.isLocal := false;
+        out_msg.RetryNum := in_msg.RetryNum;
+        out_msg.sector_id := in_msg.sector_id;
+        out_msg.sector_mask := in_msg.sector_mask;
+        out_msg.requested_sector_mask := in_msg.requested_sector_mask;
+        out_msg.is_gpu := false;
+        out_msg.is_sync := false;
+        out_msg.is_bypass := false;
+        out_msg.is_atomic := in_msg.is_atomic;
+        out_msg.is_signal := false;
+        out_msg.merged_req := in_msg.merged_req;
+        out_msg.is_owner_pull := false;
+        out_msg.MessageSize := MessageSizeType:Broadcast_Control;
+        out_msg.AccessMode := in_msg.AccessMode;
+        out_msg.Prefetch := in_msg.Prefetch;
+      }
+
+      DPRINTF(RubySlicc,
+              "AMTC_L2_IX_LOCAL_OWNER_RECALL_FROM_L1Q_V85S_R2 addr=%#x pending=%s reqmask=%d retry=%d held0=%d held1=%d L2T0=%d L2T1=%d\\n",
+              address, cache_entry.PendingL1Requestor,
+              cache_entry.PendingReqMask, in_msg.RetryNum,
+              cache_entry.PendingRequesterHeldTokensSec0,
+              cache_entry.PendingRequesterHeldTokensSec1,
+              cache_entry.TokensSec0, cache_entry.TokensSec1);
+    }
+  }
+
+  action(traceDropStaleDirLocalGetxRecallV85S2, "tdlr85s2",
+         desc="Trace obsolete same-gateway Directory GETX recall after pending completion") {
+    peek(L1requestNetwork_in, RequestMsg) {
+      if (is_valid(cache_entry)) {
+        DPRINTF(RubySlicc,
+                "AMTC_L2_DROP_STALE_DIR_LOCAL_GETX_RECALL_V85S_R2 addr=%#x state=%s req=%s retry=%d mask=%d pending=%d pending_req=%s pending_mask=%d pending_getx=%d valid=%d T0=%d T1=%d\\n",
+                address, cache_entry.CacheState, in_msg.Requestor,
+                in_msg.RetryNum, in_msg.requested_sector_mask,
+                cache_entry.PendingL1Valid, cache_entry.PendingL1Requestor,
+                cache_entry.PendingReqMask, cache_entry.PendingIsGetX,
+                cache_entry.ValidSectors,
+                cache_entry.TokensSec0, cache_entry.TokensSec1);
+      } else {
+        DPRINTF(RubySlicc,
+                "AMTC_L2_DROP_STALE_DIR_LOCAL_GETX_RECALL_V85S_R2 addr=%#x state=NP req=%s retry=%d mask=%d pending=0\\n",
+                address, in_msg.Requestor, in_msg.RetryNum,
+                in_msg.requested_sector_mask);
+      }
+    }
+  }
+
+
+  action(markCompletedPendingL1EpochsV85S4, "mcpe85s4",
+         desc="Remember all L1s completed by the current pending response window") {
+    if (cache_entry.PendingL1Valid &&
+        machineIDToMachineType(cache_entry.PendingL1Requestor) ==
+            MachineType:L1Cache) {
+      cache_entry.CompletedL1RetryGuard.add(cache_entry.PendingL1Requestor);
+    }
+    if (cache_entry.PendingL1SecondValid &&
+        machineIDToMachineType(cache_entry.PendingL1SecondRequestor) ==
+            MachineType:L1Cache) {
+      cache_entry.CompletedL1RetryGuard.add(cache_entry.PendingL1SecondRequestor);
+    }
+    if (cache_entry.PendingL1ThirdValid &&
+        machineIDToMachineType(cache_entry.PendingL1ThirdRequestor) ==
+            MachineType:L1Cache) {
+      cache_entry.CompletedL1RetryGuard.add(cache_entry.PendingL1ThirdRequestor);
+    }
+    if (cache_entry.PendingL1FourthValid &&
+        machineIDToMachineType(cache_entry.PendingL1FourthRequestor) ==
+            MachineType:L1Cache) {
+      cache_entry.CompletedL1RetryGuard.add(cache_entry.PendingL1FourthRequestor);
+    }
+
+    DPRINTF(RubySlicc,
+            "AMTC_L2_MARK_COMPLETED_L1_EPOCH_V85S_R4 addr=%#x primary=%s guards=%d pending_getx=%d reqmask=%d\n",
+            address, cache_entry.PendingL1Requestor,
+            cache_entry.CompletedL1RetryGuard.count(),
+            cache_entry.PendingIsGetX, cache_entry.PendingReqMask);
+  }
+
+  action(traceDropCompletedL1RetryV85S4, "tdce85s4",
+         desc="Drop a RetryNum>0 message from an L1 epoch already completed") {
+    peek(L1requestNetwork_in, RequestMsg) {
+      DPRINTF(RubySlicc,
+              "AMTC_L2_DROP_COMPLETED_EPOCH_RETRY_V85S_R4 addr=%#x req=%s type=%s retry=%d mask=%d state=%s pending=%d guards=%d\n",
+              address, in_msg.Requestor, in_msg.Type, in_msg.RetryNum,
+              amtc_normalizeMask(in_msg.requested_sector_mask,
+                                 in_msg.sector_id),
+              cache_entry.CacheState, cache_entry.PendingL1Valid,
+              cache_entry.CompletedL1RetryGuard.count());
+    }
+  }
+
+  action(traceStallBehindLiveGetxV85S4, "tsix85s4",
+         desc="Trace a distinct L1 request serialized behind a live IX writer") {
+    peek(L1requestNetwork_in, RequestMsg) {
+      DPRINTF(RubySlicc,
+              "AMTC_L2_STALL_BEHIND_LIVE_GETX_V85S_R4 addr=%#x incoming=%s type=%s retry=%d inmask=%d writer=%s writermask=%d\n",
+              address, in_msg.Requestor, in_msg.Type, in_msg.RetryNum,
+              amtc_normalizeMask(in_msg.requested_sector_mask,
+                                 in_msg.sector_id),
+              cache_entry.PendingL1Requestor,
+              cache_entry.PendingReqMask);
+    }
+  }
+
+
   action(savePendingL1Request, "splr",
          desc="Save original L1 requester/mask while L2 waits for Directory") {
     peek(L1requestNetwork_in, RequestMsg) {
@@ -1567,18 +1805,36 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
                 cache_entry.PendingReqMask, cache_entry.PendingIsGetX);
       } else {
         /*
-         * V23 CPU fast path: CPU L1 requests should be tracked as full-line
-         * requests.  AMTC's 32B sector tracking is useful for GPU/accelerator
-         * traffic, but CPU instruction/data caches normally consume 64B lines.
-         * Keeping CPU misses as single-sector requests creates two independent
-         * IS windows and many timeout/V22 local-fill recoveries.
+         * RetryNum==0 starts a new L1 transaction epoch.  Clear only this
+         * requestor's completion tombstone.  Other L1s may still have old
+         * timeout retries in flight from the previous shared response window.
          */
-        req_mask := amtc_fullMask();
+        if (in_msg.RetryNum == 0 &&
+            cache_entry.CompletedL1RetryGuard.isElement(in_msg.Requestor)) {
+          cache_entry.CompletedL1RetryGuard.remove(in_msg.Requestor);
+          DPRINTF(RubySlicc,
+                  "AMTC_L2_CLEAR_COMPLETED_EPOCH_GUARD_V85S_R4 addr=%#x req=%s type=%s mask=%d\n",
+                  address, in_msg.Requestor, in_msg.Type, req_mask);
+        }
+
+        /*
+         * AMTC sector-exact CPU GETX path:
+         *
+         * Older bring-up code widened all CPU L1 requests to full-line here.
+         * That breaks sector visibility when L1 already owns one sector and
+         * only requests GETX for the other sector.  Preserve the normalized
+         * request mask from L1.  Full-line requests still arrive as mask=3.
+         */
+        req_mask := amtc_sanitizeMask(req_mask);
 
         cache_entry.PendingL1Valid := true;
         cache_entry.PendingL1Requestor := in_msg.Requestor;
         cache_entry.PendingReqMask := req_mask;
-        cache_entry.PendingSectorId := in_msg.sector_id;
+        if (req_mask == amtc_fullMask()) {
+          cache_entry.PendingSectorId := 0;
+        } else {
+          cache_entry.PendingSectorId := amtc_primarySectorFromMask(req_mask);
+        }
         cache_entry.PendingIsGetX := false;
         cache_entry.PendingRequesterHeldTokensSec0 := 0;
         cache_entry.PendingRequesterHeldTokensSec1 := 0;
@@ -1612,19 +1868,22 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
             cache_entry.PendingRequesterHeldTokensSec1 := in_msg.requester_held_tokens_sec1;
           }
           int tokens_per_sector := max_tokens() / 2;
-          if (cache_entry.PendingRequesterHeldTokensSec0 < 0) {
-            cache_entry.PendingRequesterHeldTokensSec0 := 0;
-          }
-          if (cache_entry.PendingRequesterHeldTokensSec1 < 0) {
-            cache_entry.PendingRequesterHeldTokensSec1 := 0;
-          }
-          if (cache_entry.PendingRequesterHeldTokensSec0 > tokens_per_sector) {
-            cache_entry.PendingRequesterHeldTokensSec0 := tokens_per_sector;
-          }
-          if (cache_entry.PendingRequesterHeldTokensSec1 > tokens_per_sector) {
-            cache_entry.PendingRequesterHeldTokensSec1 := tokens_per_sector;
-          }
+          assert(cache_entry.PendingRequesterHeldTokensSec0 >= 0);
+          assert(cache_entry.PendingRequesterHeldTokensSec1 >= 0);
+          assert(cache_entry.PendingRequesterHeldTokensSec0 <= tokens_per_sector);
+          assert(cache_entry.PendingRequesterHeldTokensSec1 <= tokens_per_sector);
         }
+
+        DPRINTF(RubySlicc,
+                "AMTC_L2_INITIAL_GETX_MASK_CHECK addr=%#x inmask=%d saved=%d type=%s req=%s sid=%d held0=%d held1=%d\n",
+                address,
+                req_mask,
+                cache_entry.PendingReqMask,
+                in_msg.Type,
+                cache_entry.PendingL1Requestor,
+                cache_entry.PendingSectorId,
+                cache_entry.PendingRequesterHeldTokensSec0,
+                cache_entry.PendingRequesterHeldTokensSec1);
 
         DPRINTF(RubySlicc,
                 "AMTC_L2_SAVE_PENDING_L1_V32 addr=%#x req=%s reqmask=%d is_getx=%d held0=%d held1=%d retry=%d ownerpull=%d\n",
@@ -1653,8 +1912,48 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
     }
   }
 
+  // V85S-r12: the Directory records an L2 gateway as CPU owner, while the
+  // physical data/tokens may live only in L1s behind that gateway.  An NP/I L2
+  // tag is therefore not proof of a stale owner.  Fan the DMA-read data-only
+  // owner pull to all local L1s and preserve Requestor=Directory/is_owner_pull.
+  action(forwardDirectoryOwnerPullToLocalL1sV85S12, "fdopl12",
+         desc="Forward Directory data-only owner pull through hierarchical L2 gateway") {
+    peek(L1requestNetwork_in, RequestMsg) {
+      int req_mask := in_msg.requested_sector_mask;
+      if (req_mask == 0) { req_mask := in_msg.sector_mask; }
+      if (req_mask == 0) { req_mask := amtc_fullMask(); }
+      req_mask := amtc_sanitizeMask(req_mask);
+
+      enqueue(localRequestNetwork_out, RequestMsg, l2_response_latency) {
+        out_msg.addr := in_msg.addr;
+        out_msg.Requestor := in_msg.Requestor;
+        out_msg.Destination.broadcast(MachineType:L1Cache);
+        out_msg.Type := CoherenceRequestType:GETS;
+        out_msg.isLocal := false;
+        out_msg.RetryNum := in_msg.RetryNum;
+        out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+        out_msg.sector_mask := req_mask;
+        out_msg.requested_sector_mask := req_mask;
+        out_msg.is_gpu := false;
+        out_msg.is_sync := in_msg.is_sync;
+        out_msg.is_bypass := in_msg.is_bypass;
+        out_msg.is_atomic := false;
+        out_msg.is_signal := in_msg.is_signal;
+        out_msg.merged_req := in_msg.merged_req;
+        out_msg.is_owner_pull := true;
+        out_msg.MessageSize := MessageSizeType:Broadcast_Control;
+        out_msg.AccessMode := in_msg.AccessMode;
+        out_msg.Prefetch := in_msg.Prefetch;
+      }
+
+      DPRINTF(RubySlicc,
+              "AMTC_L2_DMA_READ_OWNER_PULL_FANOUT_V85S_R12 addr=%#x req=%s mask=%d resident=%d\n",
+              address, in_msg.Requestor, req_mask, is_valid(cache_entry));
+    }
+  }
+
   action(sendDataToDirectoryOwnerPullFromL1Req, "sddp",
-         desc="Reply data to Directory owner-pull using local L2 data") {
+         desc="Reply data to Directory owner-pull using L2 data or hierarchical L1 fanout") {
     assert(is_valid(cache_entry));
     peek(L1requestNetwork_in, RequestMsg) {
       int req_mask := amtc_normalizeMask(in_msg.requested_sector_mask,
@@ -1667,28 +1966,63 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
         req_mask := amtc_fullMask();
       }
 
-      enqueue(responseNetwork_out, ResponseMsg, l2_response_latency) {
-        out_msg.addr := address;
-        out_msg.Type := CoherenceResponseType:DATA_SHARED;
-        out_msg.Sender := machineID;
-        out_msg.Destination.add(in_msg.Requestor);
-        out_msg.DataBlk := cache_entry.DataBlk;
-        out_msg.Dirty := false;
-        out_msg.TokensSec0 := 0;
-        out_msg.TokensSec1 := 0;
-        out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
-        out_msg.sector_mask := req_mask;
-        out_msg.valid_sector_mask := req_mask;
-        out_msg.token_sector_mask := 0;
-        out_msg.requested_sector_mask := req_mask;
-        out_msg.MessageSize := amtc_getSizeFromDirtyMask(req_mask);
-      }
+      bool have_requested_data :=
+          amtc_maskContainsAll(cache_entry.ValidSectors, req_mask);
 
-      DPRINTF(RubySlicc,
-              "AMTC_L2_DIR_OWNER_PULL_DATA addr=%#x req=%s state=%s mask=%d valid=%d t0=%d t1=%d\n",
-              address, in_msg.Requestor, cache_entry.CacheState, req_mask,
-              cache_entry.ValidSectors, cache_entry.TokensSec0,
-              cache_entry.TokensSec1);
+      if (have_requested_data) {
+        enqueue(responseNetwork_out, ResponseMsg, l2_response_latency) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceResponseType:DATA_SHARED;
+          out_msg.Sender := machineID;
+          out_msg.Destination.add(in_msg.Requestor);
+          out_msg.DataBlk := cache_entry.DataBlk;
+          out_msg.Dirty := false;
+          out_msg.TokensSec0 := 0;
+          out_msg.TokensSec1 := 0;
+          out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+          out_msg.sector_mask := req_mask;
+          out_msg.valid_sector_mask := req_mask;
+          out_msg.token_sector_mask := 0;
+          out_msg.requested_sector_mask := req_mask;
+          out_msg.MessageSize := amtc_getSizeFromDirtyMask(req_mask);
+        }
+
+        DPRINTF(RubySlicc,
+                "AMTC_L2_DMA_READ_OWNER_PULL_DATA_V85S_R12 addr=%#x req=%s state=%s mask=%d valid=%d t0=%d t1=%d\n",
+                address, in_msg.Requestor, cache_entry.CacheState, req_mask,
+                cache_entry.ValidSectors, cache_entry.TokensSec0,
+                cache_entry.TokensSec1);
+      } else {
+        // Stable state alone does not prove that this L2 has the requested
+        // bytes.  The authoritative copy can still live in a local L1.
+        enqueue(localRequestNetwork_out, RequestMsg, l2_response_latency) {
+          out_msg.addr := in_msg.addr;
+          out_msg.Requestor := in_msg.Requestor;
+          out_msg.Destination.broadcast(MachineType:L1Cache);
+          out_msg.Type := CoherenceRequestType:GETS;
+          out_msg.isLocal := false;
+          out_msg.RetryNum := in_msg.RetryNum;
+          out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+          out_msg.sector_mask := req_mask;
+          out_msg.requested_sector_mask := req_mask;
+          out_msg.is_gpu := false;
+          out_msg.is_sync := in_msg.is_sync;
+          out_msg.is_bypass := in_msg.is_bypass;
+          out_msg.is_atomic := false;
+          out_msg.is_signal := in_msg.is_signal;
+          out_msg.merged_req := in_msg.merged_req;
+          out_msg.is_owner_pull := true;
+          out_msg.MessageSize := MessageSizeType:Broadcast_Control;
+          out_msg.AccessMode := in_msg.AccessMode;
+          out_msg.Prefetch := in_msg.Prefetch;
+        }
+
+        DPRINTF(RubySlicc,
+                "AMTC_L2_DMA_READ_OWNER_PULL_STABLE_FANOUT_V85S_R12 addr=%#x req=%s state=%s mask=%d valid=%d t0=%d t1=%d\n",
+                address, in_msg.Requestor, cache_entry.CacheState, req_mask,
+                cache_entry.ValidSectors, cache_entry.TokensSec0,
+                cache_entry.TokensSec1);
+      }
     }
   }
 
@@ -1794,13 +2128,35 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
       int send_t1 := 0;
       int token_mask := 0;
 
+      /*
+       * Do not fabricate shared GETS tokens.
+       *
+       * The failing R=2 sector-visibility run showed:
+       *   Directory DATA_SHARED tokmask=0 t0=0 t1=0
+       *   L2 AMTC_L2_PENDING_GETS_FORCE_TOKEN
+       *   L1 later sends GETX with held0=1
+       *
+       * That crumb token is not ownership and poisons the following GETX.
+       */
       if (amtc_maskHasSector(req_mask, 0)) {
-        send_t0 := 1;
-        token_mask := amtc_unionMasks(token_mask, 1);
+        if (cache_entry.TokensSec0 > 0) {
+          send_t0 := 1;
+          token_mask := amtc_unionMasks(token_mask, 1);
+        } else {
+          DPRINTF(RubySlicc,
+                  "AMTC_L2_PENDING_GETS_DATA_ONLY_NO_TOKEN_V70 addr=%#x sec=0 reqmask=%d\n",
+                  address, req_mask);
+        }
       }
       if (amtc_maskHasSector(req_mask, 1)) {
-        send_t1 := 1;
-        token_mask := amtc_unionMasks(token_mask, 2);
+        if (cache_entry.TokensSec1 > 0) {
+          send_t1 := 1;
+          token_mask := amtc_unionMasks(token_mask, 2);
+        } else {
+          DPRINTF(RubySlicc,
+                  "AMTC_L2_PENDING_GETS_DATA_ONLY_NO_TOKEN_V70 addr=%#x sec=1 reqmask=%d\n",
+                  address, req_mask);
+        }
       }
 
       enqueue(responseNetwork_out, ResponseMsg, l2_response_latency) {
@@ -1821,22 +2177,10 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
       }
 
       if (send_t0 > 0) {
-        if (cache_entry.TokensSec0 > 0) {
-          cache_entry.TokensSec0 := cache_entry.TokensSec0 - send_t0;
-        } else {
-          DPRINTF(RubySlicc,
-                  "AMTC_L2_PENDING_GETS_FORCE_TOKEN addr=%#x sec=0 reqmask=%d\n",
-                  address, req_mask);
-        }
+        cache_entry.TokensSec0 := cache_entry.TokensSec0 - send_t0;
       }
       if (send_t1 > 0) {
-        if (cache_entry.TokensSec1 > 0) {
-          cache_entry.TokensSec1 := cache_entry.TokensSec1 - send_t1;
-        } else {
-          DPRINTF(RubySlicc,
-                  "AMTC_L2_PENDING_GETS_FORCE_TOKEN addr=%#x sec=1 reqmask=%d\n",
-                  address, req_mask);
-        }
+        cache_entry.TokensSec1 := cache_entry.TokensSec1 - send_t1;
       }
 
       DPRINTF(RubySlicc,
@@ -1861,12 +2205,24 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
       int token_mask := 0;
 
       if (amtc_maskHasSector(req_mask, 0)) {
-        send_t0 := 1;
-        token_mask := amtc_unionMasks(token_mask, 1);
+        if (cache_entry.TokensSec0 > 0) {
+          send_t0 := 1;
+          token_mask := amtc_unionMasks(token_mask, 1);
+        } else {
+          DPRINTF(RubySlicc,
+                  "AMTC_L2_SECOND_GETS_DATA_ONLY_NO_TOKEN_V70 addr=%#x sec=0 reqmask=%d\n",
+                  address, req_mask);
+        }
       }
       if (amtc_maskHasSector(req_mask, 1)) {
-        send_t1 := 1;
-        token_mask := amtc_unionMasks(token_mask, 2);
+        if (cache_entry.TokensSec1 > 0) {
+          send_t1 := 1;
+          token_mask := amtc_unionMasks(token_mask, 2);
+        } else {
+          DPRINTF(RubySlicc,
+                  "AMTC_L2_SECOND_GETS_DATA_ONLY_NO_TOKEN_V70 addr=%#x sec=1 reqmask=%d\n",
+                  address, req_mask);
+        }
       }
 
       enqueue(responseNetwork_out, ResponseMsg, l2_response_latency) {
@@ -1887,22 +2243,10 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
       }
 
       if (send_t0 > 0) {
-        if (cache_entry.TokensSec0 > 0) {
-          cache_entry.TokensSec0 := cache_entry.TokensSec0 - send_t0;
-        } else {
-          DPRINTF(RubySlicc,
-                  "AMTC_L2_SECOND_GETS_FORCE_TOKEN addr=%#x sec=0 reqmask=%d\n",
-                  address, req_mask);
-        }
+        cache_entry.TokensSec0 := cache_entry.TokensSec0 - send_t0;
       }
       if (send_t1 > 0) {
-        if (cache_entry.TokensSec1 > 0) {
-          cache_entry.TokensSec1 := cache_entry.TokensSec1 - send_t1;
-        } else {
-          DPRINTF(RubySlicc,
-                  "AMTC_L2_SECOND_GETS_FORCE_TOKEN addr=%#x sec=1 reqmask=%d\n",
-                  address, req_mask);
-        }
+        cache_entry.TokensSec1 := cache_entry.TokensSec1 - send_t1;
       }
 
       DPRINTF(RubySlicc,
@@ -1927,12 +2271,24 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
       int token_mask := 0;
 
       if (amtc_maskHasSector(req_mask, 0)) {
-        send_t0 := 1;
-        token_mask := amtc_unionMasks(token_mask, 1);
+        if (cache_entry.TokensSec0 > 0) {
+          send_t0 := 1;
+          token_mask := amtc_unionMasks(token_mask, 1);
+        } else {
+          DPRINTF(RubySlicc,
+                  "AMTC_L2_THIRD_GETS_DATA_ONLY_NO_TOKEN_V85S_R3 addr=%#x sec=0 reqmask=%d\n",
+                  address, req_mask);
+        }
       }
       if (amtc_maskHasSector(req_mask, 1)) {
-        send_t1 := 1;
-        token_mask := amtc_unionMasks(token_mask, 2);
+        if (cache_entry.TokensSec1 > 0) {
+          send_t1 := 1;
+          token_mask := amtc_unionMasks(token_mask, 2);
+        } else {
+          DPRINTF(RubySlicc,
+                  "AMTC_L2_THIRD_GETS_DATA_ONLY_NO_TOKEN_V85S_R3 addr=%#x sec=1 reqmask=%d\n",
+                  address, req_mask);
+        }
       }
 
       enqueue(responseNetwork_out, ResponseMsg, l2_response_latency) {
@@ -1983,12 +2339,24 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
       int token_mask := 0;
 
       if (amtc_maskHasSector(req_mask, 0)) {
-        send_t0 := 1;
-        token_mask := amtc_unionMasks(token_mask, 1);
+        if (cache_entry.TokensSec0 > 0) {
+          send_t0 := 1;
+          token_mask := amtc_unionMasks(token_mask, 1);
+        } else {
+          DPRINTF(RubySlicc,
+                  "AMTC_L2_FOURTH_GETS_DATA_ONLY_NO_TOKEN_V85S_R3 addr=%#x sec=0 reqmask=%d\n",
+                  address, req_mask);
+        }
       }
       if (amtc_maskHasSector(req_mask, 1)) {
-        send_t1 := 1;
-        token_mask := amtc_unionMasks(token_mask, 2);
+        if (cache_entry.TokensSec1 > 0) {
+          send_t1 := 1;
+          token_mask := amtc_unionMasks(token_mask, 2);
+        } else {
+          DPRINTF(RubySlicc,
+                  "AMTC_L2_FOURTH_GETS_DATA_ONLY_NO_TOKEN_V85S_R3 addr=%#x sec=1 reqmask=%d\n",
+                  address, req_mask);
+        }
       }
 
       enqueue(responseNetwork_out, ResponseMsg, l2_response_latency) {
@@ -2049,40 +2417,33 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
     if (req_mask == 0) {
       req_mask := amtc_fullMask();
     }
+    req_mask := amtc_sanitizeMask(req_mask);
 
-    int send_mask := req_mask;
-    int tokens_per_sector := max_tokens() / 2;
-    int held_t0 := cache_entry.PendingRequesterHeldTokensSec0;
-    int held_t1 := cache_entry.PendingRequesterHeldTokensSec1;
-    if (held_t0 < 0) { held_t0 := 0; }
-    if (held_t1 < 0) { held_t1 := 0; }
-    if (held_t0 > tokens_per_sector) { held_t0 := tokens_per_sector; }
-    if (held_t1 > tokens_per_sector) { held_t1 := tokens_per_sector; }
+    /*
+     * V85S-r4 sub-line rule:
+     *   - requested_sector_mask describes the operation that is completing;
+     *   - valid_sector_mask describes every byte sector actually carried;
+     *   - token_sector_mask describes every physical token sector transferred.
+     *
+     * IX donates all L2-held tokens because the line leaves the L2 ownership
+     * transient.  If L2 also has valid bytes for the other sector, carry those
+     * bytes with the ownership response instead of discarding them.  This is
+     * exactly the 0x61780 case: reqmask=2, ValidSectors=3, tokens=512/512.
+     */
+    int send_mask := amtc_sanitizeMask(cache_entry.ValidSectors);
+    assert(amtc_maskContainsAll(send_mask, req_mask));
 
     int send_t0 := 0;
     int send_t1 := 0;
-    if (amtc_maskHasSector(send_mask, 0)) {
-      int need_t0 := tokens_per_sector - held_t0;
-      if (need_t0 < 0) { need_t0 := 0; }
-      send_t0 := cache_entry.TokensSec0;
-      if (send_t0 > need_t0) {
-        send_t0 := need_t0;
-      }
-    }
-    if (amtc_maskHasSector(send_mask, 1)) {
-      int need_t1 := tokens_per_sector - held_t1;
-      if (need_t1 < 0) { need_t1 := 0; }
-      send_t1 := cache_entry.TokensSec1;
-      if (send_t1 > need_t1) {
-        send_t1 := need_t1;
-      }
-    }
-
     int token_mask := 0;
-    if (send_t0 > 0) {
+
+    if (cache_entry.TokensSec0 > 0) {
+      send_t0 := cache_entry.TokensSec0;
       token_mask := amtc_addSectorToMask(token_mask, 0);
     }
-    if (send_t1 > 0) {
+
+    if (cache_entry.TokensSec1 > 0) {
+      send_t1 := cache_entry.TokensSec1;
       token_mask := amtc_addSectorToMask(token_mask, 1);
     }
 
@@ -2095,80 +2456,11 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
             send_t0,
             send_t1,
             token_mask);
-
-    enqueue(responseNetwork_out, ResponseMsg, l2_response_latency) {
-      out_msg.addr := address;
-      out_msg.Type := CoherenceResponseType:DATA_OWNER;
-      out_msg.Sender := machineID;
-      out_msg.Destination.add(cache_entry.PendingL1Requestor);
-
-      out_msg.DataBlk := cache_entry.DataBlk;
-      out_msg.Dirty := true;
-
-      out_msg.TokensSec0 := send_t0;
-      out_msg.TokensSec1 := send_t1;
-
-      out_msg.sector_id := 0;
-      out_msg.sector_mask := send_mask;
-      out_msg.requested_sector_mask := req_mask;
-      out_msg.valid_sector_mask := send_mask;
-      out_msg.token_sector_mask := token_mask;
-
-      out_msg.MessageSize := amtc_getSizeFromDirtyMask(send_mask);
-
-      out_msg.merged_resp := false;
-      out_msg.isGLCSet := false;
-      out_msg.isSLCSet := false;
-    }
-
-    // Requester-held tokens are metadata credit only.  Send only the
-    // missing delta from L2, then clear L2 tokens for requested sectors to
-    // avoid duplicate token ownership/overflow at the requester.
-    if (amtc_maskHasSector(send_mask, 0)) {
-      cache_entry.TokensSec0 := 0;
-    }
-    if (amtc_maskHasSector(send_mask, 1)) {
-      cache_entry.TokensSec1 := 0;
-    }
-    }
-  }
-
-  action(dbg_l2ForceLocalGetxGrant, "fxdbg",
-         desc="Debug forced local GETX owner grant from stuck IX") {
     DPRINTF(RubySlicc,
-            "AMTC_L2_IX_GETX_FORCE_LOCAL_GRANT_V14 addr=%#x valid=%d T0=%d T1=%d pending=%d req=%s reqmask=%d\n",
-            address, cache_entry.ValidSectors, cache_entry.TokensSec0,
-            cache_entry.TokensSec1, cache_entry.PendingL1Valid,
-            cache_entry.PendingL1Requestor, cache_entry.PendingReqMask);
-  }
-
-  action(forcePendingGetxOwnerDataToL1, "fpxd",
-         desc="Bring-up: force DATA_OWNER with synthetic ownership tokens to saved pending L1") {
-    cache_entry := getCacheEntry(address);
-
-    int req_mask := cache_entry.PendingReqMask;
-    if (req_mask == 0) {
-      req_mask := amtc_fullMask();
-    }
-    req_mask := amtc_sanitizeMask(req_mask);
-
-    int send_t0 := 0;
-    int send_t1 := 0;
-    int token_mask := 0;
-
-    if (amtc_maskHasSector(req_mask, 0)) {
-      send_t0 := max_tokens() / 2;
-      token_mask := amtc_addSectorToMask(token_mask, 0);
-    }
-    if (amtc_maskHasSector(req_mask, 1)) {
-      send_t1 := max_tokens() / 2;
-      token_mask := amtc_addSectorToMask(token_mask, 1);
-    }
-
-    DPRINTF(RubySlicc,
-            "AMTC_L2_IX_GETX_FORCE_OWNER_DATA_V14 addr=%#x req=%s reqmask=%d sent0=%d sent1=%d tokmask=%d\n",
-            address, cache_entry.PendingL1Requestor, req_mask,
-            send_t0, send_t1, token_mask);
+            "AMTC_L2_GETX_DATA_SCOPE_V85S_R4 addr=%#x reqmask=%d validmask=%d tokmask=%d valid=%d T0=%d T1=%d\n",
+            address, req_mask, send_mask, token_mask,
+            cache_entry.ValidSectors,
+            cache_entry.TokensSec0, cache_entry.TokensSec1);
 
     enqueue(responseNetwork_out, ResponseMsg, l2_response_latency) {
       out_msg.addr := address;
@@ -2183,21 +2475,27 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
       out_msg.TokensSec1 := send_t1;
 
       out_msg.sector_id := cache_entry.PendingSectorId;
-      out_msg.sector_mask := req_mask;
+      out_msg.sector_mask := send_mask;
       out_msg.requested_sector_mask := req_mask;
-      out_msg.valid_sector_mask := req_mask;
+      out_msg.valid_sector_mask := send_mask;
       out_msg.token_sector_mask := token_mask;
 
-      out_msg.MessageSize := amtc_getSizeFromDirtyMask(req_mask);
+      out_msg.MessageSize := amtc_getSizeFromDirtyMask(send_mask);
 
       out_msg.merged_resp := false;
       out_msg.isGLCSet := false;
       out_msg.isSLCSet := false;
     }
 
+    // All L2-held tokens were donated above.  Clear both sectors so the
+    // following IX -> NP transition does not leave residual token ownership
+    // in a non-present L2 line.
     cache_entry.TokensSec0 := 0;
     cache_entry.TokensSec1 := 0;
+    }
   }
+
+
 
   action(k_dataFromL2CacheToL1Requestor, "k", desc="AMTC strict complete DATA_SHARED response for passive L1") {
     peek(L1requestNetwork_in, RequestMsg) {
@@ -2214,18 +2512,12 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
 
       bool valid_complete := amtc_maskContainsAll(cache_entry.ValidSectors, req_mask);
 
-      // If this L2 holds all tokens for a requested sector, the line data in
-      // cache_entry.DataBlk is authoritative even if ValidSectors was narrowed
-      // by an earlier sector writeback hint.  Do not suppress the response in
-      // this case; otherwise the original L1 request is popped and no one ever
-      // sends the missing sector data back to the passive L1.
-      bool owner_data0 := (!amtc_maskHasSector(req_mask, 0)) ||
-                          (cache_entry.TokensSec0 == (max_tokens() / 2));
-      bool owner_data1 := (!amtc_maskHasSector(req_mask, 1)) ||
-                          (cache_entry.TokensSec1 == (max_tokens() / 2));
-      bool owner_data_complete := owner_data0 && owner_data1;
-
-      bool data_complete := valid_complete || owner_data_complete;
+      // V85S-r3: token ownership is permission, not byte-validity evidence.
+      // If the requested sector is not in ValidSectors, do not fabricate a
+      // local DATA_SHARED hit merely because L2 owns all of that sector's
+      // tokens.  The request must follow the data-miss path.
+      bool owner_data_complete := false;
+      bool data_complete := valid_complete;
       bool token0_ready := (!amtc_maskHasSector(req_mask, 0)) || (cache_entry.TokensSec0 > 0);
       bool token1_ready := (!amtc_maskHasSector(req_mask, 1)) || (cache_entry.TokensSec1 > 0);
       bool shared_complete := token0_ready && token1_ready;
@@ -2394,254 +2686,76 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
     }
   }
 
-  action(k_dataAndAllTokensFromL2CacheToL1Requestor, "\kk", desc="AMTC strict complete DATA_OWNER response for passive L1") {
+  action(k_dataAndAllTokensFromL2CacheToL1Requestor, "\kk",
+         desc="Send exact physical owner data/tokens from exclusive L2 to L1") {
     peek(L1requestNetwork_in, RequestMsg) {
       assert(is_valid(cache_entry));
 
-      int req_mask := in_msg.requested_sector_mask;
+      int req_mask := amtc_normalizeMask(in_msg.requested_sector_mask,
+                                         in_msg.sector_id);
       if (req_mask == 0) {
-        req_mask := in_msg.sector_mask;
+        req_mask := amtc_normalizeMask(in_msg.sector_mask,
+                                       in_msg.sector_id);
       }
       if (req_mask == 0) {
         req_mask := amtc_fullMask();
       }
       req_mask := amtc_sanitizeMask(req_mask);
 
-      int tokens_per_sector := max_tokens() / 2;
-      bool valid_complete := amtc_maskContainsAll(cache_entry.ValidSectors, req_mask);
+      int max_t := max_tokens() / 2;
 
-      // If this L2 has all tokens for a requested sector, its DataBlk is the
-      // authoritative owner copy even when ValidSectors was narrowed by prior
-      // sector metadata.  Do not suppress GETX in that case; otherwise L2 pops
-      // the request, changes state to I, and the directory only returns a
-      // zero-token ACK_OWNER while L1 waits forever.
-      bool owner_data0 := (!amtc_maskHasSector(req_mask, 0)) ||
-                          (cache_entry.TokensSec0 == tokens_per_sector);
-      bool owner_data1 := (!amtc_maskHasSector(req_mask, 1)) ||
-                          (cache_entry.TokensSec1 == tokens_per_sector);
-      bool owner_data_complete := owner_data0 && owner_data1;
-      bool data_complete := valid_complete || owner_data_complete;
+      // This action is used only by stable M.  M must already own the complete
+      // line physically; there is no legal "near token" completion.
+      assert(cache_entry.TokensSec0 == max_t);
+      assert(cache_entry.TokensSec1 == max_t);
+      assert(amtc_maskContainsAll(cache_entry.ValidSectors, req_mask));
 
-      // For an L1 upgrade from S/O to M, the requester may already hold its
-      // shared token for the requested sector.  L2 is the coordinator and must
-      // deliver the remaining tokens, not wait forever for a full sector token
-      // count inside L2.  This fixes the S_IM case where L2 has 511 tokens and
-      // L1 already has 1 token; requiring 512 here suppresses the only useful
-      // DATA_OWNER response and leaves L1 waiting on zero-token ACK_OWNERs.
-      int upgrade_tokens_needed := tokens_per_sector - 1;
-      if (upgrade_tokens_needed < 1) { upgrade_tokens_needed := 1; }
+      int send_t0 := cache_entry.TokensSec0;
+      int send_t1 := cache_entry.TokensSec1;
+      int token_mask := amtc_fullMask();
 
-      // Audit14: tolerate a small stale-sharer deficit in L2 O.
-      // We have now seen both 510/511 and 509/511 cases at the CPU->GPU
-      // handoff.  In both, the directory/sharer lists point at NP/I caches and
-      // the requester loops forever on ACK_OWNER(0).  Treat up to a two-token
-      // deficit as repairable and send the expected remaining grant; L1 clamps
-      // accumulated sector tokens to tokens_per_sector.
-      int repair_deficit_limit := 2;
-      int near_upgrade_tokens_needed := upgrade_tokens_needed - repair_deficit_limit;
-      if (near_upgrade_tokens_needed < 1) { near_upgrade_tokens_needed := 1; }
-
-      bool excl0_ready := (!amtc_maskHasSector(req_mask, 0)) ||
-                          (cache_entry.TokensSec0 >= near_upgrade_tokens_needed);
-      bool excl1_ready := (!amtc_maskHasSector(req_mask, 1)) ||
-                          (cache_entry.TokensSec1 >= near_upgrade_tokens_needed);
-      bool exclusive_complete := excl0_ready && excl1_ready;
-
-      // Passive L1 contract for GETX:
-      // Never send DATA_OWNER/ACK as a final partial upgrade.  If L2 cannot
-      // provide full requested-sector data and all tokens, keep coordination in
-      // L2/TCC/Dir by forwarding the request.  L1 only accumulates and waits.
-      if (data_complete && exclusive_complete) {
-        int send_t0 := 0;
-        int send_t1 := 0;
-        int send_token_mask := 0;
-
-        // GETX ownership is line-granular in this protocol.  Even when the
-        // requester only needs data for one sector, do not strand tokens for
-        // an unrequested sector in L2 O with ValidSectors==0.  Donate all
-        // tokens that L2 currently holds; data remains sector-scoped via
-        // valid_sector_mask/MessageSize below.
-        if (cache_entry.TokensSec0 > 0) {
-          if (amtc_maskHasSector(req_mask, 0) &&
-              cache_entry.TokensSec0 < upgrade_tokens_needed &&
-              cache_entry.TokensSec0 >= near_upgrade_tokens_needed) {
-            send_t0 := upgrade_tokens_needed;
-            DPRINTF(RubySlicc,
-                    "AMTC_L2_NEAR_TOKEN_REPAIR_W2 addr=%#x sec=0 have=%d send=%d req=%d\n",
-                    address, cache_entry.TokensSec0, send_t0, req_mask);
-          } else {
-            send_t0 := cache_entry.TokensSec0;
-          }
-          cache_entry.TokensSec0 := 0;
-          send_token_mask := amtc_unionMasks(send_token_mask, 1);
-        }
-        if (cache_entry.TokensSec1 > 0) {
-          if (amtc_maskHasSector(req_mask, 1) &&
-              cache_entry.TokensSec1 < upgrade_tokens_needed &&
-              cache_entry.TokensSec1 >= near_upgrade_tokens_needed) {
-            send_t1 := upgrade_tokens_needed;
-            DPRINTF(RubySlicc,
-                    "AMTC_L2_NEAR_TOKEN_REPAIR_W2 addr=%#x sec=1 have=%d send=%d req=%d\n",
-                    address, cache_entry.TokensSec1, send_t1, req_mask);
-          } else {
-            send_t1 := cache_entry.TokensSec1;
-          }
-          cache_entry.TokensSec1 := 0;
-          send_token_mask := amtc_unionMasks(send_token_mask, 2);
-        }
-
-        enqueue(responseNetwork_out, ResponseMsg, l2_response_latency) {
-          out_msg.addr := address;
-          out_msg.Type := CoherenceResponseType:DATA_OWNER;
-          out_msg.Sender := machineID;
-          out_msg.Destination.add(in_msg.Requestor);
-          out_msg.DataBlk := cache_entry.DataBlk;
-          out_msg.Dirty := cache_entry.Dirty;
-          out_msg.TokensSec0 := send_t0;
-          out_msg.TokensSec1 := send_t1;
-          out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
-          out_msg.sector_mask := req_mask;
-          out_msg.valid_sector_mask := req_mask;
-          out_msg.token_sector_mask := send_token_mask;
-          out_msg.requested_sector_mask := req_mask;
-          out_msg.merged_resp := false;
-          out_msg.MessageSize := amtc_getSizeFromDirtyMask(req_mask);
-        }
-
-        DPRINTF(RubySlicc,
-                "AMTC_L2_COMPLETE_GETX_DATA addr=%#x req=%d tokmask=%d valid=%d owner_data=%d need=%d sent_t0=%d sent_t1=%d\n",
-                address, req_mask, send_token_mask, cache_entry.ValidSectors,
-                owner_data_complete, upgrade_tokens_needed, send_t0, send_t1);
-      } else if (exclusive_complete) {
-        // Write/RFO may complete with tokens only when L1 already has or will
-        // install the data via the CPU store.  Do not suppress and pop the
-        // request in this case: give L1 the remaining tokens it asked for.
-        // This fixes S + Store_Sector_Miss where ValidSectors is stale/narrow
-        // but L2 has the required 511 upgrade tokens.
-        int send_t0 := 0;
-        int send_t1 := 0;
-        int send_token_mask := 0;
-
-        // GETX ownership is line-granular in this protocol.  Even when the
-        // requester only needs data for one sector, do not strand tokens for
-        // an unrequested sector in L2 O with ValidSectors==0.  Donate all
-        // tokens that L2 currently holds; data remains sector-scoped via
-        // valid_sector_mask/MessageSize below.
-        if (cache_entry.TokensSec0 > 0) {
-          if (amtc_maskHasSector(req_mask, 0) &&
-              cache_entry.TokensSec0 < upgrade_tokens_needed &&
-              cache_entry.TokensSec0 >= near_upgrade_tokens_needed) {
-            send_t0 := upgrade_tokens_needed;
-            DPRINTF(RubySlicc,
-                    "AMTC_L2_NEAR_TOKEN_REPAIR_W2 addr=%#x sec=0 have=%d send=%d req=%d\n",
-                    address, cache_entry.TokensSec0, send_t0, req_mask);
-          } else {
-            send_t0 := cache_entry.TokensSec0;
-          }
-          cache_entry.TokensSec0 := 0;
-          send_token_mask := amtc_unionMasks(send_token_mask, 1);
-        }
-        if (cache_entry.TokensSec1 > 0) {
-          if (amtc_maskHasSector(req_mask, 1) &&
-              cache_entry.TokensSec1 < upgrade_tokens_needed &&
-              cache_entry.TokensSec1 >= near_upgrade_tokens_needed) {
-            send_t1 := upgrade_tokens_needed;
-            DPRINTF(RubySlicc,
-                    "AMTC_L2_NEAR_TOKEN_REPAIR_W2 addr=%#x sec=1 have=%d send=%d req=%d\n",
-                    address, cache_entry.TokensSec1, send_t1, req_mask);
-          } else {
-            send_t1 := cache_entry.TokensSec1;
-          }
-          cache_entry.TokensSec1 := 0;
-          send_token_mask := amtc_unionMasks(send_token_mask, 2);
-        }
-
-        enqueue(responseNetwork_out, ResponseMsg, l2_response_latency) {
-          out_msg.addr := address;
-          out_msg.Type := CoherenceResponseType:ACK;
-          out_msg.Sender := machineID;
-          out_msg.Destination.add(in_msg.Requestor);
-          out_msg.TokensSec0 := send_t0;
-          out_msg.TokensSec1 := send_t1;
-          out_msg.Dirty := false;
-          out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
-          out_msg.sector_mask := req_mask;
-          out_msg.valid_sector_mask := 0;
-          out_msg.token_sector_mask := send_token_mask;
-          out_msg.requested_sector_mask := req_mask;
-          out_msg.merged_resp := false;
-          out_msg.MessageSize := MessageSizeType:Response_Control;
-        }
-
-        DPRINTF(RubySlicc,
-                "AMTC_L2_COMPLETE_GETX_TOKENS_ONLY addr=%#x req=%d tokmask=%d valid=%d need=%d sent_t0=%d sent_t1=%d\n",
-                address, req_mask, send_token_mask, cache_entry.ValidSectors,
-                upgrade_tokens_needed, send_t0, send_t1);
-      } else {
-        enqueue(globalRequestNetwork_out, RequestMsg, l2_request_latency) {
-          out_msg.addr := address;
-          out_msg.Type := CoherenceRequestType:GETX;
-          out_msg.Requestor := in_msg.Requestor;
-          out_msg.RetryNum := in_msg.RetryNum;
-          out_msg.Destination.broadcast(MachineType:L2Cache);
-          out_msg.Destination.remove(machineID);
-          out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
-          out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
-          out_msg.sector_mask := req_mask;
-          out_msg.requested_sector_mask := req_mask;
-          out_msg.MessageSize := MessageSizeType:Request_Control;
-          out_msg.AccessMode := in_msg.AccessMode;
-          out_msg.Prefetch := in_msg.Prefetch;
-          out_msg.is_gpu := in_msg.is_gpu;
-          out_msg.is_sync := in_msg.is_sync;
-          out_msg.is_bypass := in_msg.is_bypass;
-          out_msg.is_atomic := in_msg.is_atomic;
-          out_msg.is_signal := in_msg.is_signal;
-          out_msg.merged_req := in_msg.merged_req;
-          out_msg.is_owner_pull := in_msg.is_owner_pull;
-        }
-
-        DPRINTF(RubySlicc,
-                "AMTC_L2_SUPPRESS_PARTIAL_GETX addr=%#x req=%d valid=%d owner_data=%d need=%d t0=%d t1=%d\n",
-                address, req_mask, cache_entry.ValidSectors,
-                owner_data_complete, upgrade_tokens_needed,
-                cache_entry.TokensSec0, cache_entry.TokensSec1);
+      enqueue(responseNetwork_out, ResponseMsg, l2_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA_OWNER;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.DataBlk := cache_entry.DataBlk;
+        out_msg.Dirty := cache_entry.Dirty;
+        out_msg.TokensSec0 := send_t0;
+        out_msg.TokensSec1 := send_t1;
+        out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+        out_msg.sector_mask := req_mask;
+        out_msg.valid_sector_mask := req_mask;
+        out_msg.token_sector_mask := token_mask;
+        out_msg.requested_sector_mask := req_mask;
+        out_msg.merged_resp := false;
+        out_msg.MessageSize := amtc_getSizeFromDirtyMask(req_mask);
       }
+
+      cache_entry.TokensSec0 := 0;
+      cache_entry.TokensSec1 := 0;
+
+      DPRINTF(RubySlicc,
+              "AMTC_L2_M_OWNER_DONATE_EXACT_V85S addr=%#x req=%s mask=%d sent0=%d sent1=%d\n",
+              address, in_msg.Requestor, req_mask, send_t0, send_t1);
     }
   }
 
-  action(amtc_l2RecomputeValidFromTokens, "l2rv", desc="Rebuild valid-sector mask from retained tokens after donation") {
+  action(amtc_l2RecomputeValidFromTokens, "l2rv",
+         desc="Clear validity for sectors that lost their last token") {
     if (is_valid(cache_entry)) {
-      /*
-       * Max-repair closure rule:
-       * A stable L2 state must not keep an orphan token for a sector that is
-       * not marked valid.  The IS/IX completion paths can donate the requested
-       * sector token to L1 while leaving another sector token in L2.  The old
-       * helper only removed valid bits for zero-token sectors; it did not add a
-       * valid bit for a retained sector token.  That allowed states such as
-       * valid=0, TokensSec0=1, TokensSec1=0 before committing S/NP, tripping
-       * the stable-state invariant.
-       *
-       * In this proof-mode controller, any retained token means L2 has a usable
-       * copy for that sector because the completion path just wrote DataBlk.
-       * Therefore recompute ValidSectors from tokens in both directions:
-       *   token == 0  -> clear valid bit
-       *   token >  0  -> set valid bit
-       */
+      // V85S: permission tokens do not prove data bytes were installed.
       if (cache_entry.TokensSec0 == 0) {
-        cache_entry.ValidSectors := amtc_subtractMask(cache_entry.ValidSectors, 1);
-      } else {
-        cache_entry.ValidSectors := amtc_unionMasks(cache_entry.ValidSectors, 1);
+        cache_entry.ValidSectors :=
+            amtc_subtractMask(cache_entry.ValidSectors, 1);
       }
-
       if (cache_entry.TokensSec1 == 0) {
-        cache_entry.ValidSectors := amtc_subtractMask(cache_entry.ValidSectors, 2);
-      } else {
-        cache_entry.ValidSectors := amtc_unionMasks(cache_entry.ValidSectors, 2);
+        cache_entry.ValidSectors :=
+            amtc_subtractMask(cache_entry.ValidSectors, 2);
       }
 
       DPRINTF(RubySlicc,
-              "AMTC_L2_RECOMPUTE_VALID_FROM_TOKENS_V4 addr=%#x valid=%d t0=%d t1=%d\n",
+              "AMTC_L2_VALID_CLEAR_FROM_TOKENS_V85S addr=%#x valid=%d t0=%d t1=%d\n",
               address, cache_entry.ValidSectors,
               cache_entry.TokensSec0, cache_entry.TokensSec1);
     }
@@ -2684,11 +2798,19 @@ action(cc_dirtyReplacement, "\c", desc="Issue dirty writeback") {
         if (req_mask == 0) {
           req_mask := amtc_fullMask();
         }
-        if (machineIDToMachineType(in_msg.Requestor) == MachineType:L1Cache) {
-          req_mask := amtc_fullMask();
-        }
-        cache_entry.RequestedSectorMask :=
-            amtc_unionMasks(cache_entry.RequestedSectorMask, req_mask);
+        req_mask := amtc_sanitizeMask(req_mask);
+
+        // V85S-r3: PendingReqMask and the explicit second/third/fourth waiter
+        // masks are the only places where concurrent sub-line requests are
+        // merged.  RequestedSectorMask must describe this exact request; do
+        // not widen every L1 request to mask=3 and do not union a previous
+        // sector from an already-completed request.
+        cache_entry.RequestedSectorMask := req_mask;
+
+        DPRINTF(RubySlicc,
+                "AMTC_L2_REQMASK_EXACT_V85S_R3 addr=%#x req=%s type=%s mask=%d pending=%d pendingmask=%d\n",
+                address, in_msg.Requestor, in_msg.Type, req_mask,
+                cache_entry.PendingL1Valid, cache_entry.PendingReqMask);
       }
     }
   }
@@ -2731,57 +2853,6 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     cache_entry.TokensSec1 := 0;
   }
 
-  action(tt_sendLocalAckWithCollectedTokens, "tt", desc="Send requested collected tokens to local L1 without pretending data is complete") {
-    assert(is_valid(cache_entry));
-
-    peek(L1requestNetwork_in, RequestMsg) {
-      int req_mask := in_msg.requested_sector_mask;
-      if (req_mask == 0) {
-        req_mask := in_msg.sector_mask;
-      }
-      if (req_mask == 0) {
-        req_mask := amtc_fullMask();
-      }
-      req_mask := amtc_sanitizeMask(req_mask);
-
-      int send_t0 := 0;
-      int send_t1 := 0;
-      int t_mask := 0;
-
-      if (amtc_maskHasSector(req_mask, 0) && cache_entry.TokensSec0 > 0) {
-        send_t0 := cache_entry.TokensSec0;
-        t_mask := amtc_unionMasks(t_mask, 1);
-      }
-      if (amtc_maskHasSector(req_mask, 1) && cache_entry.TokensSec1 > 0) {
-        send_t1 := cache_entry.TokensSec1;
-        t_mask := amtc_unionMasks(t_mask, 2);
-      }
-
-      if (t_mask != 0) {
-        enqueue(responseNetwork_out, ResponseMsg, l2_response_latency) {
-          out_msg.addr := address;
-          out_msg.Type := CoherenceResponseType:ACK;
-          out_msg.Sender := machineID;
-          out_msg.Destination.add(in_msg.Requestor);
-          out_msg.TokensSec0 := send_t0;
-          out_msg.TokensSec1 := send_t1;
-          out_msg.sector_id := amtc_primarySectorFromMask(t_mask);
-          out_msg.sector_mask := req_mask;
-          out_msg.valid_sector_mask := 0;
-          out_msg.token_sector_mask := t_mask;
-          out_msg.requested_sector_mask := req_mask;
-          out_msg.MessageSize := MessageSizeType:Response_Control;
-        }
-      }
-
-      if (send_t0 > 0) {
-        cache_entry.TokensSec0 := 0;
-      }
-      if (send_t1 > 0) {
-        cache_entry.TokensSec1 := 0;
-      }
-    }
-  }
 
   action(t_popTriggerQueue, "tq", desc="Pop trigger queue") {
     triggerQueue_in.dequeue(clockEdge());
@@ -2882,6 +2953,21 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
 }
 
   action(rnp_deallocateNPVictimIfPresent, "rnp", desc="AMTC: safely clear an NP victim selected by cacheProbe during writeback allocation pressure.") {
+    /*
+     * V85L: NP is a zero-token state.  Never let physical-tag cleanup hide
+     * a residual token; that would make a later strict MIG_C2G/MIG_G2C
+     * collection wait forever for ownership which no cache can return.
+     */
+    if (is_valid(cache_entry)) {
+      DPRINTF(RubySlicc,
+              "AMTC_L2_NP_DEALLOC_TOKEN_CHECK_V85L addr=%#x state=%s valid=%d T0=%d T1=%d dirty=%d\n",
+              address, cache_entry.CacheState, cache_entry.ValidSectors,
+              cache_entry.TokensSec0, cache_entry.TokensSec1,
+              cache_entry.DirtySectors);
+      assert(cache_entry.TokensSec0 == 0);
+      assert(cache_entry.TokensSec1 == 0);
+    }
+
     if (L2cache.isTagPresent(address)) {
       L2cache.deallocate(address);
     }
@@ -2916,50 +3002,34 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
   }
 
   action(sendPendingGetxDirBroadcastRetryV49, "pgxb49",
-         desc="Broadcast owner-pull GETX repair for empty pending IX GETX") {
+         desc="Compatibility retry: resend pending GETX with exact retained credit") {
     peek(L1requestNetwork_in, RequestMsg) {
-      int req_mask := cache_entry.PendingReqMask;
-      if (req_mask == 0) {
-        req_mask := amtc_normalizeMask(in_msg.requested_sector_mask,
-                                       in_msg.sector_id);
-      }
-      if (req_mask == 0) {
-        req_mask := amtc_normalizeMask(in_msg.sector_mask,
-                                       in_msg.sector_id);
-      }
-      if (req_mask == 0) {
-        req_mask := amtc_fullMask();
-      }
-
-      int req_sid := cache_entry.PendingSectorId;
-      if (req_mask == amtc_fullMask()) {
-        req_sid := 0;
-      }
-
-      cache_entry.PendingRetrySent := true;
-      cache_entry.PendingRetryNumSent := in_msg.RetryNum;
-
-      DPRINTF(RubySlicc,
-              "AMTC_L2_EMPTY_GETX_DIR_BCAST_SEND_V49 addr=%#x retry=%d req=%s reqmask=%d inmask=%d valid=%d T0=%d T1=%d held0=%d held1=%d\n",
-              address, in_msg.RetryNum, cache_entry.PendingL1Requestor,
-              cache_entry.PendingReqMask, req_mask, cache_entry.ValidSectors,
-              cache_entry.TokensSec0, cache_entry.TokensSec1,
-              cache_entry.PendingRequesterHeldTokensSec0,
-              cache_entry.PendingRequesterHeldTokensSec1);
+      int max_t := max_tokens() / 2;
+      int credit0 := cache_entry.PendingRequesterHeldTokensSec0 +
+                     cache_entry.TokensSec0;
+      int credit1 := cache_entry.PendingRequesterHeldTokensSec1 +
+                     cache_entry.TokensSec1;
+      assert(credit0 >= 0);
+      assert(credit1 >= 0);
+      assert(credit0 <= max_t);
+      assert(credit1 <= max_t);
 
       enqueue(globalRequestNetwork_out, RequestMsg, l2_request_latency) {
         out_msg.addr := address;
         out_msg.Type := CoherenceRequestType:GETX;
         out_msg.Requestor := machineID;
-        out_msg.Destination.broadcast(MachineType:Directory);
+        out_msg.Destination.add(
+            mapAddressToMachine(address, MachineType:Directory));
         out_msg.MessageSize := MessageSizeType:Request_Control;
         out_msg.AccessMode := in_msg.AccessMode;
         out_msg.Prefetch := in_msg.Prefetch;
         out_msg.RetryNum := in_msg.RetryNum;
-        out_msg.is_owner_pull := true;
-        out_msg.sector_id := req_sid;
-        out_msg.sector_mask := req_mask;
-        out_msg.requested_sector_mask := req_mask;
+        out_msg.is_owner_pull := false;
+        out_msg.sector_id := cache_entry.PendingSectorId;
+        out_msg.sector_mask := cache_entry.PendingReqMask;
+        out_msg.requested_sector_mask := cache_entry.PendingReqMask;
+        out_msg.requester_held_tokens_sec0 := credit0;
+        out_msg.requester_held_tokens_sec1 := credit1;
         out_msg.is_gpu := false;
         out_msg.is_sync := false;
         out_msg.is_bypass := false;
@@ -2984,17 +3054,25 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
             cache_entry.AccumulationPending);
   }
 
-  action(dbg_l2DropPoisonLocalGetsV45, "dpg45",
-         desc="Debug drop poisoned IX entry after local GETS escape") {
-    DPRINTF(RubySlicc,
-            "AMTC_L2_IX_EMPTY_GETS_DROP_POISON_DONE_V45 addr=%#x valid=%d T0=%d T1=%d pending=%d reqmask=%d\n",
-            address, cache_entry.ValidSectors, cache_entry.TokensSec0,
-            cache_entry.TokensSec1, cache_entry.PendingL1Valid,
-            cache_entry.PendingReqMask);
-  }
-
   action(rr_deallocateL2CacheBlock, "\r",
         desc="Safely deallocate L2 cache block") {
+    /*
+     * V85L: deallocation is not a token-transfer operation.  Every caller
+     * must return/donate all physical tokens before dropping the L2 entry.
+     * Keep this strict so repair/restart paths cannot silently lose a token
+     * and strand a later cross-domain ownership migration at 511/512.
+     */
+    if (is_valid(cache_entry)) {
+      DPRINTF(RubySlicc,
+              "AMTC_L2_DEALLOC_TOKEN_CHECK_V85L addr=%#x state=%s valid=%d T0=%d T1=%d dirty=%d pending=%d reqmask=%d\n",
+              address, cache_entry.CacheState, cache_entry.ValidSectors,
+              cache_entry.TokensSec0, cache_entry.TokensSec1,
+              cache_entry.DirtySectors, cache_entry.PendingL1Valid,
+              cache_entry.PendingReqMask);
+      assert(cache_entry.TokensSec0 == 0);
+      assert(cache_entry.TokensSec1 == 0);
+    }
+
     if (L2cache.isTagPresent(address)) {
       L2cache.deallocate(address);
     }
@@ -3039,117 +3117,91 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     L1requestNetwork_in.dequeue(clockEdge());
   }
 
-  action(q_updateTokensFromResponse, "q", desc="Saturating update token count based on incoming response") {
+  action(q_updateTokensFromResponse, "q", desc="Strict additive token update based on incoming response") {
     peek(responseNetwork_in, ResponseMsg) {
       assert(is_valid(cache_entry));
 
-      /*
-       * Max-repair v6:
-       * Directory repair DATA_SHARED may return a small shared token for a
-       * sector where L2 already retained the maximum legal token count.  The
-       * old additive update asserted immediately at amtc_assertTokenBounds()
-       * when old+incoming exceeded max_tokens()/2.  For proof-mode repair,
-       * treat these as duplicate/late repair tokens and saturate instead of
-       * killing the run.
-       */
       int tokens_per_sector := max_tokens() / 2;
       int new_t0 := cache_entry.TokensSec0 + in_msg.TokensSec0;
       int new_t1 := cache_entry.TokensSec1 + in_msg.TokensSec1;
 
-      if (new_t0 > tokens_per_sector) {
-        DPRINTF(RubySlicc,
-                "AMTC_L2_RESP_TOKEN_SAT_V6 addr=%#x sec=0 old=%d in=%d max=%d type=%s\n",
-                address, cache_entry.TokensSec0, in_msg.TokensSec0,
-                tokens_per_sector, in_msg.Type);
-        new_t0 := tokens_per_sector;
-      }
-
-      if (new_t1 > tokens_per_sector) {
-        DPRINTF(RubySlicc,
-                "AMTC_L2_RESP_TOKEN_SAT_V6 addr=%#x sec=1 old=%d in=%d max=%d type=%s\n",
-                address, cache_entry.TokensSec1, in_msg.TokensSec1,
-                tokens_per_sector, in_msg.Type);
-        new_t1 := tokens_per_sector;
-      }
-
-      if (new_t0 < 0) {
-        new_t0 := 0;
-      }
-      if (new_t1 < 0) {
-        new_t1 := 0;
-      }
+      // V85S: overlapping/duplicate grants are protocol errors.  Never hide
+      // them by saturating the physical token count.
+      assert(new_t0 >= 0);
+      assert(new_t1 >= 0);
+      assert(new_t0 <= tokens_per_sector);
+      assert(new_t1 <= tokens_per_sector);
 
       cache_entry.TokensSec0 := new_t0;
       cache_entry.TokensSec1 := new_t1;
-      amtc_assertTokenBounds(cache_entry.TokensSec0);
-      amtc_assertTokenBounds(cache_entry.TokensSec1);
 
-      cache_entry.ValidSectors := amtc_unionMasks(cache_entry.ValidSectors, in_msg.valid_sector_mask);
+      cache_entry.ValidSectors :=
+          amtc_unionMasks(cache_entry.ValidSectors,
+                          in_msg.valid_sector_mask);
 
       if ((in_msg.Type == CoherenceResponseType:DATA_OWNER ||
-           in_msg.Type == CoherenceResponseType:WB_OWNED) && in_msg.Dirty) {
+           in_msg.Type == CoherenceResponseType:WB_OWNED) &&
+          in_msg.Dirty) {
         cache_entry.Dirty := true;
-        cache_entry.DirtySectors := amtc_unionMasks(cache_entry.DirtySectors, in_msg.valid_sector_mask);
+        cache_entry.DirtySectors :=
+            amtc_unionMasks(cache_entry.DirtySectors,
+                            in_msg.valid_sector_mask);
       }
 
       DPRINTF(RubySlicc,
-              "AMTC_L2_RESP_TOKEN_UPDATE_V6 addr=%#x type=%s valid=%d tokmask=%d t0=%d t1=%d\n",
+              "AMTC_L2_RESP_TOKEN_ADD_V85S addr=%#x type=%s valid=%d tokmask=%d in0=%d in1=%d t0=%d t1=%d\n",
               address, in_msg.Type, cache_entry.ValidSectors,
-              in_msg.token_sector_mask, cache_entry.TokensSec0,
-              cache_entry.TokensSec1);
+              in_msg.token_sector_mask, in_msg.TokensSec0, in_msg.TokensSec1,
+              cache_entry.TokensSec0, cache_entry.TokensSec1);
     }
   }
 
   action(q_replaceTokensFromOwnerResponse, "qrtor",
-        desc="Replace token count from authoritative DATA_OWNER response") {
+        desc="Strictly add physical DATA_OWNER token contribution") {
     peek(responseNetwork_in, ResponseMsg) {
       assert(is_valid(cache_entry));
 
+      int tokens_per_sector := max_tokens() / 2;
+      int new_t0 := cache_entry.TokensSec0 + in_msg.TokensSec0;
+      int new_t1 := cache_entry.TokensSec1 + in_msg.TokensSec1;
+
+      // V85S: DATA_OWNER from Directory carries the remaining physical
+      // contribution.  It is not an authoritative replacement value.
+      assert(new_t0 >= 0);
+      assert(new_t1 >= 0);
+      assert(new_t0 <= tokens_per_sector);
+      assert(new_t1 <= tokens_per_sector);
+
+      cache_entry.TokensSec0 := new_t0;
+      cache_entry.TokensSec1 := new_t1;
+
       int resp_mask := amtc_normalizeMask(in_msg.token_sector_mask,
                                           in_msg.sector_id);
-
       if (resp_mask == 0) {
         resp_mask := amtc_normalizeMask(in_msg.sector_mask,
                                         in_msg.sector_id);
       }
 
-      if (resp_mask == 1) {
-        cache_entry.TokensSec0 := in_msg.TokensSec0;
-      } else if (resp_mask == 2) {
-        cache_entry.TokensSec1 := in_msg.TokensSec1;
-      } else if (resp_mask == 3) {
-        cache_entry.TokensSec0 := in_msg.TokensSec0;
-        cache_entry.TokensSec1 := in_msg.TokensSec1;
-      }
-
-      amtc_assertTokenBounds(cache_entry.TokensSec0);
-      amtc_assertTokenBounds(cache_entry.TokensSec1);
-
       cache_entry.ValidSectors :=
-        amtc_unionMasks(cache_entry.ValidSectors,
-                        in_msg.valid_sector_mask);
-
+          amtc_unionMasks(cache_entry.ValidSectors,
+                          in_msg.valid_sector_mask);
       cache_entry.TokenSectorMask :=
-        amtc_unionMasks(cache_entry.TokenSectorMask,
-                        resp_mask);
+          amtc_unionMasks(cache_entry.TokenSectorMask, resp_mask);
 
       if ((in_msg.Type == CoherenceResponseType:DATA_OWNER ||
-          in_msg.Type == CoherenceResponseType:WB_OWNED) &&
+           in_msg.Type == CoherenceResponseType:WB_OWNED) &&
           in_msg.Dirty) {
         cache_entry.Dirty := true;
         cache_entry.DirtySectors :=
-          amtc_unionMasks(cache_entry.DirtySectors,
-                          in_msg.valid_sector_mask);
+            amtc_unionMasks(cache_entry.DirtySectors,
+                            in_msg.valid_sector_mask);
       }
 
       DPRINTF(RubySlicc,
-              "AMTC_L2_OWNER_TOKEN_REPLACE addr=%#x resp_mask=%d t0=%d t1=%d valid=%d tokmask=%d\n",
-              address,
-              resp_mask,
-              cache_entry.TokensSec0,
-              cache_entry.TokensSec1,
-              cache_entry.ValidSectors,
-              cache_entry.TokenSectorMask);
+              "AMTC_L2_OWNER_TOKEN_ADD_V85S addr=%#x resp_mask=%d in0=%d in1=%d t0=%d t1=%d valid=%d tokmask=%d\n",
+              address, resp_mask, in_msg.TokensSec0, in_msg.TokensSec1,
+              cache_entry.TokensSec0, cache_entry.TokensSec1,
+              cache_entry.ValidSectors, cache_entry.TokenSectorMask);
     }
   }
 
@@ -3159,47 +3211,41 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
   // sector, so do not let a late/overlapping writeback push a sector above the
   // architectural per-sector token count.  Saturate writeback absorption while
   // keeping normal data-response token updates strict.
-  action(qwb_updateTokensFromWritebackResponse, "qwb", desc="Saturating update for L1 writeback token/data response") {
+  action(qwb_updateTokensFromWritebackResponse, "qwb",
+         desc="Strict additive update for L1 writeback token/data response") {
     peek(responseNetwork_in, ResponseMsg) {
       assert(is_valid(cache_entry));
 
       int tokens_per_sector := max_tokens() / 2;
-
       int new_t0 := cache_entry.TokensSec0 + in_msg.TokensSec0;
       int new_t1 := cache_entry.TokensSec1 + in_msg.TokensSec1;
 
-      if (new_t0 > tokens_per_sector) {
-        DPRINTF(RubySlicc,
-                "AMTC_L2_WB_TOKEN_SAT addr=%#x sec=0 old=%d in=%d max=%d\n",
-                address, cache_entry.TokensSec0, in_msg.TokensSec0, tokens_per_sector);
-        new_t0 := tokens_per_sector;
-      }
-
-      if (new_t1 > tokens_per_sector) {
-        DPRINTF(RubySlicc,
-                "AMTC_L2_WB_TOKEN_SAT addr=%#x sec=1 old=%d in=%d max=%d\n",
-                address, cache_entry.TokensSec1, in_msg.TokensSec1, tokens_per_sector);
-        new_t1 := tokens_per_sector;
-      }
+      assert(new_t0 >= 0);
+      assert(new_t1 >= 0);
+      assert(new_t0 <= tokens_per_sector);
+      assert(new_t1 <= tokens_per_sector);
 
       cache_entry.TokensSec0 := new_t0;
       cache_entry.TokensSec1 := new_t1;
 
-      amtc_assertTokenBounds(cache_entry.TokensSec0);
-      amtc_assertTokenBounds(cache_entry.TokensSec1);
-
-      cache_entry.ValidSectors := amtc_unionMasks(cache_entry.ValidSectors, in_msg.valid_sector_mask);
+      cache_entry.ValidSectors :=
+          amtc_unionMasks(cache_entry.ValidSectors,
+                          in_msg.valid_sector_mask);
 
       if ((in_msg.Type == CoherenceResponseType:WB_OWNED ||
-           in_msg.Type == CoherenceResponseType:DATA_OWNER) && in_msg.Dirty) {
+           in_msg.Type == CoherenceResponseType:DATA_OWNER) &&
+          in_msg.Dirty) {
         cache_entry.Dirty := true;
-        cache_entry.DirtySectors := amtc_unionMasks(cache_entry.DirtySectors, in_msg.valid_sector_mask);
+        cache_entry.DirtySectors :=
+            amtc_unionMasks(cache_entry.DirtySectors,
+                            in_msg.valid_sector_mask);
       }
 
       DPRINTF(RubySlicc,
-              "AMTC_L2_WB_TOKEN_UPDATE addr=%#x type=%s valid=%d tokmask=%d t0=%d t1=%d\n",
-              address, in_msg.Type, cache_entry.ValidSectors,
-              in_msg.token_sector_mask, cache_entry.TokensSec0, cache_entry.TokensSec1);
+              "AMTC_L2_WB_TOKEN_ADD_V85S addr=%#x type=%s in0=%d in1=%d valid=%d t0=%d t1=%d\n",
+              address, in_msg.Type, in_msg.TokensSec0, in_msg.TokensSec1,
+              cache_entry.ValidSectors,
+              cache_entry.TokensSec0, cache_entry.TokensSec1);
     }
   }
 
@@ -3215,15 +3261,37 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
 
   action(forceDropTransientVictim, "fdtv",
         desc="Emergency drop of long-stuck transient L2 victim") {
-    DPRINTF(RubySlicc,
-            "AMTC_L2_FORCE_DROP_TRANSIENT_VICTIM victim=%#x \n",
-            address);
 
-    if (L2cache.isTagPresent(address)) {
-      L2cache.deallocate(address);
-    }
+      if (is_valid(cache_entry)) {
+          DPRINTF(RubySlicc,
+                  "AMTC_L2_FORCE_DROP_TOKEN_CHECK_V85N addr=%#x state=%s valid=%d dirty=%d T0=%d T1=%d pending=%d reqmask=%d\n",
+                  address,
+                  cache_entry.CacheState,
+                  cache_entry.ValidSectors,
+                  cache_entry.Dirty,
+                  cache_entry.TokensSec0,
+                  cache_entry.TokensSec1,
+                  cache_entry.PendingL1Valid,
+                  cache_entry.PendingReqMask);
 
-    unset_cache_entry();
+          /*
+          * Never discard a transient L2 entry while it still owns
+          * physical tokens. Doing so permanently violates token
+          * conservation and can strand a later migration below 512/512.
+          */
+          assert(cache_entry.TokensSec0 == 0);
+          assert(cache_entry.TokensSec1 == 0);
+      }
+
+      DPRINTF(RubySlicc,
+              "AMTC_L2_FORCE_DROP_TRANSIENT_VICTIM victim=%#x\n",
+              address);
+
+      if (L2cache.isTagPresent(address)) {
+          L2cache.deallocate(address);
+      }
+
+      unset_cache_entry();
   }
 
   //*****************************************************
@@ -3236,12 +3304,11 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     n_popResponseQueue;
   }
 
-  // Directory/DMA owner-pull probes must never be treated as new local
-  // L1 misses.  If L2 is NP/I/transient, it cannot donate data; return
-  // ACK_OWNER(0) so the Directory CE_W_DMA_READ path can fall back to memory
-  // instead of forming Directory->L2->Directory self-cycle.
+  // V85S-r12: NP/I/transient L2 residency does not prove the recorded CPU
+  // owner is stale: the Directory tracks this L2 as a gateway and real data may
+  // reside only in local L1s.  Forward the observational owner-pull downward.
   transition({NP, I, IS, IX}, Dir_Owner_GETS) {
-    sendStaleOwnerAckToDirectoryFromL1Req;
+    forwardDirectoryOwnerPullToLocalL1sV85S12;
     o_popL1RequestQueue;
   }
 
@@ -3475,22 +3542,50 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
       int old_mask := cache_entry.PendingReqMask;
       int new_mask := old_mask;
 
-      if (old_mask == 0) {
-        new_mask := in_mask;
-      } else if (old_mask == 1) {
-        if (in_mask == 2) {
-          new_mask := 3;
-        } else if (in_mask == 3) {
+      if (in_msg.Type == CoherenceRequestType:GETX) {
+        /*
+         * AMTC sector-exact GETX retry fix:
+         *
+         * A repeated L1 GETX retry carries the sector that is actually blocked.
+         * Do not widen it with a stale/full-line pending mask.  The observed
+         * failure was:
+         *
+         *   oldmask=3 inmask=2 newmask=3 valid=2 T0=512 T1=512
+         *
+         * Sector 1 was already locally satisfiable, but the widened full-line
+         * mask forced L2 to wait for sector 0 data forever and repeatedly
+         * owner-pull from Directory.
+         */
+        cache_entry.PendingIsGetX := true;
+
+        if (old_mask == 0) {
+          new_mask := in_mask;
+        } else if (cache_entry.PendingL1Requestor == in_msg.Requestor) {
+          // A retry belongs to the same transaction epoch; its mask is invariant.
+          assert(old_mask == in_mask);
+          new_mask := old_mask;
+        } else {
+          // Different L1 GETX contenders are serialized by the IX classifier.
+          new_mask := old_mask;
+        }
+      } else {
+        if (old_mask == 0) {
+          new_mask := in_mask;
+        } else if (old_mask == 1) {
+          if (in_mask == 2) {
+            new_mask := 3;
+          } else if (in_mask == 3) {
+            new_mask := 3;
+          }
+        } else if (old_mask == 2) {
+          if (in_mask == 1) {
+            new_mask := 3;
+          } else if (in_mask == 3) {
+            new_mask := 3;
+          }
+        } else if (old_mask == 3) {
           new_mask := 3;
         }
-      } else if (old_mask == 2) {
-        if (in_mask == 1) {
-          new_mask := 3;
-        } else if (in_mask == 3) {
-          new_mask := 3;
-        }
-      } else if (old_mask == 3) {
-        new_mask := 3;
       }
 
       cache_entry.PendingReqMask := new_mask;
@@ -3504,10 +3599,7 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
       if (new_mask != old_mask) {
         cache_entry.PendingRetrySent := false;
         cache_entry.PendingRetryNumSent := 0;
-      }
-
-      if (in_msg.Type == CoherenceRequestType:GETX) {
-        cache_entry.PendingIsGetX := true;
+        cache_entry.AccumulationPending := false;
       }
 
       DPRINTF(RubySlicc,
@@ -3536,10 +3628,25 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
         in_mask := amtc_fullMask();
       }
 
-      cache_entry.PendingReqMask :=
-          amtc_unionMasks(cache_entry.PendingReqMask, in_mask);
+      /*
+       * Keep pending GETX retries sector-exact.  GETS may still merge masks,
+       * but GETX ownership retries must not widen sector-1 or sector-0 writes
+       * into full-line requests.
+       */
+      if (cache_entry.PendingIsGetX) {
+        if (cache_entry.PendingL1Requestor == in_msg.Requestor) {
+          cache_entry.PendingReqMask := in_mask;
+        }
+      } else {
+        cache_entry.PendingReqMask :=
+            amtc_unionMasks(cache_entry.PendingReqMask, in_mask);
+      }
+
       if (cache_entry.PendingReqMask == 3) {
         cache_entry.PendingSectorId := 0;
+      } else {
+        cache_entry.PendingSectorId :=
+            amtc_primarySectorFromMask(cache_entry.PendingReqMask);
       }
 
       bool send_repair := false;
@@ -3654,8 +3761,12 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
   }
 
   action(maybeForwardPendingGetxRetry, "mfxr",
-        desc="Forward pending GETX retry to Directory if IX response is missing") {
+        desc="Coalesce duplicate L1 requests and retry Directory with exact retained credit") {
     peek(L1requestNetwork_in, RequestMsg) {
+      assert(cache_entry.PendingL1Valid);
+      assert(machineIDToMachineType(cache_entry.PendingL1Requestor) ==
+             MachineType:L1Cache);
+
       int in_mask := amtc_normalizeMask(in_msg.requested_sector_mask,
                                         in_msg.sector_id);
       if (in_mask == 0) {
@@ -3663,409 +3774,136 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
                                       in_msg.sector_id);
       }
       if (in_mask == 0) {
+        in_mask := cache_entry.PendingReqMask;
+      }
+      if (in_mask == 0) {
         in_mask := amtc_fullMask();
       }
+      in_mask := amtc_sanitizeMask(in_mask);
 
-      bool pending_ok := true;
-      if (!cache_entry.PendingL1Valid) {
-        pending_ok := false;
+      assert(cache_entry.PendingIsGetX);
+      assert(in_msg.Type == CoherenceRequestType:GETX);
+      assert(cache_entry.PendingL1Requestor == in_msg.Requestor);
+
+      if (cache_entry.PendingReqMask == 0) {
+        cache_entry.PendingReqMask := in_mask;
       } else {
-        if (machineIDToMachineType(cache_entry.PendingL1Requestor) != MachineType:L1Cache) {
-          pending_ok := false;
-        }
+        assert(cache_entry.PendingReqMask == in_mask);
       }
 
-      /*
-       * V32: never launch owner-pull GETX repair using a bad/non-L1 pending
-       * requester.  This was the failure signature for 0x11b3080:
-       * PendingL1Requestor=Directory-0, valid=0, tiny tokens, retry increasing
-       * forever.  Clear the poisoned window and let the next L1 retry be
-       * reclassified or restarted by the IX stale-pending guard.
-       */
-      if (!pending_ok) {
-        DPRINTF(RubySlicc,
-                "AMTC_L2_ABORT_GETX_REPAIR_BAD_PENDING_V32 addr=%#x pending=%d req=%s reqmask=%d is_getx=%d incoming=%s type=%s inmask=%d retry=%d valid=%d T0=%d T1=%d\n",
-                address, cache_entry.PendingL1Valid,
-                cache_entry.PendingL1Requestor, cache_entry.PendingReqMask,
-                cache_entry.PendingIsGetX, in_msg.Requestor, in_msg.Type,
-                in_mask, in_msg.RetryNum, cache_entry.ValidSectors,
-                cache_entry.TokensSec0, cache_entry.TokensSec1);
-
-        cache_entry.PendingL1Valid := false;
-        cache_entry.PendingReqMask := 0;
+      if (cache_entry.PendingReqMask == amtc_fullMask()) {
         cache_entry.PendingSectorId := 0;
-        cache_entry.PendingIsGetX := false;
-        cache_entry.PendingRequesterHeldTokensSec0 := 0;
-        cache_entry.PendingRequesterHeldTokensSec1 := 0;
-        cache_entry.PendingRetrySent := false;
-        cache_entry.PendingRetryNumSent := 0;
-        cache_entry.AccumulationPending := false;
       } else {
-        if (in_msg.Type != CoherenceRequestType:GETX && !cache_entry.PendingIsGetX) {
-          /*
-           * V34: this is a pending GETS/read retry, not a GETX ownership
-           * retry.  V32/V33 only skipped GETX repair here, leaving a valid
-           * L1 read waiter stuck forever when L2 had no data/tokens
-           * (valid=0,T0=0,T1=0).  Reissue a directory GETS to make progress,
-           * keeping the saved L1 requester so the eventual Data_Shared can be
-           * returned to that CPU Sequencer.
-           */
-          cache_entry.PendingReqMask :=
-              amtc_unionMasks(cache_entry.PendingReqMask, in_mask);
-          if (cache_entry.PendingReqMask == 3) {
-            cache_entry.PendingSectorId := 0;
-          } else {
-            cache_entry.PendingSectorId := amtc_primarySectorFromMask(cache_entry.PendingReqMask);
-          }
+        cache_entry.PendingSectorId :=
+            amtc_primarySectorFromMask(cache_entry.PendingReqMask);
+      }
 
-          /* V43: last-resort local completion for an empty IX pending GETS.
-           * V42 proved this escape can unblock the CPU read at 0x11b3080,
-           * but it left the L2 line in IX with no pending waiter.  That stale
-           * transient can later interfere with the HSA/AQL DMA path.  Fire
-           * earlier, then enqueue the existing GETS-complete trigger so the
-           * line leaves IX and becomes a normal shared line after the saved L1
-           * request is satisfied.  This remains a bring-up escape, not the
-           * final coherence rule.
-           */
-          if (in_msg.RetryNum >= 128 &&
-              cache_entry.ValidSectors == 0 &&
-              cache_entry.TokensSec0 <= 1 &&
-              cache_entry.TokensSec1 <= 1) {
-            int force_mask := amtc_sanitizeMask(cache_entry.PendingReqMask);
-            if (force_mask == 0) {
-              force_mask := in_mask;
-            }
-            if (force_mask == 0) {
-              force_mask := amtc_fullMask();
-            }
+      // At most one L2->Directory resend per strictly newer L1 retry number.
+      bool send_retry :=
+          (in_msg.RetryNum > cache_entry.PendingRetryNumSent);
 
-            int force_t0 := 0;
-            int force_t1 := 0;
-            int force_tokmask := 0;
-            if (amtc_maskHasSector(force_mask, 0)) {
-              force_t0 := 1;
-              force_tokmask := amtc_unionMasks(force_tokmask, 1);
-            }
-            if (amtc_maskHasSector(force_mask, 1)) {
-              force_t1 := 1;
-              force_tokmask := amtc_unionMasks(force_tokmask, 2);
-            }
+      if (send_retry) {
+        int max_t := max_tokens() / 2;
+        int credit0 := cache_entry.PendingRequesterHeldTokensSec0;
+        int credit1 := cache_entry.PendingRequesterHeldTokensSec1;
 
-            DPRINTF(RubySlicc,
-                    "AMTC_L2_IX_EMPTY_GETS_FORCE_LOCAL_DATA_V43 addr=%#x retry=%d req=%s pending=%s reqmask=%d inmask=%d valid=%d T0=%d T1=%d send0=%d send1=%d\n",
-                    address, in_msg.RetryNum, in_msg.Requestor,
-                    cache_entry.PendingL1Requestor, force_mask, in_mask,
-                    cache_entry.ValidSectors, cache_entry.TokensSec0,
-                    cache_entry.TokensSec1, force_t0, force_t1);
-
-            enqueue(responseNetwork_out, ResponseMsg, l2_response_latency) {
-              out_msg.addr := address;
-              out_msg.Type := CoherenceResponseType:DATA_SHARED;
-              out_msg.Sender := machineID;
-              out_msg.Destination.add(cache_entry.PendingL1Requestor);
-              out_msg.DataBlk := cache_entry.DataBlk;
-              out_msg.Dirty := false;
-              out_msg.TokensSec0 := force_t0;
-              out_msg.TokensSec1 := force_t1;
-              out_msg.sector_id := amtc_primarySectorFromMask(force_mask);
-              out_msg.sector_mask := force_mask;
-              out_msg.valid_sector_mask := force_mask;
-              out_msg.token_sector_mask := force_tokmask;
-              out_msg.requested_sector_mask := force_mask;
-              out_msg.MessageSize := amtc_getSizeFromDirtyMask(force_mask);
-            }
-
-            cache_entry.PendingL1Valid := false;
-            cache_entry.PendingReqMask := 0;
-            cache_entry.PendingSectorId := 0;
-            cache_entry.PendingIsGetX := false;
-            cache_entry.PendingRequesterHeldTokensSec0 := 0;
-            cache_entry.PendingRequesterHeldTokensSec1 := 0;
-            cache_entry.PendingRetrySent := false;
-            cache_entry.PendingRetryNumSent := 0;
-
-            /* V45: do not keep a fake shared L2 copy after the emergency
-             * local DATA_SHARED.  v44 completed the L1 read, but then
-             * recomputed ValidSectors=3 from two residual one-token sectors and
-             * left the line as S.  Later CPU invalidation / HSA AQL DMA traffic
-             * re-entered the same line and the run degraded into host polling.
-             * Drop the poisoned IX entry after the L1 response; the next real
-             * requester must refetch through the normal Directory/memory path.
-             */
-            cache_entry.AccumulationPending := true;
-            DPRINTF(RubySlicc,
-                    "AMTC_L2_IX_EMPTY_GETS_DROP_POISON_V45 addr=%#x valid=%d T0=%d T1=%d force_mask=%d\n",
-                    address, cache_entry.ValidSectors, cache_entry.TokensSec0,
-                    cache_entry.TokensSec1, force_mask);
-            enqueue(triggerQueue_out, TriggerMsg, 1) {
-              out_msg.addr := address;
-              out_msg.Type := Event:L2_Gets_Local_Escape_Drop;
-            }
-
-          } else {
-
-          bool send_gets_repair := false;
-          bool reset_gets_epoch := false;
-
-          if (in_msg.RetryNum == 0) {
-            reset_gets_epoch := true;
-            send_gets_repair := false;
-            cache_entry.PendingRetryNumSent := 0;
-          } else {
-            if (in_msg.RetryNum < cache_entry.PendingRetryNumSent) {
-              reset_gets_epoch := true;
-              cache_entry.PendingRetryNumSent := 0;
-            }
-
-            int next_gets_retry := cache_entry.PendingRetryNumSent + 1;
-            if (in_msg.RetryNum >= next_gets_retry) {
-              send_gets_repair := true;
-              cache_entry.PendingRetryNumSent := in_msg.RetryNum;
-            }
-          }
-
-          if (send_gets_repair) {
-            cache_entry.PendingRetrySent := true;
-
-            DPRINTF(RubySlicc,
-                    "AMTC_L2_PENDING_GETS_DIR_RETRY_V37 addr=%#x retry=%d last=%d reset=%d req=%s pending=%s reqmask=%d inmask=%d valid=%d T0=%d T1=%d ownerpull=1 clean_gets_repair=1 fullmask=3 dir_retry=1\n",
-                    address, in_msg.RetryNum, cache_entry.PendingRetryNumSent,
-                    reset_gets_epoch, in_msg.Requestor,
-                    cache_entry.PendingL1Requestor, cache_entry.PendingReqMask,
-                    in_mask, cache_entry.ValidSectors, cache_entry.TokensSec0,
-                    cache_entry.TokensSec1);
-
-            enqueue(globalRequestNetwork_out, RequestMsg, l2_request_latency) {
-              out_msg.addr := address;
-              out_msg.Type := CoherenceRequestType:GETS;
-
-              /* Directory must reply to this L2 proxy.  The L2 will then
-               * satisfy PendingL1Requestor with DATA_SHARED.
-               */
-              out_msg.Requestor := machineID;
-              out_msg.Destination.add(
-                  mapAddressToMachine(address, MachineType:Directory));
-
-              out_msg.MessageSize := MessageSizeType:Request_Control;
-              out_msg.AccessMode := in_msg.AccessMode;
-              out_msg.Prefetch := in_msg.Prefetch;
-              /* V37: this is not a normal first-time GETS.  L2 has a real
-               * pending L1 GETS waiter, but local L2 has no data/tokens and
-               * prior clean replay reached Directory, which forwarded again to
-               * a stale owner L2.  Mark this as a Directory repair retry so
-               * AMTC-dir.sm routes it through CPU_GETS_Owner_Pull_Repair
-               * instead of normal CE+CPU_GETS forwarding.
-               *
-               * Keep PendingReqMask unchanged so the eventual DATA_SHARED to
-               * the waiting L1 remains sector-limited, but request a full-line
-               * backing repair from Directory.
-               */
-              out_msg.RetryNum := 1;
-              out_msg.is_owner_pull := true;
-
-              out_msg.sector_id := 0;
-              out_msg.sector_mask := amtc_fullMask();
-              out_msg.requested_sector_mask := amtc_fullMask();
-
-              out_msg.is_gpu := false;
-              out_msg.is_sync := false;
-              out_msg.is_bypass := false;
-              out_msg.is_atomic := false;
-              out_msg.is_signal := false;
-              out_msg.merged_req := false;
-              out_msg.isGLCSet := in_msg.isGLCSet;
-              out_msg.isSLCSet := in_msg.isSLCSet;
-            }
-          } else {
-            DPRINTF(RubySlicc,
-                    "AMTC_L2_HOLD_PENDING_GETS_RETRY_WINDOW_V37 addr=%#x retry=%d last=%d reset=%d req=%s pending=%s reqmask=%d inmask=%d valid=%d T0=%d T1=%d\n",
-                    address, in_msg.RetryNum, cache_entry.PendingRetryNumSent,
-                    reset_gets_epoch, in_msg.Requestor,
-                    cache_entry.PendingL1Requestor, cache_entry.PendingReqMask,
-                    in_mask, cache_entry.ValidSectors, cache_entry.TokensSec0,
-                    cache_entry.TokensSec1);
-          }
-          }
-        } else {
-          cache_entry.PendingReqMask :=
-              amtc_unionMasks(cache_entry.PendingReqMask, in_mask);
-          if (cache_entry.PendingReqMask == 3) {
-            cache_entry.PendingSectorId := 0;
-          }
-
-          bool send_repair := false;
-          bool reset_epoch := false;
-
-          if (in_msg.RetryNum == 0) {
-            /*
-             * Retry epoch restart only.  Do not send an owner-pull GETX repair at
-             * retry 0: Directory may immediately forward that GETX back to the
-             * same L1 that is still in IS_WAIT_ALL/S_IS, causing
-             * Transient_GETX-in-wait-state aborts.  Wait for the L1 timeout path
-             * to prove the original IX transaction is really stuck.
-             */
-            reset_epoch := true;
-            send_repair := false;
-            cache_entry.PendingRetryNumSent := 0;
-          } else {
-            if (in_msg.RetryNum < cache_entry.PendingRetryNumSent) {
-              reset_epoch := true;
-              cache_entry.PendingRetryNumSent := 0;
-            }
-
-            if (in_msg.RetryNum >= 1) {
-              int next_retry := cache_entry.PendingRetryNumSent + 1;
-              if (in_msg.RetryNum >= next_retry) {
-                send_repair := true;
-                cache_entry.PendingRetryNumSent := in_msg.RetryNum;
-              }
-            }
-          }
-
-          if (send_repair) {
-            cache_entry.PendingRetrySent := true;
-
-            /*
-             * V67 clean-exit repair: keep normal first GETX as full-line and
-             * do not narrow PendingReqMask.  Instead, when the retry loop proves
-             * a CPU GETX is stuck while L2 already has some valid data but one
-             * token sector is starved, complete the saved GETX locally with the
-             * existing full-line synthetic DATA_OWNER grant.  This avoids the
-             * v65/v66 NP invariant failure caused by sector-granting and then
-             * deallocating an L2 block that still owns the other sector.
-             *
-             * Seen signatures:
-             *   addr=0x60a00 valid=1 T0=2 T1=0 inmask=2 reqmask=3
-             *   addr=0x3c980 valid=3 T0=0 T1=2 inmask=1 reqmask=3
-             */
-            if (cache_entry.CacheState == State:IX &&
-                in_msg.RetryNum >= 1 &&
-                cache_entry.PendingL1Valid &&
-                cache_entry.PendingIsGetX &&
-                machineIDToMachineType(cache_entry.PendingL1Requestor) == MachineType:L1Cache &&
-                cache_entry.PendingReqMask == 3 &&
-                cache_entry.ValidSectors == 0 &&
-                cache_entry.TokensSec0 <= 1 &&
-                cache_entry.TokensSec1 <= 1 &&
-                cache_entry.PendingRequesterHeldTokensSec0 > 0 &&
-                cache_entry.PendingRequesterHeldTokensSec1 > 0) {
-              /*
-               * V68 clean-exit repair: handle the residual-held IX GETX retry
-               * loop directly in the retry-loop path.  This is the recurring
-               * post-pass signature:
-               *   valid=0 T0=1 T1=1 held0=1 held1=1 reqmask=3 inmask=2
-               * Earlier v47/v51 escapes do not fire here because they live in
-               * the direct L1 request classification path or require a different
-               * held-token shape.  Keep the grant full-line before using the
-               * existing local DATA_OWNER + L2 deallocate path, so NP asserts are
-               * not violated by residual sector tokens.
-               */
-              cache_entry.PendingReqMask := amtc_fullMask();
-              cache_entry.PendingSectorId := 0;
-
-              DPRINTF(RubySlicc,
-                      "AMTC_L2_PENDING_GETX_RESIDUAL_HELD_FULL_LOCAL_GRANT_V68 addr=%#x retry=%d reqmask=%d inmask=%d valid=%d T0=%d T1=%d held0=%d held1=%d\n",
-                      address,
-                      in_msg.RetryNum,
-                      cache_entry.PendingReqMask,
-                      in_mask,
-                      cache_entry.ValidSectors,
-                      cache_entry.TokensSec0,
-                      cache_entry.TokensSec1,
-                      cache_entry.PendingRequesterHeldTokensSec0,
-                      cache_entry.PendingRequesterHeldTokensSec1);
-
-              enqueue(triggerQueue_out, TriggerMsg, 1) {
-                out_msg.addr := address;
-                out_msg.Type := Event:L1_GETX_Force_Local_Grant_TriggerQ;
-              }
-            } else if (cache_entry.CacheState == State:IX &&
-                in_msg.RetryNum >= 1 &&
-                cache_entry.PendingL1Valid &&
-                cache_entry.PendingIsGetX &&
-                machineIDToMachineType(cache_entry.PendingL1Requestor) == MachineType:L1Cache &&
-                cache_entry.PendingReqMask == 3 &&
-                cache_entry.ValidSectors != 0 &&
-                cache_entry.TokensSec0 <= 2 &&
-                cache_entry.TokensSec1 <= 2 &&
-                (cache_entry.TokensSec0 == 0 ||
-                 cache_entry.TokensSec1 == 0)) {
-              cache_entry.PendingReqMask := amtc_fullMask();
-              cache_entry.PendingSectorId := 0;
-
-              DPRINTF(RubySlicc,
-                      "AMTC_L2_PENDING_GETX_TOKENSTARVED_FULL_LOCAL_GRANT_V67 addr=%#x retry=%d reqmask=%d inmask=%d valid=%d T0=%d T1=%d\n",
-                      address,
-                      in_msg.RetryNum,
-                      cache_entry.PendingReqMask,
-                      in_mask,
-                      cache_entry.ValidSectors,
-                      cache_entry.TokensSec0,
-                      cache_entry.TokensSec1);
-
-              enqueue(triggerQueue_out, TriggerMsg, 1) {
-                out_msg.addr := address;
-                out_msg.Type := Event:L1_GETX_Force_Local_Grant_TriggerQ;
-              }
-            } else {
-              DPRINTF(RubySlicc,
-                      "AMTC_L2_PENDING_GETX_REFWD_MAX_REPAIR_V32 addr=%#x retry=%d last=%d reset=%d req=%s reqmask=%d inmask=%d valid=%d T0=%d T1=%d acc=%d ownerpull=1\n",
-                      address,
-                      in_msg.RetryNum,
-                      cache_entry.PendingRetryNumSent,
-                      reset_epoch,
-                      cache_entry.PendingL1Requestor,
-                      cache_entry.PendingReqMask,
-                      in_mask,
-                      cache_entry.ValidSectors,
-                      cache_entry.TokensSec0,
-                      cache_entry.TokensSec1,
-                      cache_entry.AccumulationPending);
-
-              enqueue(globalRequestNetwork_out, RequestMsg, l2_request_latency) {
-                out_msg.addr := address;
-                out_msg.Type := CoherenceRequestType:GETX;
-
-                /*
-                 * Repair must complete at L2.  L2 will then reply to the saved L1.
-                 * Do not target the retrying L1 directly from Directory.
-                 */
-                out_msg.Requestor := machineID;
-
-                out_msg.Destination.add(
-                    mapAddressToMachine(address, MachineType:Directory));
-
-                out_msg.MessageSize := MessageSizeType:Request_Control;
-                out_msg.AccessMode := in_msg.AccessMode;
-                out_msg.Prefetch := in_msg.Prefetch;
-
-                out_msg.RetryNum := in_msg.RetryNum;
-                out_msg.is_owner_pull := true;
-
-                out_msg.sector_id := cache_entry.PendingSectorId;
-                out_msg.sector_mask := cache_entry.PendingReqMask;
-                out_msg.requested_sector_mask := cache_entry.PendingReqMask;
-
-                out_msg.is_gpu := false;
-                out_msg.is_sync := false;
-                out_msg.is_bypass := false;
-                out_msg.is_atomic := false;
-                out_msg.is_signal := false;
-                out_msg.merged_req := false;
-                out_msg.isGLCSet := in_msg.isGLCSet;
-                out_msg.isSLCSet := in_msg.isSLCSet;
-              }
-            }
-          } else {
-            DPRINTF(RubySlicc,
-                    "AMTC_L2_HOLD_PENDING_GETX_RETRY_WINDOW_V32 addr=%#x retry=%d last=%d reqmask=%d inmask=%d\n",
-                    address,
-                    in_msg.RetryNum,
-                    cache_entry.PendingRetryNumSent,
-                    cache_entry.PendingReqMask,
-                    in_mask);
-          }
+        if (cache_entry.PendingIsGetX) {
+          credit0 := credit0 + cache_entry.TokensSec0;
+          credit1 := credit1 + cache_entry.TokensSec1;
         }
+
+        assert(credit0 >= 0);
+        assert(credit1 >= 0);
+        assert(credit0 <= max_t);
+        assert(credit1 <= max_t);
+
+        /*
+         * V85S-r7: ownership and data are independent.  A forwarded local
+         * owner can donate every physical token while having no valid bytes
+         * for the requested sector.  Re-sending GETX in that condition only
+         * recalls the now-empty owner forever.  Once exact requested-sector
+         * ownership is already present, a retry must ask Directory for DATA
+         * ONLY via the existing CE owner-pull path.
+         */
+        bool requested_tokens_full := true;
+        if (amtc_maskHasSector(cache_entry.PendingReqMask, 0) &&
+            credit0 != max_t) {
+          requested_tokens_full := false;
+        }
+        if (amtc_maskHasSector(cache_entry.PendingReqMask, 1) &&
+            credit1 != max_t) {
+          requested_tokens_full := false;
+        }
+
+        bool requested_data_present :=
+            amtc_maskContainsAll(cache_entry.ValidSectors,
+                                 cache_entry.PendingReqMask);
+
+        bool getx_data_only_repair :=
+            cache_entry.PendingIsGetX &&
+            requested_tokens_full &&
+            !requested_data_present;
+
+        cache_entry.PendingRetrySent := true;
+        cache_entry.PendingRetryNumSent := in_msg.RetryNum;
+
+        enqueue(globalRequestNetwork_out, RequestMsg, l2_request_latency) {
+          out_msg.addr := address;
+          if (getx_data_only_repair) {
+            out_msg.Type := CoherenceRequestType:GETS;
+          } else if (cache_entry.PendingIsGetX) {
+            out_msg.Type := CoherenceRequestType:GETX;
+          } else {
+            out_msg.Type := CoherenceRequestType:GETS;
+          }
+          out_msg.Requestor := machineID;
+          out_msg.Destination.add(
+              mapAddressToMachine(address, MachineType:Directory));
+          out_msg.MessageSize := MessageSizeType:Request_Control;
+          out_msg.AccessMode := in_msg.AccessMode;
+          out_msg.Prefetch := in_msg.Prefetch;
+          out_msg.RetryNum := in_msg.RetryNum;
+          out_msg.is_owner_pull := getx_data_only_repair;
+          out_msg.sector_id := cache_entry.PendingSectorId;
+          out_msg.sector_mask := cache_entry.PendingReqMask;
+          out_msg.requested_sector_mask := cache_entry.PendingReqMask;
+          out_msg.requester_held_tokens_sec0 := credit0;
+          out_msg.requester_held_tokens_sec1 := credit1;
+          out_msg.is_gpu := false;
+          out_msg.is_sync := false;
+          out_msg.is_bypass := false;
+          out_msg.is_atomic := false;
+          out_msg.is_signal := false;
+          out_msg.merged_req := false;
+          out_msg.isGLCSet := in_msg.isGLCSet;
+          out_msg.isSLCSet := in_msg.isSLCSet;
+        }
+
+        if (getx_data_only_repair) {
+          DPRINTF(RubySlicc,
+                  "AMTC_L2_GETX_FULL_OWNER_DATA_PULL_V85S_R7 addr=%#x retry=%d req=%s mask=%d valid=%d credit0=%d credit1=%d L2T0=%d L2T1=%d ownerpull=1\n",
+                  address, in_msg.RetryNum,
+                  cache_entry.PendingL1Requestor,
+                  cache_entry.PendingReqMask,
+                  cache_entry.ValidSectors,
+                  credit0, credit1,
+                  cache_entry.TokensSec0, cache_entry.TokensSec1);
+        } else {
+          DPRINTF(RubySlicc,
+                  "AMTC_L2_PENDING_RETRY_EXACT_CREDIT_V85S addr=%#x type=%s retry=%d req=%s mask=%d credit0=%d credit1=%d L2T0=%d L2T1=%d\n",
+                  address, in_msg.Type, in_msg.RetryNum,
+                  cache_entry.PendingL1Requestor,
+                  cache_entry.PendingReqMask,
+                  credit0, credit1,
+                  cache_entry.TokensSec0, cache_entry.TokensSec1);
+        }
+      } else {
+        DPRINTF(RubySlicc,
+                "AMTC_L2_PENDING_RETRY_COALESCED_V85S addr=%#x retry=%d last=%d req=%s mask=%d\n",
+                address, in_msg.RetryNum,
+                cache_entry.PendingRetryNumSent,
+                cache_entry.PendingL1Requestor,
+                cache_entry.PendingReqMask);
       }
     }
   }
@@ -4590,34 +4428,12 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     o_popL1RequestQueue;
   }
 
-  // Audit94/V18: bounded bring-up escape for a GETS miss stuck in IS with no
-  // data/tokens.  Lowered trigger from retry 16 to retry 1 because
-  // post-kernel result-check loads progress only at issue=64, but every output line still waits for 16 L1 timeouts.
-  // Trigger at the first retry to avoid pathological post-kernel result-check stalls.  The observed sequence was:
-  //   AMTC_L2_ALLOC_OK / AMTC_L2_DIR_PROXY_BCAST_V10 addr=0x10f26c0
-  //   no AMTC_DIR_REQ_RAW_IN / no Data_Shared
-  //   repeated AMTC_L2_IS_GETS_REPAIR_BCAST_V10 retries forever.
-  // Do not keep the L2 line in IS forever.  Drop the empty transient entry
-  // and leave the L1 request queued so it is reprocessed from NP/I and sends
-  // a fresh directory request.
-  transition(IS, L1_GETS_Force_Restart, NP) {
-    dbg_l2ForceRestartEmptyISGets;
-    // V13 bring-up escape: the normal L2->Directory request path is not being
-    // observed by the Directory for this stuck I-cache line.  Replaying the
-    // same request only repeats AMTC_L2_DIR_PROXY_BCAST without any
-    // AMTC_DIR_REQ_RAW_IN.  Complete the saved pending GETS locally so the
-    // CPU sequencer can make forward progress, then drop the empty transient
-    // L2 entry.  This is a temporary bring-up workaround, not the final
-    // coherence model.
-    dbg_l2ForceLocalGetsFill;
-    sendPendingGetsDataToL1;
-    sendPendingGetsDataToSecondL1;
-    sendPendingGetsDataToThirdL1;
-    sendPendingGetsDataToFourthL1;
-    clearPendingL1Request;
-    rr_deallocateL2CacheBlock;
-    o_popL1RequestQueue;
-  }
+  // V85O: An IS entry with a pending Directory GETS must remain live until
+  // the matching response arrives.  Timeout retries are handled by the
+  // ordinary IS + L1_GETS transition below; they must not complete locally,
+  // clear PendingL1*, or deallocate the line while the Directory transaction
+  // is still in flight.  Doing so orphaned a later DATA_SHARED response and
+  // permanently lost its physical tokens.
 
   // While a GETS is already pending, another GETS for the same line is a
   // timeout retry/duplicate. Drop only the duplicate read retry; do not
@@ -4686,48 +4502,41 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
   // For bring-up only, synthesize an owner grant after long retry so the CPU
   // sequencer can move past the stuck store.  Replace with a clean Directory
   // response-path fix later.
-  transition(IX, L1_GETX_Force_Local_Grant, NP) {
-    dbg_l2ForceLocalGetxGrant;
-    forcePendingGetxOwnerDataToL1;
-    clearPendingL1Request;
-    rr_deallocateL2CacheBlock;
-    o_popL1RequestQueue;
-  }
 
   // V67: same local GETX grant, but sourced from triggerQueue_out in the
   // retry-loop repair path.  Do not pop L1requestNetwork_in for this internal
   // trigger; the retrying L1 request has already been consumed by the outer
   // transition that scheduled this trigger.
-  transition(IX, L1_GETX_Force_Local_Grant_TriggerQ, NP) {
-    dbg_l2ForceLocalGetxGrant;
-    forcePendingGetxOwnerDataToL1;
-    clearPendingL1Request;
-    rr_deallocateL2CacheBlock;
-    t_popTriggerQueue;
-  }
 
   transition(IX, L1_GETS) {
-    mergePendingMaskFromIncomingL1;
-    // Audit86: A timeout retry can arrive after the needed data/tokens are
-    // already present in the IX entry but before/without a fresh response event.
-    // Re-run the accumulation check on duplicate GETS/GETX so a pending L1
-    // requester is not stranded forever waiting for a new Data_Owner message.
-    cl2_checkL2Accumulation;
-    maybeForwardPendingGetxRetry;
-    o_popL1RequestQueue;
+    /*
+     * V85S-r4: GETS is a distinct operation while an exclusive writer is in
+     * flight.  Never union its sector mask into PendingReqMask and never turn
+     * the read into a GETX retry.  Keep it at the queue head; the independent
+     * response network can finish IX, after which this same GETS is reclassified
+     * against the new stable/NP state.
+     */
+    traceStallBehindLiveGetxV85S4;
   }
 
   transition(IX, L1_GETX) {
+    /*
+     * Only a RetryNum>0 from PendingL1Requestor reaches this transition in the
+     * normal V85S-r4 classifier.  Keep the active GETX sector-exact and replay
+     * only that writer's transaction.
+     */
     mergePendingMaskFromIncomingL1;
-    // Audit86: same retry-side completion repair for sector-masked GETX, e.g.
-    // addr=0x19c4c00 stuck with L1Cache-2 in S_IM and L2 IX receiving repeated
-    // L1_GETX retries.
     cl2_checkL2Accumulation;
     maybeForwardPendingGetxRetry;
     o_popL1RequestQueue;
   }
 
+  transition(IX, L1_GETX_Contender_Stall) {
+    traceStallBehindLiveGetxV85S4;
+  }
+
   transition(IS, Data_Shared, S) {
+    markCompletedPendingL1EpochsV85S4;
     u_writeDataToCache;
     q_updateTokensFromResponse;
     sendPendingGetsDataToL1;
@@ -4741,6 +4550,7 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
   }
 
   transition(IS, Data_Owner, O) {
+    markCompletedPendingL1EpochsV85S4;
     u_writeDataToCache;
     q_updateTokensFromResponse;
     sendPendingGetsDataToL1;
@@ -4759,6 +4569,7 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
   transition(IX, Data_Shared, IX) {
     u_writeDataToCache;
     q_updateTokensFromResponse;
+    maybeCompletePendingGetsDataOnlyV85Q;
     cl2_checkL2Accumulation;
     dbgIXPendingNoComplete;
     n_popResponseQueue;
@@ -4777,8 +4588,17 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     n_popResponseQueue;
   }
 
-  transition(IX, L2_Gets_Local_Escape_Drop, NP) {
-    dbg_l2DropPoisonLocalGetsV45;
+  /* V85Q: a CPU GETS may complete with data but no ownership token.
+   * Forward DATA_SHARED with zero tokens so L1 takes Data_No_Token, then
+   * discard the tokenless L2 copy.  rr_deallocateL2CacheBlock keeps the
+   * physical-token invariant strict.
+   */
+  transition(IX, L2_Gets_DataOnly_Done, NP) {
+    markCompletedPendingL1EpochsV85S4;
+    sendPendingGetsDataToL1;
+    sendPendingGetsDataToSecondL1;
+    sendPendingGetsDataToThirdL1;
+    sendPendingGetsDataToFourthL1;
     z_resetAccumulationFlag;
     clearPendingL1Request;
     rr_deallocateL2CacheBlock;
@@ -4787,6 +4607,7 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
   }
 
   transition(IX, L2_Gets_Accumulation_Done, S) {
+    markCompletedPendingL1EpochsV85S4;
     sendPendingGetsDataToL1;
     sendPendingGetsDataToSecondL1;
     sendPendingGetsDataToThirdL1;
@@ -4799,6 +4620,7 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
   }
 
   transition(IX, L2_Accumulation_Done, NP) {
+    markCompletedPendingL1EpochsV85S4;
     sendPendingGetxDataToL1;
     z_resetAccumulationFlag;
     clearPendingL1Request;
@@ -4820,9 +4642,50 @@ action(t_sendAckWithCollectedTokens, "t", desc="Send ack with the tokens we've c
     n_popResponseQueue;
   }
 
-  transition({IS, IX}, {Transient_GETX, Transient_GETS}) {
-    // L2 already has an outstanding miss for this line.  Drop/coalesce
-    // external probes for now; Directory will retry/repair as needed.
+  transition(IS, {Transient_GETX, Transient_GETS}) {
+    // GETS miss is already outstanding; preserve the original transaction.
+    m_popRequestQueue;
+  }
+
+  transition({NP, I, S, O, M, IS, IX, SX, OX, MX},
+             L1_Completed_Epoch_Retry_Stale) {
+    traceDropCompletedL1RetryV85S4;
+    o_popL1RequestQueue;
+  }
+
+  transition({NP, I, S, O, M, IS, IX, SX, OX, MX},
+             Dir_Local_GETX_Recall_Stale) {
+    /*
+     * No live pending writer exists at this L2.  This is a delayed retry/recall
+     * from a transaction that has already completed (or otherwise retired).
+     * Do not allocate a block, save a pending requester, or re-forward it to
+     * Directory.
+     */
+    traceDropStaleDirLocalGetxRecallV85S2;
+    o_popL1RequestQueue;
+  }
+
+  transition(IX, Dir_Local_GETX_Recall) {
+    /*
+     * V85S-r2: active same-gateway recall arriving on L1requestNetwork_in.
+     * IX still has the original pending L1 writer, so collect only real tokens
+     * from the other local L1 holders.
+     */
+    jix_forwardSelfDirGetxFromL1QueueV85S2;
+    o_popL1RequestQueue;
+  }
+
+  transition(IX, Transient_GETX) {
+    /*
+     * V85S-r1 global-request form of the same hierarchical local-owner recall.
+     * Keep this path for configurations where Directory->L2 uses vnet 2.
+     */
+    jix_forwardSelfDirGetxToLocalSharersV85S1;
+    m_popRequestQueue;
+  }
+
+  transition(IX, Transient_GETS) {
+    // Preserve existing coalescing for unrelated reads while GETX is active.
     m_popRequestQueue;
   }
 
@@ -4939,10 +4802,15 @@ transition(IX, Writeback_Owned) {
     n_popResponseQueue;
   }
 
-  transition(S, L1_GETX, I) {
+  // V85S: shared->exclusive is a real outstanding transaction.  Keep L2
+  // tokens resident, save the L1-held credit, and collect Directory's physical
+  // remainder in IX before returning ownership to L1.
+  transition(S, L1_GETX, IX) {
+    z_resetAccumulationFlag;
+    savePendingL1Request;
     rm_updateRequestedMask;
     a_broadcastLocalRequest;
-    tt_sendLocalAckWithCollectedTokens;
+    markPendingDirRequestSent;
     r_markNewSharer;
     r_setMRU;
     uu_profileMiss;
@@ -5048,16 +4916,14 @@ transition(IX, Writeback_Owned) {
   }
 
 
-  transition(O, L1_GETX, O) {
+  // V85S: owned->exclusive follows the same conservation rule as S->IX.
+  // Do not donate L2 tokens before Directory's remaining contribution arrives.
+  transition(O, L1_GETX, IX) {
     z_resetAccumulationFlag;
+    savePendingL1Request;
     rm_updateRequestedMask;
     a_broadcastLocalRequest;
-    k_dataAndAllTokensFromL2CacheToL1Requestor;
-    // audit53: do not drop an O entry when the partial GETX was suppressed.
-    // If tokens were actually donated, clear only the sectors that no longer
-    // have tokens so stable O remains legal; if the action suppressed the
-    // response, tokens/valid stay intact and future donor tokens can converge.
-    amtc_l2RecomputeValidFromTokens;
+    markPendingDirRequestSent;
     r_markNewSharer;
     r_setMRU;
     uu_profileMiss;
@@ -5236,6 +5102,7 @@ transition(IX, Writeback_Owned) {
   }
 
   transition({I, NP}, Writeback_Owned) {
+    bb_bounceResponse;
     n_popResponseQueue;
   }
 

@@ -567,10 +567,10 @@ ComputeUnit::startWavefront(Wavefront *w, int waveId, LdsChunk *ldsChunk,
 void
 ComputeUnit::doInvalidate(RequestPtr req, int kernId)
 {
-    warn("AMTC_CU_DO_INVALIDATE tick=%llu cu=%d kern=%d req=%p "
-         "requestor=%d\n",
-         (unsigned long long)curTick(), cu_id, kernId, req.get(),
-         req->requestorId());
+    warn_once("AMTC_CU_DO_INVALIDATE tick=%llu cu=%d kern=%d req=%p "
+              "requestor=%d\n",
+              (unsigned long long)curTick(), cu_id, kernId, req.get(),
+              req->requestorId());
 
     GPUDynInstPtr gpuDynInst
         = std::make_shared<GPUDynInst>(this, nullptr,
@@ -581,9 +581,9 @@ ComputeUnit::doInvalidate(RequestPtr req, int kernId)
     injectGlobalMemFence(gpuDynInst, true, req);
 
     if (AMTC_BYPASS_TCP_KERNEL_INV_WAIT) {
-        warn("AMTC_CU_INV_PROGRESS_DECREMENT tick=%llu cu=%d kern=%d "
-             "reason=tcp_memsync_not_reaching_tcp_sequencer\n",
-             (unsigned long long)curTick(), cu_id, kernId);
+        warn_once("AMTC_CU_INV_PROGRESS_DECREMENT tick=%llu cu=%d kern=%d "
+                  "reason=tcp_memsync_not_reaching_tcp_sequencer\n",
+                  (unsigned long long)curTick(), cu_id, kernId);
         shader->dispatcher().updateInvCounter(kernId);
     }
 }
@@ -713,6 +713,26 @@ ComputeUnit::insertInPipeMap(Wavefront *w)
     panic_if(w->instructionBuffer.empty(),
              "Instruction Buffer of WF%d can't be empty", w->wgId);
     GPUDynInstPtr ii = w->instructionBuffer.front();
+
+    /*
+     * AMTC SSSP hang diagnostic:
+     *
+     * Trace simulator-side instruction pipeline entry for the single
+     * wavefront currently implicated by the hang.  This does not execute
+     * any additional guest GPU instructions or coherent memory accesses.
+     */
+    if (cu_id == 0 && w->simdId == 0 && w->wfSlotId == 0) {
+        warn_once(
+            "AMTC_CU_PIPE_INSERT tick=%llu cu=%d simd=%d wf=%d wfDyn=%d "
+            "wg=%d kern=%d seq=%llu pc=%#llx status=%d outstanding=%d "
+            "ibuf=%llu pipe=%llu inst=%s\n",
+            (unsigned long long)curTick(), cu_id, w->simdId, w->wfSlotId,
+            w->wfDynId, w->wgId, ii->kern_id, (unsigned long long)ii->seqNum(),
+            (unsigned long long)w->pc(), w->getStatus(), w->outstandingReqs,
+            (unsigned long long)w->instructionBuffer.size(),
+            (unsigned long long)pipeMap.size(), ii->disassemble().c_str());
+    }
+
     pipeMap.emplace(ii->seqNum());
 }
 
@@ -722,10 +742,31 @@ ComputeUnit::deleteFromPipeMap(Wavefront *w)
     panic_if(w->instructionBuffer.empty(),
              "Instruction Buffer of WF%d can't be empty", w->wgId);
     GPUDynInstPtr ii = w->instructionBuffer.front();
+
+    if (cu_id == 0 && w->simdId == 0 && w->wfSlotId == 0) {
+        warn_once(
+            "AMTC_CU_PIPE_DELETE_BEFORE tick=%llu cu=%d simd=%d wf=%d "
+            "wfDyn=%d wg=%d kern=%d seq=%llu pc=%#llx status=%d "
+            "outstanding=%d ibuf=%llu pipe=%llu inst=%s\n",
+            (unsigned long long)curTick(), cu_id, w->simdId, w->wfSlotId,
+            w->wfDynId, w->wgId, ii->kern_id, (unsigned long long)ii->seqNum(),
+            (unsigned long long)w->pc(), w->getStatus(), w->outstandingReqs,
+            (unsigned long long)w->instructionBuffer.size(),
+            (unsigned long long)pipeMap.size(), ii->disassemble().c_str());
+    }
+
     // delete the dynamic instruction from the pipeline map
     auto it = pipeMap.find(ii->seqNum());
     panic_if(it == pipeMap.end(), "Pipeline Map is empty\n");
     pipeMap.erase(it);
+
+    if (cu_id == 0 && w->simdId == 0 && w->wfSlotId == 0) {
+        warn_once("AMTC_CU_PIPE_DELETE_AFTER tick=%llu cu=%d simd=%d wf=%d "
+                  "wfDyn=%d seq=%llu status=%d outstanding=%d pipe=%llu\n",
+                  (unsigned long long)curTick(), cu_id, w->simdId, w->wfSlotId,
+                  w->wfDynId, (unsigned long long)ii->seqNum(), w->getStatus(),
+                  w->outstandingReqs, (unsigned long long)pipeMap.size());
+    }
 }
 
 bool
@@ -1034,23 +1075,24 @@ ComputeUnit::DataPort::handleResponse(PacketPtr pkt)
     GPUDynInstPtr gpuDynInst = sender_state->_gpuDynInst;
     GPUDispatcher &dispatcher = computeUnit->shader->dispatcher();
 
-    warn("AMTC_CU_DATA_RESP_ENTER tick=%llu cu=%d port=%d pkt=%p cmd=%s "
-         "paddr=%#llx gpuDynInst=%p isKernel=%d isInvL1=%d isInvL2=%d\n",
-         (unsigned long long)curTick(), computeUnit->cu_id, index, pkt,
-         pkt->cmdString().c_str(),
-         pkt->req ? (unsigned long long)pkt->req->getPaddr() : 0ULL,
-         gpuDynInst.get(), pkt->req ? pkt->req->isKernel() : 0,
-         pkt->req ? pkt->req->isInvL1() : 0,
-         pkt->req ? pkt->req->isInvL2() : 0);
+    warn_once("AMTC_CU_DATA_RESP_ENTER tick=%llu cu=%d port=%d pkt=%p cmd=%s "
+              "paddr=%#llx gpuDynInst=%p isKernel=%d isInvL1=%d isInvL2=%d\n",
+              (unsigned long long)curTick(), computeUnit->cu_id, index, pkt,
+              pkt->cmdString().c_str(),
+              pkt->req ? (unsigned long long)pkt->req->getPaddr() : 0ULL,
+              gpuDynInst.get(), pkt->req ? pkt->req->isKernel() : 0,
+              pkt->req ? pkt->req->isInvL1() : 0,
+              pkt->req ? pkt->req->isInvL2() : 0);
 
     if (gpuDynInst) {
-        warn("AMTC_CU_DATA_RESP_INST tick=%llu cu=%d pkt=%p inst=%p seq=%llu "
-             "kern=%d simd=%d wf=%d wfDyn=%d cmd=%s paddr=%#llx\n",
-             (unsigned long long)curTick(), computeUnit->cu_id, pkt,
-             gpuDynInst.get(), (unsigned long long)gpuDynInst->seqNum(),
-             gpuDynInst->kern_id, gpuDynInst->simdId, gpuDynInst->wfSlotId,
-             gpuDynInst->wfDynId, pkt->cmdString().c_str(),
-             pkt->req ? (unsigned long long)pkt->req->getPaddr() : 0ULL);
+        warn_once(
+            "AMTC_CU_DATA_RESP_INST tick=%llu cu=%d pkt=%p inst=%p seq=%llu "
+            "kern=%d simd=%d wf=%d wfDyn=%d cmd=%s paddr=%#llx\n",
+            (unsigned long long)curTick(), computeUnit->cu_id, pkt,
+            gpuDynInst.get(), (unsigned long long)gpuDynInst->seqNum(),
+            gpuDynInst->kern_id, gpuDynInst->simdId, gpuDynInst->wfSlotId,
+            gpuDynInst->wfDynId, pkt->cmdString().c_str(),
+            pkt->req ? (unsigned long long)pkt->req->getPaddr() : 0ULL);
     }
 
     // MemSyncResp + WriteAckResp are handled completely here and we don't
@@ -1068,16 +1110,18 @@ ComputeUnit::DataPort::handleResponse(PacketPtr pkt)
             assert(cu != nullptr);
 
             if (pkt->req->isInvL2()) {
-                warn("AMTC_CU_DATA_MEMSYNC_INV_L2_RESP tick=%llu cu=%d pkt=%p "
-                     "outstanding_l2_before=%d\n",
-                     (unsigned long long)curTick(), cu->cu_id, pkt,
-                     cu->shader->getNumOutstandingInvL2s());
+                warn_once(
+                    "AMTC_CU_DATA_MEMSYNC_INV_L2_RESP tick=%llu cu=%d pkt=%p "
+                    "outstanding_l2_before=%d\n",
+                    (unsigned long long)curTick(), cu->cu_id, pkt,
+                    cu->shader->getNumOutstandingInvL2s());
                 cu->shader->decNumOutstandingInvL2s();
                 assert(cu->shader->getNumOutstandingInvL2s() >= 0);
-                warn("AMTC_CU_DATA_MEMSYNC_INV_L2_DONE tick=%llu cu=%d pkt=%p "
-                     "outstanding_l2_after=%d\n",
-                     (unsigned long long)curTick(), cu->cu_id, pkt,
-                     cu->shader->getNumOutstandingInvL2s());
+                warn_once(
+                    "AMTC_CU_DATA_MEMSYNC_INV_L2_DONE tick=%llu cu=%d pkt=%p "
+                    "outstanding_l2_after=%d\n",
+                    (unsigned long long)curTick(), cu->cu_id, pkt,
+                    cu->shader->getNumOutstandingInvL2s());
             } else {
                 panic("Unknown MemSyncResp not from an instruction");
             }
@@ -1092,27 +1136,28 @@ ComputeUnit::DataPort::handleResponse(PacketPtr pkt)
         // wavefront was nullptr when launching kernel, so it is meaningless
         // here (simdId=-1, wfSlotId=-1)
         if (gpuDynInst->isKernelLaunch()) {
-            warn("AMTC_CU_DATA_INV_RESP_ENTER tick=%llu cu=%d kern=%d "
-                 "pkt=%p isKernel=%d isInvL1=%d cmd=%s\n",
-                 (unsigned long long)curTick(), computeUnit->cu_id,
-                 gpuDynInst->kern_id, pkt, pkt->req->isKernel(),
-                 pkt->req->isInvL1(), pkt->cmdString().c_str());
+            warn_once("AMTC_CU_DATA_INV_RESP_ENTER tick=%llu cu=%d kern=%d "
+                      "pkt=%p isKernel=%d isInvL1=%d cmd=%s\n",
+                      (unsigned long long)curTick(), computeUnit->cu_id,
+                      gpuDynInst->kern_id, pkt, pkt->req->isKernel(),
+                      pkt->req->isInvL1(), pkt->cmdString().c_str());
 
             assert(pkt->req->isKernel());
             assert(pkt->req->isInvL1());
 
             if (AMTC_BYPASS_TCP_KERNEL_INV_WAIT) {
-                warn("AMTC_CU_DATA_INV_RESP_SKIP_COUNTER tick=%llu cu=%d "
-                     "kern=%d "
-                     "reason=progress_bypass_already_decremented\n",
-                     (unsigned long long)curTick(), computeUnit->cu_id,
-                     gpuDynInst->kern_id);
+                warn_once("AMTC_CU_DATA_INV_RESP_SKIP_COUNTER tick=%llu cu=%d "
+                          "kern=%d "
+                          "reason=progress_bypass_already_decremented\n",
+                          (unsigned long long)curTick(), computeUnit->cu_id,
+                          gpuDynInst->kern_id);
             } else {
                 dispatcher.updateInvCounter(gpuDynInst->kern_id);
 
-                warn("AMTC_CU_DATA_INV_RESP_DONE tick=%llu cu=%d kern=%d\n",
-                     (unsigned long long)curTick(), computeUnit->cu_id,
-                     gpuDynInst->kern_id);
+                warn_once(
+                    "AMTC_CU_DATA_INV_RESP_DONE tick=%llu cu=%d kern=%d\n",
+                    (unsigned long long)curTick(), computeUnit->cu_id,
+                    gpuDynInst->kern_id);
             }
 
             delete pkt->senderState;
@@ -1136,16 +1181,17 @@ ComputeUnit::DataPort::handleResponse(PacketPtr pkt)
 
             // once flush done, decrement counter, and return whether all
             // dirty writeback operations are done for the kernel
-            warn("AMTC_CU_KERNEL_END_FLUSH_RESP tick=%llu cu=%d kern=%d "
-                 "wg=%d simd=%d wf=%d pkt=%p status=%d\n",
-                 (unsigned long long)curTick(), computeUnit->cu_id,
-                 gpuDynInst->kern_id, w->wgId, w->simdId, w->wfSlotId, pkt,
-                 w->getStatus());
+            warn_once("AMTC_CU_KERNEL_END_FLUSH_RESP tick=%llu cu=%d kern=%d "
+                      "wg=%d simd=%d wf=%d pkt=%p status=%d\n",
+                      (unsigned long long)curTick(), computeUnit->cu_id,
+                      gpuDynInst->kern_id, w->wgId, w->simdId, w->wfSlotId,
+                      pkt, w->getStatus());
             bool isWbDone = dispatcher.updateWbCounter(gpuDynInst->kern_id);
-            warn("AMTC_CU_KERNEL_END_WB_STATE tick=%llu cu=%d kern=%d wg=%d "
-                 "isWbDone=%d\n",
-                 (unsigned long long)curTick(), computeUnit->cu_id,
-                 gpuDynInst->kern_id, w->wgId, isWbDone);
+            warn_once(
+                "AMTC_CU_KERNEL_END_WB_STATE tick=%llu cu=%d kern=%d wg=%d "
+                "isWbDone=%d\n",
+                (unsigned long long)curTick(), computeUnit->cu_id,
+                gpuDynInst->kern_id, w->wgId, isWbDone);
 
             // not all wbs are done for the kernel, just release pkt
             // resources
@@ -1161,18 +1207,19 @@ ComputeUnit::DataPort::handleResponse(PacketPtr pkt)
                     computeUnit->cu_id, w->simdId, w->wfSlotId,
                     w->wfDynId, w->wgId);
 
-            warn("AMTC_CU_NOTIFY_WG_COMPL tick=%llu cu=%d kern=%d wg=%d "
-                 "simd=%d wf=%d wfDyn=%d status_before=%d\n",
-                 (unsigned long long)curTick(), computeUnit->cu_id,
-                 gpuDynInst->kern_id, w->wgId, w->simdId, w->wfSlotId,
-                 w->wfDynId, w->getStatus());
+            warn_once("AMTC_CU_NOTIFY_WG_COMPL tick=%llu cu=%d kern=%d wg=%d "
+                      "simd=%d wf=%d wfDyn=%d status_before=%d\n",
+                      (unsigned long long)curTick(), computeUnit->cu_id,
+                      gpuDynInst->kern_id, w->wgId, w->simdId, w->wfSlotId,
+                      w->wfDynId, w->getStatus());
             dispatcher.notifyWgCompl(w);
             w->setStatus(Wavefront::S_STOPPED);
-            warn("AMTC_CU_NOTIFY_WG_COMPL_DONE tick=%llu cu=%d kern=%d wg=%d "
-                 "simd=%d wf=%d status_after=%d\n",
-                 (unsigned long long)curTick(), computeUnit->cu_id,
-                 gpuDynInst->kern_id, w->wgId, w->simdId, w->wfSlotId,
-                 w->getStatus());
+            warn_once(
+                "AMTC_CU_NOTIFY_WG_COMPL_DONE tick=%llu cu=%d kern=%d wg=%d "
+                "simd=%d wf=%d status_after=%d\n",
+                (unsigned long long)curTick(), computeUnit->cu_id,
+                gpuDynInst->kern_id, w->wgId, w->simdId, w->wfSlotId,
+                w->getStatus());
         }
 
         if (!pkt->req->isKernel()) {
@@ -1182,21 +1229,23 @@ ComputeUnit::DataPort::handleResponse(PacketPtr pkt)
                             gpuDynInst->wfSlotId, gpuDynInst->wfDynId,
                             gpuDynInst->disassemble(), w->outstandingReqs,
                             w->outstandingReqs - 1);
-            warn("AMTC_CU_MEMSYNC_NONKERNEL_COMPLETE tick=%llu cu=%d "
-                 "inst=%p seq=%llu simd=%d wf=%d wfDyn=%d "
-                 "outstanding_before=%d\n",
-                 (unsigned long long)curTick(), computeUnit->cu_id,
-                 gpuDynInst.get(), (unsigned long long)gpuDynInst->seqNum(),
-                 gpuDynInst->simdId, gpuDynInst->wfSlotId, gpuDynInst->wfDynId,
-                 w->outstandingReqs);
+            warn_once("AMTC_CU_MEMSYNC_NONKERNEL_COMPLETE tick=%llu cu=%d "
+                      "inst=%p seq=%llu simd=%d wf=%d wfDyn=%d "
+                      "outstanding_before=%d\n",
+                      (unsigned long long)curTick(), computeUnit->cu_id,
+                      gpuDynInst.get(),
+                      (unsigned long long)gpuDynInst->seqNum(),
+                      gpuDynInst->simdId, gpuDynInst->wfSlotId,
+                      gpuDynInst->wfDynId, w->outstandingReqs);
             computeUnit->globalMemoryPipe.handleResponse(gpuDynInst);
-            warn("AMTC_CU_MEMSYNC_NONKERNEL_AFTER_PIPE tick=%llu cu=%d "
-                 "inst=%p seq=%llu simd=%d wf=%d wfDyn=%d "
-                 "outstanding_after=%d\n",
-                 (unsigned long long)curTick(), computeUnit->cu_id,
-                 gpuDynInst.get(), (unsigned long long)gpuDynInst->seqNum(),
-                 gpuDynInst->simdId, gpuDynInst->wfSlotId, gpuDynInst->wfDynId,
-                 w->outstandingReqs);
+            warn_once("AMTC_CU_MEMSYNC_NONKERNEL_AFTER_PIPE tick=%llu cu=%d "
+                      "inst=%p seq=%llu simd=%d wf=%d wfDyn=%d "
+                      "outstanding_after=%d\n",
+                      (unsigned long long)curTick(), computeUnit->cu_id,
+                      gpuDynInst.get(),
+                      (unsigned long long)gpuDynInst->seqNum(),
+                      gpuDynInst->simdId, gpuDynInst->wfSlotId,
+                      gpuDynInst->wfDynId, w->outstandingReqs);
         }
 
         delete pkt->senderState;
@@ -1212,7 +1261,7 @@ ComputeUnit::DataPort::handleResponse(PacketPtr pkt)
             computeUnit->cu_id, gpuDynInst->simdId, gpuDynInst->wfSlotId,
             gpuDynInst->seqNum(), index, pkt->req->getPaddr());
 
-    warn(
+    warn_once(
         "AMTC_CU_DATA_RESP_SCHEDULE_EVENT tick=%llu cu=%d port=%d pkt=%p "
         "inst=%p seq=%llu simd=%d wf=%d wfDyn=%d paddr=%#llx resp_tick=%llu\n",
         (unsigned long long)curTick(), computeUnit->cu_id, index, pkt,
@@ -1402,6 +1451,18 @@ ComputeUnit::sendRequest(GPUDynInstPtr gpuDynInst, PortID index, PacketPtr pkt)
 {
     // There must be a way around this check to do the globalMemStart...
     Addr tmp_vaddr = pkt->req->getVaddr();
+
+    if (cu_id == 0 && gpuDynInst && gpuDynInst->simdId == 0 &&
+        gpuDynInst->wfSlotId == 0) {
+        warn_once(
+            "AMTC_CU_VMEM_REQ_ENTER tick=%llu cu=%d simd=%d wf=%d wfDyn=%d "
+            "kern=%d seq=%llu lane=%d cmd=%s vaddr=%#llx size=%u inst=%s\n",
+            (unsigned long long)curTick(), cu_id, gpuDynInst->simdId,
+            gpuDynInst->wfSlotId, gpuDynInst->wfDynId, gpuDynInst->kern_id,
+            (unsigned long long)gpuDynInst->seqNum(), index,
+            pkt->cmdString().c_str(), (unsigned long long)tmp_vaddr,
+            pkt->getSize(), gpuDynInst->disassemble().c_str());
+    }
 
     updatePageDivergenceDist(tmp_vaddr);
 
@@ -1662,13 +1723,13 @@ ComputeUnit::injectGlobalMemFence(GPUDynInstPtr gpuDynInst,
             DPRINTF(GPUPort, "CU%d: WF[%d][%d]: index %d, addr %#x scheduling "
                     "an acquire\n", cu_id, gpuDynInst->simdId,
                     gpuDynInst->wfSlotId, 0, pkt->req->getPaddr());
-            warn("AMTC_CU_INJECT_KERNEL_INV tick=%llu cu=%d kern=%d "
-                 "req=%p requestor=%d paddr=%#llx flags_kernel=%d "
-                 "flags_inv_l1=%d\n",
-                 (unsigned long long)curTick(), cu_id, gpuDynInst->kern_id,
-                 req.get(), req->requestorId(),
-                 (unsigned long long)req->getPaddr(), req->isKernel(),
-                 req->isInvL1());
+            warn_once("AMTC_CU_INJECT_KERNEL_INV tick=%llu cu=%d kern=%d "
+                      "req=%p requestor=%d paddr=%#llx flags_kernel=%d "
+                      "flags_inv_l1=%d\n",
+                      (unsigned long long)curTick(), cu_id,
+                      gpuDynInst->kern_id, req.get(), req->requestorId(),
+                      (unsigned long long)req->getPaddr(), req->isKernel(),
+                      req->isInvL1());
             schedule(mem_req_event, curTick() + req_tick_latency);
         } else {
           // kernel end flush of GL2 cache may be quiesced by Ruby if the
@@ -1741,15 +1802,16 @@ ComputeUnit::DataPort::processMemRespEvent(PacketPtr pkt)
 
     assert(gpuDynInst);
 
-    warn("AMTC_CU_MEM_RESP_EVENT_ENTER tick=%llu cu=%d port=%d pkt=%p "
-         "cmd=%s inst=%p seq=%llu kern=%d simd=%d wf=%d wfDyn=%d paddr=%#llx "
-         "statusEntries=%llu\n",
-         (unsigned long long)curTick(), compute_unit->cu_id, id, pkt,
-         pkt->cmdString().c_str(), gpuDynInst.get(),
-         (unsigned long long)gpuDynInst->seqNum(), gpuDynInst->kern_id,
-         gpuDynInst->simdId, gpuDynInst->wfSlotId, gpuDynInst->wfDynId,
-         (unsigned long long)pkt->req->getPaddr(),
-         (unsigned long long)gpuDynInst->memStatusVector.size());
+    warn_once(
+        "AMTC_CU_MEM_RESP_EVENT_ENTER tick=%llu cu=%d port=%d pkt=%p "
+        "cmd=%s inst=%p seq=%llu kern=%d simd=%d wf=%d wfDyn=%d paddr=%#llx "
+        "statusEntries=%llu\n",
+        (unsigned long long)curTick(), compute_unit->cu_id, id, pkt,
+        pkt->cmdString().c_str(), gpuDynInst.get(),
+        (unsigned long long)gpuDynInst->seqNum(), gpuDynInst->kern_id,
+        gpuDynInst->simdId, gpuDynInst->wfSlotId, gpuDynInst->wfDynId,
+        (unsigned long long)pkt->req->getPaddr(),
+        (unsigned long long)gpuDynInst->memStatusVector.size());
 
     DPRINTF(GPUPort, "CU%d: WF[%d][%d]: Response for addr %#x, index %d\n",
             compute_unit->cu_id, gpuDynInst->simdId, gpuDynInst->wfSlotId,
@@ -1776,21 +1838,22 @@ ComputeUnit::DataPort::processMemRespEvent(PacketPtr pkt)
             gpuDynInst->memStatusVector.count(paddr) != 0;
 
         if ((!FullSystem || !pkt->req->systemReq()) && !tracked_write_resp) {
-            warn("AMTC_CU_MEM_RESP_WRITE_RESP_DROP_UNTRACKED tick=%llu cu=%d "
-                 "port=%d "
-                 "pkt=%p inst=%p seq=%llu paddr=%#llx fullSystem=%d "
-                 "systemReq=%d "
-                 "tracked=%d\n",
-                 (unsigned long long)curTick(), compute_unit->cu_id, id, pkt,
-                 gpuDynInst.get(), (unsigned long long)gpuDynInst->seqNum(),
-                 (unsigned long long)paddr, FullSystem, pkt->req->systemReq(),
-                 tracked_write_resp);
+            warn_once(
+                "AMTC_CU_MEM_RESP_WRITE_RESP_DROP_UNTRACKED tick=%llu cu=%d "
+                "port=%d "
+                "pkt=%p inst=%p seq=%llu paddr=%#llx fullSystem=%d "
+                "systemReq=%d "
+                "tracked=%d\n",
+                (unsigned long long)curTick(), compute_unit->cu_id, id, pkt,
+                gpuDynInst.get(), (unsigned long long)gpuDynInst->seqNum(),
+                (unsigned long long)paddr, FullSystem, pkt->req->systemReq(),
+                tracked_write_resp);
             delete pkt;
             return;
         }
 
         if (!FullSystem || !pkt->req->systemReq()) {
-            warn(
+            warn_once(
                 "AMTC_CU_MEM_RESP_WRITE_RESP_TREAT_AS_COMPLETE_V2 tick=%llu "
                 "cu=%d port=%d pkt=%p inst=%p seq=%llu simd=%d wf=%d wfDyn=%d "
                 "paddr=%#llx fullSystem=%d systemReq=%d tracked=%d\n",
@@ -1802,12 +1865,13 @@ ComputeUnit::DataPort::processMemRespEvent(PacketPtr pkt)
         }
     }
 
-    warn("AMTC_CU_MEM_STATUS_BEFORE tick=%llu cu=%d inst=%p seq=%llu "
-         "paddr=%#llx vector_entries=%llu addr_slots=%llu\n",
-         (unsigned long long)curTick(), compute_unit->cu_id, gpuDynInst.get(),
-         (unsigned long long)gpuDynInst->seqNum(), (unsigned long long)paddr,
-         (unsigned long long)gpuDynInst->memStatusVector.size(),
-         (unsigned long long)gpuDynInst->memStatusVector[paddr].size());
+    warn_once("AMTC_CU_MEM_STATUS_BEFORE tick=%llu cu=%d inst=%p seq=%llu "
+              "paddr=%#llx vector_entries=%llu addr_slots=%llu\n",
+              (unsigned long long)curTick(), compute_unit->cu_id,
+              gpuDynInst.get(), (unsigned long long)gpuDynInst->seqNum(),
+              (unsigned long long)paddr,
+              (unsigned long long)gpuDynInst->memStatusVector.size(),
+              (unsigned long long)gpuDynInst->memStatusVector[paddr].size());
 
     // this is for read, write and atomic
     int index = gpuDynInst->memStatusVector[paddr].back();
@@ -1820,11 +1884,12 @@ ComputeUnit::DataPort::processMemRespEvent(PacketPtr pkt)
 
     gpuDynInst->decrementStatusVector(index);
     DPRINTF(GPUMem, "bitvector is now %s\n", gpuDynInst->printStatusVector());
-    warn("AMTC_CU_MEM_STATUS_AFTER_DEC tick=%llu cu=%d inst=%p seq=%llu "
-         "paddr=%#llx index=%d status=%s allZero=%d\n",
-         (unsigned long long)curTick(), compute_unit->cu_id, gpuDynInst.get(),
-         (unsigned long long)gpuDynInst->seqNum(), (unsigned long long)paddr,
-         index, gpuDynInst->printStatusVector(), gpuDynInst->allLanesZero());
+    warn_once("AMTC_CU_MEM_STATUS_AFTER_DEC tick=%llu cu=%d inst=%p seq=%llu "
+              "paddr=%#llx index=%d status=%s allZero=%d\n",
+              (unsigned long long)curTick(), compute_unit->cu_id,
+              gpuDynInst.get(), (unsigned long long)gpuDynInst->seqNum(),
+              (unsigned long long)paddr, index,
+              gpuDynInst->printStatusVector(), gpuDynInst->allLanesZero());
 
     if (gpuDynInst->allLanesZero()) {
         auto iter = gpuDynInst->memStatusVector.begin();
@@ -1848,31 +1913,33 @@ ComputeUnit::DataPort::processMemRespEvent(PacketPtr pkt)
 
         gpuDynInst->
             profileRoundTripTime(curTick(), InstMemoryHop::GMEnqueue);
-        warn("AMTC_CU_MEM_INST_COMPLETE_BEFORE_PIPE tick=%llu cu=%d "
-             "inst=%p seq=%llu kern=%d simd=%d wf=%d wfDyn=%d paddr=%#llx\n",
-             (unsigned long long)curTick(), compute_unit->cu_id,
-             gpuDynInst.get(), (unsigned long long)gpuDynInst->seqNum(),
-             gpuDynInst->kern_id, gpuDynInst->simdId, gpuDynInst->wfSlotId,
-             gpuDynInst->wfDynId, (unsigned long long)paddr);
+        warn_once(
+            "AMTC_CU_MEM_INST_COMPLETE_BEFORE_PIPE tick=%llu cu=%d "
+            "inst=%p seq=%llu kern=%d simd=%d wf=%d wfDyn=%d paddr=%#llx\n",
+            (unsigned long long)curTick(), compute_unit->cu_id,
+            gpuDynInst.get(), (unsigned long long)gpuDynInst->seqNum(),
+            gpuDynInst->kern_id, gpuDynInst->simdId, gpuDynInst->wfSlotId,
+            gpuDynInst->wfDynId, (unsigned long long)paddr);
         compute_unit->globalMemoryPipe.handleResponse(gpuDynInst);
-        warn("AMTC_CU_MEM_INST_COMPLETE_AFTER_PIPE tick=%llu cu=%d "
-             "inst=%p seq=%llu kern=%d simd=%d wf=%d wfDyn=%d paddr=%#llx\n",
-             (unsigned long long)curTick(), compute_unit->cu_id,
-             gpuDynInst.get(), (unsigned long long)gpuDynInst->seqNum(),
-             gpuDynInst->kern_id, gpuDynInst->simdId, gpuDynInst->wfSlotId,
-             gpuDynInst->wfDynId, (unsigned long long)paddr);
+        warn_once(
+            "AMTC_CU_MEM_INST_COMPLETE_AFTER_PIPE tick=%llu cu=%d "
+            "inst=%p seq=%llu kern=%d simd=%d wf=%d wfDyn=%d paddr=%#llx\n",
+            (unsigned long long)curTick(), compute_unit->cu_id,
+            gpuDynInst.get(), (unsigned long long)gpuDynInst->seqNum(),
+            gpuDynInst->kern_id, gpuDynInst->simdId, gpuDynInst->wfSlotId,
+            gpuDynInst->wfDynId, (unsigned long long)paddr);
 
         DPRINTF(GPUMem, "CU%d: WF[%d][%d]: packet totally complete\n",
                 compute_unit->cu_id, gpuDynInst->simdId,
                 gpuDynInst->wfSlotId);
     } else {
-        warn("AMTC_CU_MEM_INST_PARTIAL tick=%llu cu=%d inst=%p seq=%llu "
-             "simd=%d wf=%d wfDyn=%d paddr=%#llx status=%s isRead=%d\n",
-             (unsigned long long)curTick(), compute_unit->cu_id,
-             gpuDynInst.get(), (unsigned long long)gpuDynInst->seqNum(),
-             gpuDynInst->simdId, gpuDynInst->wfSlotId, gpuDynInst->wfDynId,
-             (unsigned long long)paddr, gpuDynInst->printStatusVector(),
-             pkt->isRead());
+        warn_once("AMTC_CU_MEM_INST_PARTIAL tick=%llu cu=%d inst=%p seq=%llu "
+                  "simd=%d wf=%d wfDyn=%d paddr=%#llx status=%s isRead=%d\n",
+                  (unsigned long long)curTick(), compute_unit->cu_id,
+                  gpuDynInst.get(), (unsigned long long)gpuDynInst->seqNum(),
+                  gpuDynInst->simdId, gpuDynInst->wfSlotId,
+                  gpuDynInst->wfDynId, (unsigned long long)paddr,
+                  gpuDynInst->printStatusVector(), pkt->isRead());
         if (pkt->isRead()) {
             if (!compute_unit->headTailMap.count(gpuDynInst)) {
                 compute_unit->headTailMap
@@ -1933,6 +2000,20 @@ ComputeUnit::DTLBPort::recvTimingResp(PacketPtr pkt)
     GPUDynInstPtr gpuDynInst = sender_state->_gpuDynInst;
     PortID mp_index = sender_state->portIndex;
     Addr vaddr = pkt->req->getVaddr();
+
+    if (computeUnit->cu_id == 0 && gpuDynInst && gpuDynInst->simdId == 0 &&
+        gpuDynInst->wfSlotId == 0) {
+        warn_once("AMTC_CU_DTLB_RESP tick=%llu cu=%d simd=%d wf=%d wfDyn=%d "
+                  "kern=%d seq=%llu lane=%d vaddr=%#llx paddr=%#llx "
+                  "hitLevel=%d inst=%s\n",
+                  (unsigned long long)curTick(), computeUnit->cu_id,
+                  gpuDynInst->simdId, gpuDynInst->wfSlotId,
+                  gpuDynInst->wfDynId, gpuDynInst->kern_id,
+                  (unsigned long long)gpuDynInst->seqNum(), mp_index,
+                  (unsigned long long)vaddr, (unsigned long long)line,
+                  hit_level, gpuDynInst->disassemble().c_str());
+    }
+
     gpuDynInst->memStatusVector[line].push_back(mp_index);
     gpuDynInst->tlbHitLevel[mp_index] = hit_level;
 
@@ -2105,13 +2186,14 @@ ComputeUnit::DataPort::processMemReqEvent(PacketPtr pkt)
         is_kernel_memsync && !pkt->req->isInvL1() && !pkt->req->isInvL2();
 
     if (is_kernel_memsync) {
-        warn("AMTC_CU_DATA_MEMSYNC_SEND tick=%llu cu=%d pkt=%p "
-             "gpuDynInst=%p isInvL1=%d isInvL2=%d kern=%d "
-             "requestor=%d paddr=%#llx\n",
-             (unsigned long long)curTick(), computeUnit->cu_id, pkt,
-             gpuDynInst.get(), pkt->req->isInvL1(), pkt->req->isInvL2(),
-             gpuDynInst ? gpuDynInst->kern_id : -1, pkt->req->requestorId(),
-             (unsigned long long)pkt->req->getPaddr());
+        warn_once("AMTC_CU_DATA_MEMSYNC_SEND tick=%llu cu=%d pkt=%p "
+                  "gpuDynInst=%p isInvL1=%d isInvL2=%d kern=%d "
+                  "requestor=%d paddr=%#llx\n",
+                  (unsigned long long)curTick(), computeUnit->cu_id, pkt,
+                  gpuDynInst.get(), pkt->req->isInvL1(), pkt->req->isInvL2(),
+                  gpuDynInst ? gpuDynInst->kern_id : -1,
+                  pkt->req->requestorId(),
+                  (unsigned long long)pkt->req->getPaddr());
     }
 
     /*
@@ -2126,12 +2208,12 @@ ComputeUnit::DataPort::processMemReqEvent(PacketPtr pkt)
      * feeding it through the normal CU response path.
      */
     if (is_plain_kernel_memsync) {
-        warn("AMTC_CU_DATA_MEMSYNC_PLAIN_LOCAL_COMPLETE tick=%llu "
-             "cu=%d pkt=%p gpuDynInst=%p kern=%d requestor=%d paddr=%#llx\n",
-             (unsigned long long)curTick(), computeUnit->cu_id, pkt,
-             gpuDynInst.get(), gpuDynInst ? gpuDynInst->kern_id : -1,
-             pkt->req->requestorId(),
-             (unsigned long long)pkt->req->getPaddr());
+        warn_once(
+            "AMTC_CU_DATA_MEMSYNC_PLAIN_LOCAL_COMPLETE tick=%llu "
+            "cu=%d pkt=%p gpuDynInst=%p kern=%d requestor=%d paddr=%#llx\n",
+            (unsigned long long)curTick(), computeUnit->cu_id, pkt,
+            gpuDynInst.get(), gpuDynInst ? gpuDynInst->kern_id : -1,
+            pkt->req->requestorId(), (unsigned long long)pkt->req->getPaddr());
 
         pkt->makeResponse();
 
@@ -2144,20 +2226,45 @@ ComputeUnit::DataPort::processMemReqEvent(PacketPtr pkt)
         return;
     }
 
+    if (gpuDynInst && computeUnit->cu_id == 0 && gpuDynInst->simdId == 0 &&
+        gpuDynInst->wfSlotId == 0) {
+        warn_once(
+            "AMTC_CU_DATA_REQ_EVENT tick=%llu cu=%d simd=%d wf=%d wfDyn=%d "
+            "kern=%d seq=%llu port=%d cmd=%s paddr=%#llx system=%d "
+            "inst=%s\n",
+            (unsigned long long)curTick(), computeUnit->cu_id,
+            gpuDynInst->simdId, gpuDynInst->wfSlotId, gpuDynInst->wfDynId,
+            gpuDynInst->kern_id, (unsigned long long)gpuDynInst->seqNum(), id,
+            pkt->cmdString().c_str(), (unsigned long long)pkt->req->getPaddr(),
+            pkt->req->systemReq(), gpuDynInst->disassemble().c_str());
+    }
+
     if (pkt->req->systemReq()) {
         assert(compute_unit->shader->systemHub);
         SystemHubEvent *resp_event = new SystemHubEvent(pkt, this);
         compute_unit->shader->systemHub->sendRequest(pkt, resp_event);
     } else if (!(sendTimingReq(pkt))) {
         if (is_kernel_memsync) {
-            warn("AMTC_CU_DATA_MEMSYNC_SEND_STALL tick=%llu cu=%d "
-                 "pkt=%p kern=%d isInvL1=%d isInvL2=%d\n",
-                 (unsigned long long)curTick(), computeUnit->cu_id, pkt,
-                 gpuDynInst ? gpuDynInst->kern_id : -1, pkt->req->isInvL1(),
-                 pkt->req->isInvL2());
+            warn_once("AMTC_CU_DATA_MEMSYNC_SEND_STALL tick=%llu cu=%d "
+                      "pkt=%p kern=%d isInvL1=%d isInvL2=%d\n",
+                      (unsigned long long)curTick(), computeUnit->cu_id, pkt,
+                      gpuDynInst ? gpuDynInst->kern_id : -1,
+                      pkt->req->isInvL1(), pkt->req->isInvL2());
         }
 
         retries.emplace_back(pkt, gpuDynInst);
+
+        if (gpuDynInst && computeUnit->cu_id == 0 && gpuDynInst->simdId == 0 &&
+            gpuDynInst->wfSlotId == 0) {
+            warn_once("AMTC_CU_DATA_REQ_STALL tick=%llu cu=%d simd=%d wf=%d "
+                      "wfDyn=%d seq=%llu port=%d paddr=%#llx retries=%llu\n",
+                      (unsigned long long)curTick(), computeUnit->cu_id,
+                      gpuDynInst->simdId, gpuDynInst->wfSlotId,
+                      gpuDynInst->wfDynId,
+                      (unsigned long long)gpuDynInst->seqNum(), id,
+                      (unsigned long long)pkt->req->getPaddr(),
+                      (unsigned long long)retries.size());
+        }
 
         if (gpuDynInst) {
             DPRINTF(GPUPort,
@@ -2167,11 +2274,22 @@ ComputeUnit::DataPort::processMemReqEvent(PacketPtr pkt)
         }
     } else {
         if (is_kernel_memsync) {
-            warn("AMTC_CU_DATA_MEMSYNC_SEND_OK tick=%llu cu=%d "
-                 "pkt=%p kern=%d isInvL1=%d isInvL2=%d\n",
-                 (unsigned long long)curTick(), computeUnit->cu_id, pkt,
-                 gpuDynInst ? gpuDynInst->kern_id : -1, pkt->req->isInvL1(),
-                 pkt->req->isInvL2());
+            warn_once("AMTC_CU_DATA_MEMSYNC_SEND_OK tick=%llu cu=%d "
+                      "pkt=%p kern=%d isInvL1=%d isInvL2=%d\n",
+                      (unsigned long long)curTick(), computeUnit->cu_id, pkt,
+                      gpuDynInst ? gpuDynInst->kern_id : -1,
+                      pkt->req->isInvL1(), pkt->req->isInvL2());
+        }
+
+        if (gpuDynInst && computeUnit->cu_id == 0 && gpuDynInst->simdId == 0 &&
+            gpuDynInst->wfSlotId == 0) {
+            warn_once("AMTC_CU_DATA_REQ_SENT tick=%llu cu=%d simd=%d wf=%d "
+                      "wfDyn=%d seq=%llu port=%d paddr=%#llx\n",
+                      (unsigned long long)curTick(), computeUnit->cu_id,
+                      gpuDynInst->simdId, gpuDynInst->wfSlotId,
+                      gpuDynInst->wfDynId,
+                      (unsigned long long)gpuDynInst->seqNum(), id,
+                      (unsigned long long)pkt->req->getPaddr());
         }
 
         if (gpuDynInst) {

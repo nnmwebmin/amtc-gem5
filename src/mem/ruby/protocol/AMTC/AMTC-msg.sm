@@ -56,6 +56,12 @@ enumeration(CoherenceRequestType, desc="...") {
   GETX,      desc="Get eXclusive";
   GETS,      desc="Get Shared";
   InvCache,  desc="Invalidate TCC cache entry from TCP";
+
+  // GPU atomic requests. Keep the return/no-return distinction because
+  // GPUCoalescer requires the original value for ATOMIC_RETURN operations
+  // such as atomicAdd() and atomicMax().
+  AtomicReturn,   desc="GPU atomic operation returning the original value";
+  AtomicNoReturn, desc="GPU atomic operation without a return value";
 }
 
 // PersistentType
@@ -119,6 +125,15 @@ structure(RequestMsg, desc="...", interface="Message") {
   MessageSizeType MessageSize, desc="size category of the message";
   RubyAccessMode AccessMode,    desc="user/supervisor access type";
   PrefetchBit Prefetch,         desc="Is this a prefetch request";
+
+  /*
+   * GPU atomic transport.
+   *
+   * Do not collapse AtomicReturn into GETX. Parallel GPU code may depend
+   * on the returned pre-RMW value.
+   */
+  WriteMask writeMask,              desc="GPU atomic/write operation mask";
+  uint64_t instSeqNum, default="0", desc="Originating GPU instruction sequence number";
 
   // AMTC request-intent fields for 64B block / 2 x 32B logical sectors.
   // Requests state what the requester wants; validity and token ownership

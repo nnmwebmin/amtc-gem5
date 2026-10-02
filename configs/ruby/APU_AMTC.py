@@ -388,8 +388,8 @@ def define_options(parser):
 
     # VIPER GPU Options
     parser.add_argument("--num-subcaches", type=int, default=4)
-    #parser.add_argument("--l3-data-latency", type=int, default=20)
-    #parser.add_argument("--l3-tag-latency", type=int, default=15)
+    # parser.add_argument("--l3-data-latency", type=int, default=20)
+    # parser.add_argument("--l3-tag-latency", type=int, default=15)
     parser.add_argument("--cpu-to-dir-latency", type=int, default=20)
     parser.add_argument("--gpu-to-dir-latency", type=int, default=20)
     parser.add_argument(
@@ -480,7 +480,7 @@ def construct_l2s(options, system, ruby_system, network):
         l2_cntrl.GlobalRequestToL2Cache.in_port = network.out_port
         l2_cntrl.responseToL2Cache = MessageBuffer()
         l2_cntrl.responseToL2Cache.in_port = network.out_port
-        l2_cntrl.triggerQueue = MessageBuffer(ordered=True) 
+        l2_cntrl.triggerQueue = MessageBuffer(ordered=True)
 
         exec("ruby_system.l2_cntrl%d = l2_cntrl" % i)
         l2_cntrl_nodes.append(l2_cntrl)
@@ -526,6 +526,14 @@ def construct_dirs(options, system, ruby_system, network):
 
         dir_cntrl.requestFromDir = MessageBuffer()
         dir_cntrl.requestFromDir.out_port = network.in_port
+
+        # V85C: Directory -> CPU/L2 ownership recalls, vnet 2
+        dir_cntrl.cpuProbeFromDir = MessageBuffer()
+        dir_cntrl.cpuProbeFromDir.out_port = network.in_port
+
+        # V81: Directory -> TCC probes, matching TCC probeFromNB vnet 0
+        dir_cntrl.gpuProbeFromDir = MessageBuffer()
+        dir_cntrl.gpuProbeFromDir.out_port = network.in_port
         dir_cntrl.responseFromDir = MessageBuffer()
         dir_cntrl.responseFromDir.out_port = network.in_port
         dir_cntrl.persistentFromDir = MessageBuffer()
@@ -596,6 +604,14 @@ def construct_gpudirs(options, system, ruby_system, network):
 
         dir_cntrl.requestFromDir = MessageBuffer()
         dir_cntrl.requestFromDir.out_port = network.in_port
+
+        # V85C: Directory -> CPU/L2 ownership recalls, vnet 2
+        dir_cntrl.cpuProbeFromDir = MessageBuffer()
+        dir_cntrl.cpuProbeFromDir.out_port = network.in_port
+
+        # V81: Directory -> TCC probes, matching TCC probeFromNB vnet 0
+        dir_cntrl.gpuProbeFromDir = MessageBuffer()
+        dir_cntrl.gpuProbeFromDir.out_port = network.in_port
 
         dir_cntrl.responseFromDir = MessageBuffer()
         dir_cntrl.responseFromDir.out_port = network.in_port
@@ -840,8 +856,6 @@ def construct_tccs(options, system, ruby_system, network):
         tcc_cntrl.requestToNB.out_port = network.in_port
         tcc_cntrl.responseToNB = MessageBuffer()
         tcc_cntrl.responseToNB.out_port = network.in_port
-        tcc_cntrl.unblockToNB = MessageBuffer()
-        tcc_cntrl.unblockToNB.out_port = network.in_port
         tcc_cntrl.triggerQueue = MessageBuffer(ordered=True)
         # Update to the new Funnel port name:
         tcc_cntrl.L1RequestToL2Cache = MessageBuffer(ordered=True)

@@ -115,8 +115,8 @@ PowerState::set(enums::PwrState p)
     // Any state change related stats would have been recorded on previous call
     // to this function.
     if (prvEvalTick == curTick() && curTick() != 0) {
-        warn("PowerState: More than one power state change request "
-             "encountered within the same simulation tick");
+        warn_once("PowerState: More than one power state change request "
+                  "encountered within the same simulation tick");
         _currState = p;
         return;
     }

@@ -380,6 +380,33 @@ parser.add_argument(
     help="Download resources to this directory",
 )
 
+parser.add_argument(
+    "--amtc-mode",
+    choices=["functional", "profile", "performance", "strict"],
+    default="functional",
+)
+
+parser.add_argument("--amtc-retry-threshold", type=int, default=1)
+parser.add_argument("--amtc-fixed-timeout", type=int, default=100)
+parser.add_argument("--amtc-reissue-latency", type=int, default=10)
+parser.add_argument("--amtc-use-timeout", type=int, default=50)
+
+parser.add_argument(
+    "--amtc-dynamic-timeout", action="store_true", default=True
+)
+
+parser.add_argument(
+    "--no-amtc-dynamic-timeout",
+    dest="amtc_dynamic_timeout",
+    action="store_false",
+)
+
+parser.add_argument("--amtc-l2-filtering", action="store_true", default=True)
+
+parser.add_argument(
+    "--no-amtc-l2-filtering", dest="amtc_l2_filtering", action="store_false"
+)
+
 Ruby.define_options(parser)
 GPUTLBOptions.tlb_options(parser)
 
@@ -807,8 +834,9 @@ for i in range(len(dma_list)):
         dbg(f"Set clock domain for system.ruby.dma_cntrl{i}")
     else:
         dbg(
-            f"Warning: Could not find dma_cntrl{i} to assign clock domain.
-            Skipping.")
+            f"Warning: Could not find dma_cntrl{i} to assign clock domain. "
+            "Skipping."
+        )
 # dbg_banner("CPU to Ruby port mapping")
 
 for i in range(args.num_cpus):

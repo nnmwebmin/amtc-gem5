@@ -77,13 +77,47 @@ amtcTraceDmaPort(const std::string &port_name)
 
 } // anonymous namespace
 
-DmaPort::DmaPort(ClockedObject *dev, System *s,
-                 std::optional<uint32_t> sid, std::optional<uint32_t> ssid)
+DmaPort::DmaPort(ClockedObject *dev, System *s, std::optional<uint32_t> sid,
+                 std::optional<uint32_t> ssid)
     : RequestPort(dev->name() + ".dma"),
-      device(dev), sys(s), requestorId(s->getRequestorId(dev)),
-      sendEvent([this]{ sendDma(); }, dev->name()),
-      defaultSid(sid), defaultSSid(ssid), cacheLineSize(s->cacheLineSize())
+      device(dev),
+      sys(s),
+      requestorId(s->getRequestorId(dev)),
+      sendEvent([this] { sendDma(); }, dev->name()),
+      amtcDmaWatchdogEvent([this] { amtcDmaWatchdog(); },
+                           dev->name() + ".amtcDmaWatchdog"),
+      defaultSid(sid),
+      defaultSSid(ssid),
+      cacheLineSize(s->cacheLineSize())
 { }
+
+void
+DmaPort::amtcDmaWatchdog()
+{
+    if (!amtcDmaTraceValid) {
+        return;
+    }
+
+    const Tick age = curTick() - amtcDmaTraceIssueTick;
+
+    warn("AMTC_DMADEV_STUCK_PENDING tick=%llu port=%s addr=%#lx "
+         "size=%u cmd=%s age=%llu pending=%u retryPending=%d "
+         "inRetry=%p inRetry_addr=%#lx inRetry_size=%u inRetry_cmd=%s "
+         "transmitList=%llu sendEvent=%d\n",
+         (unsigned long long)curTick(), name().c_str(),
+         (unsigned long)amtcDmaTraceAddr, amtcDmaTraceSize,
+         amtcDmaTraceCmd.c_str(), (unsigned long long)age, pendingCount,
+         retryPending, inRetry,
+         inRetry ? (unsigned long)inRetry->getAddr() : 0UL,
+         inRetry ? inRetry->getSize() : 0,
+         inRetry ? inRetry->cmdString().c_str() : "none",
+         (unsigned long long)transmitList.size(), sendEvent.scheduled());
+
+    if ((pendingCount != 0 || retryPending || inRetry) &&
+        !amtcDmaWatchdogEvent.scheduled()) {
+        device->schedule(amtcDmaWatchdogEvent, curTick() + 5000000);
+    }
+}
 
 void
 DmaPort::handleRespPacket(PacketPtr pkt, Tick delay)
@@ -182,12 +216,18 @@ DmaPort::DmaReqState::createPacket()
 bool
 DmaPort::recvTimingResp(PacketPtr pkt)
 {
-    if (amtcTraceDmaAddr(pkt->getAddr()) || amtcTraceDmaPort(name())) {
+    const Addr resp_addr = pkt->getAddr();
+    const unsigned resp_size = pkt->getSize();
+
+    if (amtcTraceDmaAddr(resp_addr) || amtcTraceDmaPort(name())) {
         warn("AMTC_DMADEV_RECV_TIMING_RESP tick=%llu port=%s pkt=%p cmd=%s "
-             "addr=%#lx size=%u is_resp=%d error=%d pending=%u\n",
+             "addr=%#lx size=%u is_resp=%d error=%d pending=%u "
+             "trace_valid=%d trace_addr=%#lx trace_cmd=%s\n",
              (unsigned long long)curTick(), name().c_str(), pkt,
-             pkt->cmdString().c_str(), (unsigned long)pkt->getAddr(),
-             pkt->getSize(), pkt->isResponse(), pkt->isError(), pendingCount);
+             pkt->cmdString().c_str(), (unsigned long)resp_addr, resp_size,
+             pkt->isResponse(), pkt->isError(), pendingCount,
+             amtcDmaTraceValid, (unsigned long)amtcDmaTraceAddr,
+             amtcDmaTraceCmd.c_str());
     }
 
     // We shouldn't ever get a cacheable block in Modified state.
@@ -195,6 +235,22 @@ DmaPort::recvTimingResp(PacketPtr pkt)
            !(pkt->cacheResponding() && !pkt->hasSharers()));
 
     handleRespPacket(pkt);
+
+    if (amtcDmaTraceValid &&
+        (resp_addr == amtcDmaTraceAddr || pendingCount == 0)) {
+        warn("AMTC_DMADEV_PENDING_CLEARED tick=%llu port=%s resp_addr=%#lx "
+             "resp_size=%u trace_addr=%#lx trace_size=%u trace_cmd=%s "
+             "pending=%u\n",
+             (unsigned long long)curTick(), name().c_str(),
+             (unsigned long)resp_addr, resp_size,
+             (unsigned long)amtcDmaTraceAddr, amtcDmaTraceSize,
+             amtcDmaTraceCmd.c_str(), pendingCount);
+
+        amtcDmaTraceValid = false;
+        if (amtcDmaWatchdogEvent.scheduled()) {
+            device->deschedule(amtcDmaWatchdogEvent);
+        }
+    }
 
     return true;
 }
@@ -346,6 +402,11 @@ DmaPort::abortPending()
 
     if (pendingCount == 0)
         signalDrainDone();
+
+    amtcDmaTraceValid = false;
+    if (amtcDmaWatchdogEvent.scheduled()) {
+        device->deschedule(amtcDmaWatchdogEvent);
+    }
 }
 
 void
@@ -386,6 +447,18 @@ DmaPort::trySendTimingReq()
     const bool accepted = sendTimingReq(pkt);
     if (accepted) {
         pendingCount++;
+
+        if (trace_pkt) {
+            amtcDmaTraceValid = true;
+            amtcDmaTraceAddr = trace_addr;
+            amtcDmaTraceSize = trace_size;
+            amtcDmaTraceCmd = trace_cmd;
+            amtcDmaTraceIssueTick = curTick();
+
+            if (!amtcDmaWatchdogEvent.scheduled()) {
+                device->schedule(amtcDmaWatchdogEvent, curTick() + 5000000);
+            }
+        }
     } else {
         retryPending = true;
         inRetry = pkt;
@@ -394,10 +467,13 @@ DmaPort::trySendTimingReq()
     if (trace_pkt) {
         warn("AMTC_DMADEV_SEND_AFTER tick=%llu port=%s pkt=%p addr=%#lx "
              "ok=%d last=%d pending=%u retryPending=%d inRetry=%p "
+             "trace_valid=%d trace_addr=%#lx trace_cmd=%s "
              "transmitList=%llu sendEvent=%d\n",
              (unsigned long long)curTick(), name().c_str(), trace_pkt_ptr,
              (unsigned long)trace_addr, accepted, last, pendingCount,
-             retryPending, inRetry, (unsigned long long)transmitList.size(), sendEvent.scheduled());
+             retryPending, inRetry, amtcDmaTraceValid,
+             (unsigned long)amtcDmaTraceAddr, amtcDmaTraceCmd.c_str(),
+             (unsigned long long)transmitList.size(), sendEvent.scheduled());
     }
     if (!retryPending) {
         state->gen.next();

@@ -139,6 +139,7 @@ machine(MachineType:L1Cache, "Token protocol")
     Transient_GETX,  desc="A GetX from another processor";
     Transient_Local_GETX,  desc="A GetX from another processor";
     Transient_GETS,  desc="A GetS from another processor";
+    Transient_GETS_Owner_Pull, desc="Directory DMA-read data-only owner pull";
     Transient_Local_GETS,  desc="A GetS from another processor";
     Transient_GETS_Last_Token,  desc="A GetS from another processor";
     Transient_Local_GETS_Last_Token,  desc="A GetS from another processor";
@@ -645,6 +646,12 @@ machine(MachineType:L1Cache, "Token protocol")
       assert(cache_entry.TokensSec0 >= 0);
       assert(cache_entry.TokensSec1 >= 0);
 
+      // V85S-r8 fundamental data-authority invariant:
+      // dirty sector => authoritative bytes are resident and valid.
+      assert(amtc_intersectMasks(cache_entry.DirtySectors,
+                                 cache_entry.ValidSectors) ==
+             cache_entry.DirtySectors);
+
       // In AMTC, the whole line's max_tokens() is divided equally among sectors
       int tokens_per_sector := max_tokens() / 2;
 
@@ -1057,26 +1064,6 @@ machine(MachineType:L1Cache, "Token protocol")
                                          tbe.RequestedSectorMask);
             }
 
-            bool self_owner_token_read_ready := false;
-            if (is_valid(tbe) && is_valid(cache_entry) &&
-                tbe.TypeOfAccess == AccessType:Read &&
-                ack_has_all_requested_tokens &&
-                !data_already_ready &&
-                (cache_entry.CacheState == State:M ||
-                 cache_entry.CacheState == State:MM ||
-                 cache_entry.CacheState == State:M_W ||
-                 cache_entry.CacheState == State:MM_W ||
-                 cache_entry.CacheState == State:M_IS ||
-                 tbe.TBEState == State:M_IS)) {
-                // L1 is already the modified owner but a stale/narrow
-                // ValidSectors bitmap made it issue GETS for a sector.  L2 may
-                // return the missing token-only ACK, while Directory returns
-                // zero-token ACK_OWNER because it believes this same L1 is the
-                // owner.  Route this to an explicit self-owner read repair
-                // transition instead of retrying forever.
-                self_owner_token_read_ready := true;
-            }
-
             bool stale_owner_read_ack := false;
             if (is_valid(tbe) &&
                 in_msg.Type == CoherenceResponseType:ACK_OWNER &&
@@ -1131,21 +1118,9 @@ machine(MachineType:L1Cache, "Token protocol")
                 }
             }
 
-            if (ack_has_all_requested_tokens &&
-                (data_already_ready || self_owner_token_read_ready)) {
-                // Token-only completion is allowed only when the requested
-                // sector bytes are already present in L1.  A Store_Sector_Miss
-                // into an invalid/unowned sector still needs DATA_OWNER/DATA_SHARED
-                // so the partial store can merge with the old bytes.  Directory
-                // CS+CPU_GETX must therefore return data+tokens, not a bare ACK.
-                // Self-owner read repair is handled by the M_IS Ack_All_Tokens transition.
-                if (self_owner_token_read_ready) {
-                    DPRINTF(RubySlicc,
-                            "AMTC_L1_ROUTE_SELF_OWNER_TOKEN_READ_REPAIR addr=%#x mask=%x T0=%d T1=%d inT0=%d inT1=%d\n",
-                            in_msg.addr, tbe.RequestedSectorMask,
-                            cache_entry.TokensSec0, cache_entry.TokensSec1,
-                            in_msg.TokensSec0, in_msg.TokensSec1);
-                }
+            if (ack_has_all_requested_tokens && data_already_ready) {
+                // V85S: a control ACK can complete only when requested bytes
+                // are already resident.  Tokens alone never create data.
                 trigger(Event:Ack_All_Tokens, in_msg.addr, cache_entry, tbe);
             } else if (stale_owner_read_ack) {
                 trigger(Event:Stale_Owner_Ack, in_msg.addr, cache_entry, tbe);
@@ -1241,8 +1216,40 @@ machine(MachineType:L1Cache, "Token protocol")
                     cache_entry, tbe);
           }
         } else if (in_msg.Type == CoherenceRequestType:GETS) {
-          if (getTokens(cache_entry,amtc_fullMask()) == 1 ||
-              getTokens(cache_entry,amtc_fullMask()) == (max_tokens() / 2) + 1) {
+          // V85S-r12: Directory DMA-read owner pulls are observational reads.
+          // They must return bytes without donating tokens or changing the
+          // local coherence state.  Classify them before normal GETS/last-token
+          // logic, which intentionally transfers physical tokens.
+          if (in_msg.is_owner_pull &&
+              machineIDToMachineType(in_msg.Requestor) == MachineType:Directory) {
+            trigger(Event:Transient_GETS_Owner_Pull, in_msg.addr,
+                    cache_entry, tbe);
+          } else {
+          // V85S-r8: "last token" is a per-requested-sector property.
+          // The old full-line total test (1 or 513) misses cases such as
+          // requested sector=1 token while the other sector holds 511 tokens.
+          int req_mask := in_msg.requested_sector_mask;
+          if (req_mask == 0) { req_mask := in_msg.sector_mask; }
+          if (req_mask == 0) { req_mask := amtc_fullMask(); }
+          req_mask := amtc_sanitizeMask(req_mask);
+
+          bool requested_last_token := false;
+          if (amtc_maskHasSector(req_mask, 0) &&
+              getTokens(cache_entry, 1) == 1) {
+            requested_last_token := true;
+          }
+          if (amtc_maskHasSector(req_mask, 1) &&
+              getTokens(cache_entry, 2) == 1) {
+            requested_last_token := true;
+          }
+
+          DPRINTF(RubySlicc,
+                  "AMTC_L1_GETS_LAST_TOKEN_CLASSIFY_V85S_R8 addr=%#x req=%x T0=%d T1=%d last=%d\n",
+                  in_msg.addr, req_mask,
+                  getTokens(cache_entry, 1), getTokens(cache_entry, 2),
+                  requested_last_token);
+
+          if (requested_last_token) {
             if (in_msg.isLocal) {
               trigger(Event:Transient_Local_GETS_Last_Token, in_msg.addr,
                       cache_entry, tbe);
@@ -1262,6 +1269,7 @@ machine(MachineType:L1Cache, "Token protocol")
                       cache_entry, tbe);
             }
           }
+          } // !Directory owner-pull GETS
         } else {
           error("Unexpected message");
         }
@@ -1292,27 +1300,8 @@ machine(MachineType:L1Cache, "Token protocol")
             if (amtc_maskHasSector(needed_mask, 0) && L1Icache_entry.TokensSec0 == 0) { has_tokens := false; }
             if (amtc_maskHasSector(needed_mask, 1) && L1Icache_entry.TokensSec1 == 0) { has_tokens := false; }
 
-            bool owns_requested_tokens := true;
-            int ifetch_tokens_per_sector := max_tokens() / 2;
-            if (amtc_maskHasSector(needed_mask, 0) && L1Icache_entry.TokensSec0 < ifetch_tokens_per_sector) { owns_requested_tokens := false; }
-            if (amtc_maskHasSector(needed_mask, 1) && L1Icache_entry.TokensSec1 < ifetch_tokens_per_sector) { owns_requested_tokens := false; }
 
-            if (!has_data && owns_requested_tokens &&
-                (L1Icache_entry.CacheState == State:M ||
-                 L1Icache_entry.CacheState == State:MM ||
-                 L1Icache_entry.CacheState == State:M_W ||
-                 L1Icache_entry.CacheState == State:MM_W)) {
-              // Self-owner repair: Directory's CE state assumes this L1 owns
-              // the bytes.  If this entry owns all requested tokens but its
-              // ValidSectors bit is stale/narrow, do not send GETS to self via
-              // Directory; mark the local sector valid and satisfy the request.
-              L1Icache_entry.ValidSectors := amtc_unionMasks(L1Icache_entry.ValidSectors, needed_mask);
-              DPRINTF(RubySlicc,
-                      "AMTC_L1_SELF_OWNER_VALID_REPAIR_IFETCH addr=%#x mask=%x valid=%x T0=%d T1=%d\n",
-                      in_msg.LineAddress, needed_mask, L1Icache_entry.ValidSectors,
-                      L1Icache_entry.TokensSec0, L1Icache_entry.TokensSec1);
-              trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.LineAddress, L1Icache_entry, tbe);
-            } else if (!has_data || !has_tokens) {
+            if (!has_data || !has_tokens) {
               trigger(Event:Load_Sector_Miss, in_msg.LineAddress, L1Icache_entry, tbe);
             } else {
               trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.LineAddress, L1Icache_entry, tbe);
@@ -1339,27 +1328,8 @@ machine(MachineType:L1Cache, "Token protocol")
             if (amtc_maskHasSector(needed_mask, 0) && L1Dcache_entry.TokensSec0 == 0) { has_tokens := false; }
             if (amtc_maskHasSector(needed_mask, 1) && L1Dcache_entry.TokensSec1 == 0) { has_tokens := false; }
 
-            bool owns_requested_tokens_data := true;
-            int load_tokens_per_sector := max_tokens() / 2;
-            if (amtc_maskHasSector(needed_mask, 0) && L1Dcache_entry.TokensSec0 < load_tokens_per_sector) { owns_requested_tokens_data := false; }
-            if (amtc_maskHasSector(needed_mask, 1) && L1Dcache_entry.TokensSec1 < load_tokens_per_sector) { owns_requested_tokens_data := false; }
 
-            if (!has_data && owns_requested_tokens_data &&
-                (L1Dcache_entry.CacheState == State:M ||
-                 L1Dcache_entry.CacheState == State:MM ||
-                 L1Dcache_entry.CacheState == State:M_W ||
-                 L1Dcache_entry.CacheState == State:MM_W)) {
-                // Self-owner repair: the Directory is in CE and will only send
-                // zero-token ACK_OWNER back to this same L1.  The L1 already
-                // owns the requested sector's full token set, so the missing
-                // ValidSectors bit is stale.  Repair it locally and hit.
-                L1Dcache_entry.ValidSectors := amtc_unionMasks(L1Dcache_entry.ValidSectors, needed_mask);
-                DPRINTF(RubySlicc,
-                        "AMTC_L1_SELF_OWNER_VALID_REPAIR_LOAD addr=%#x mask=%x valid=%x T0=%d T1=%d\n",
-                        in_msg.LineAddress, needed_mask, L1Dcache_entry.ValidSectors,
-                        L1Dcache_entry.TokensSec0, L1Dcache_entry.TokensSec1);
-                trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.LineAddress, L1Dcache_entry, tbe);
-            } else if (!has_data || !has_tokens) {
+            if (!has_data || !has_tokens) {
                 trigger(Event:Load_Sector_Miss, in_msg.LineAddress, L1Dcache_entry, tbe);
             } else {
                 trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.LineAddress, L1Dcache_entry, tbe);
@@ -1382,12 +1352,28 @@ machine(MachineType:L1Cache, "Token protocol")
           Entry L1Dcache_entry := getL1DCacheEntry(in_msg.LineAddress);
           if (is_valid(L1Dcache_entry)) {
             bool has_write_permission := true;
+            bool has_store_data :=
+                (amtc_intersectMasks(L1Dcache_entry.ValidSectors,
+                                     needed_mask) == needed_mask);
             int tokens_per_sector := max_tokens() / 2;
 
             if (amtc_maskHasSector(needed_mask, 0) && L1Dcache_entry.TokensSec0 < tokens_per_sector) { has_write_permission := false; }
             if (amtc_maskHasSector(needed_mask, 1) && L1Dcache_entry.TokensSec1 < tokens_per_sector) { has_write_permission := false; }
 
-            if (!has_write_permission) {
+            // V85S-r9: exclusive tokens are permission, not data.  A partial
+            // store/RFO must not hit locally unless the old bytes for every
+            // requested sector are actually resident.  If ownership is already
+            // complete but data is missing, route through Store_Sector_Miss;
+            // r7's data-only owner-pull obtains the authoritative bytes.
+            if (!has_write_permission || !has_store_data) {
+                if (has_write_permission && !has_store_data) {
+                  DPRINTF(RubySlicc,
+                          "AMTC_L1_STORE_FULL_OWNER_DATA_MISS_V85S_R9 addr=%#x mask=%x valid=%x T0=%d T1=%d\n",
+                          in_msg.LineAddress, needed_mask,
+                          L1Dcache_entry.ValidSectors,
+                          L1Dcache_entry.TokensSec0,
+                          L1Dcache_entry.TokensSec1);
+                }
                 trigger(Event:Store_Sector_Miss, in_msg.LineAddress, L1Dcache_entry, tbe);
             } else {
                 trigger(mandatory_request_type_to_event(in_msg.Type), in_msg.LineAddress, L1Dcache_entry, tbe);
@@ -1829,6 +1815,107 @@ action(a_issueReadRequest, "a", desc="Issue GETS") {
     }
   }
 
+  // V85S-r12: coherent DMA reads are data-only observations.  A Directory
+  // owner-pull must never consume a token or downgrade/invalidate the L1.
+  action(dop_sendDataOnlyOwnerPullV85S12, "dop12",
+         desc="Return requested owner bytes to Directory without moving tokens") {
+    peek(requestNetwork_in, RequestMsg) {
+      assert(is_valid(cache_entry));
+      int req_mask := in_msg.requested_sector_mask;
+      if (req_mask == 0) { req_mask := in_msg.sector_mask; }
+      if (req_mask == 0) { req_mask := amtc_fullMask(); }
+      req_mask := amtc_sanitizeMask(req_mask);
+
+      assert(amtc_intersectMasks(cache_entry.DirtySectors,
+                                 cache_entry.ValidSectors) ==
+             cache_entry.DirtySectors);
+
+      int send_valid_mask :=
+          amtc_intersectMasks(cache_entry.ValidSectors, req_mask);
+
+      if (amtc_maskContainsAll(send_valid_mask, req_mask)) {
+        enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceResponseType:DATA_SHARED;
+          out_msg.Sender := machineID;
+          out_msg.Destination.add(in_msg.Requestor);
+          out_msg.TokensSec0 := 0;
+          out_msg.TokensSec1 := 0;
+          out_msg.Dirty := false;
+          out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+          out_msg.sector_mask := req_mask;
+          out_msg.requested_sector_mask := req_mask;
+          out_msg.token_sector_mask := 0;
+          out_msg.valid_sector_mask := req_mask;
+          out_msg.merged_resp := false;
+          if (amtc_maskHasSector(req_mask, 0)) {
+            out_msg.DataBlk.copyPartial(cache_entry.DataBlk, 0, 32);
+          }
+          if (amtc_maskHasSector(req_mask, 1)) {
+            out_msg.DataBlk.copyPartial(cache_entry.DataBlk, 32, 32);
+          }
+          out_msg.MessageSize := amtc_getSizeFromDirtyMask(req_mask);
+        }
+        DPRINTF(RubySlicc,
+                "AMTC_L1_DMA_READ_OWNER_PULL_DATA_V85S_R12 addr=%#x req=%d valid=%d dirty=%d T0=%d T1=%d\n",
+                address, req_mask, cache_entry.ValidSectors,
+                cache_entry.DirtySectors, cache_entry.TokensSec0,
+                cache_entry.TokensSec1);
+      } else {
+        // Partial/missing bytes cannot safely be reconstructed from memory when
+        // another requested sector may be dirty.  Return only a zero-token NACK;
+        // Directory waits for another local holder rather than fabricating tokens.
+        enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceResponseType:ACK_OWNER;
+          out_msg.Sender := machineID;
+          out_msg.Destination.add(in_msg.Requestor);
+          out_msg.TokensSec0 := 0;
+          out_msg.TokensSec1 := 0;
+          out_msg.Dirty := false;
+          out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+          out_msg.sector_mask := req_mask;
+          out_msg.requested_sector_mask := req_mask;
+          out_msg.token_sector_mask := 0;
+          out_msg.valid_sector_mask := 0;
+          out_msg.merged_resp := false;
+          out_msg.MessageSize := MessageSizeType:Response_Control;
+        }
+        DPRINTF(RubySlicc,
+                "AMTC_L1_DMA_READ_OWNER_PULL_NO_DATA_V85S_R12 addr=%#x req=%d valid=%d dirty=%d T0=%d T1=%d\n",
+                address, req_mask, cache_entry.ValidSectors,
+                cache_entry.DirtySectors, cache_entry.TokensSec0,
+                cache_entry.TokensSec1);
+      }
+    }
+  }
+
+  action(doa_sendOwnerPullAckNoDataV85S12, "doa12",
+         desc="Return zero-token owner-pull ACK from non-holder L1") {
+    peek(requestNetwork_in, RequestMsg) {
+      int req_mask := in_msg.requested_sector_mask;
+      if (req_mask == 0) { req_mask := in_msg.sector_mask; }
+      if (req_mask == 0) { req_mask := amtc_fullMask(); }
+      req_mask := amtc_sanitizeMask(req_mask);
+      enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:ACK_OWNER;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.TokensSec0 := 0;
+        out_msg.TokensSec1 := 0;
+        out_msg.Dirty := false;
+        out_msg.sector_id := amtc_primarySectorFromMask(req_mask);
+        out_msg.sector_mask := req_mask;
+        out_msg.requested_sector_mask := req_mask;
+        out_msg.token_sector_mask := 0;
+        out_msg.valid_sector_mask := 0;
+        out_msg.merged_resp := false;
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+      }
+    }
+  }
+
   action(dd_sendDataWithAllTokens, "\d", desc="Send data and all tokens with AMTC sector metadata") {
     peek(requestNetwork_in, RequestMsg) {
       assert(is_valid(cache_entry));
@@ -1842,25 +1929,41 @@ action(a_issueReadRequest, "a", desc="Issue GETS") {
       if (cache_entry.TokensSec0 > 0) { send_token_mask := amtc_unionMasks(send_token_mask, 1); }
       if (cache_entry.TokensSec1 > 0) { send_token_mask := amtc_unionMasks(send_token_mask, 2); }
 
-      int send_valid_mask := amtc_intersectMasks(cache_entry.ValidSectors, req_mask);
+      // V85S-r8: this action transfers ALL local tokens and invalidates the
+      // donor, so it must also transfer every resident valid sector, not only
+      // the currently requested sector.  Otherwise dirty bytes in an
+      // unrequested sector can be discarded when the donor is invalidated.
+      int requested_valid_mask :=
+          amtc_intersectMasks(cache_entry.ValidSectors, req_mask);
+      int send_valid_mask := cache_entry.ValidSectors;
 
-      // Audit59: a forwarded GETX may ask for a sector whose ValidSectors bit
-      // was stale/cleared even though this owner still holds all tokens for
-      // that sector.  Sending all tokens with valid_sector_mask missing the
-      // requested sector makes the requester see Data_All_Tokens, transition
-      // toward MM, but fail the stable-state invariant because the requested
-      // data was never marked received.  If we hold all tokens for a requested
-      // sector, treat the local DataBlk as authoritative for the donation.
-      int tokens_per_sector := max_tokens() / 2;
+      // Dirty metadata is proof that authoritative bytes exist locally.
+      // Never allow a dirty sector to become metadata-only.
+      assert(amtc_intersectMasks(cache_entry.DirtySectors,
+                                 cache_entry.ValidSectors) ==
+             cache_entry.DirtySectors);
+
+      /*
+       * V85S-r7: a token-only owner donation may leave the new owner with
+       * exact ownership but no old bytes for a partial store.  The only safe
+       * fallback is a data-only memory fetch, and that is legal only when the
+       * requested missing sector is clean.  If DirtySectors says otherwise,
+       * the authoritative bytes have been lost and we must fail here rather
+       * than silently consume stale memory.
+       */
       if (amtc_maskHasSector(req_mask, 0) &&
-          cache_entry.TokensSec0 == tokens_per_sector) {
-        send_valid_mask := amtc_unionMasks(send_valid_mask, 1);
+          !amtc_maskHasSector(requested_valid_mask, 0)) {
+        assert(!amtc_maskHasSector(cache_entry.DirtySectors, 0));
       }
       if (amtc_maskHasSector(req_mask, 1) &&
-          cache_entry.TokensSec1 == tokens_per_sector) {
-        send_valid_mask := amtc_unionMasks(send_valid_mask, 2);
+          !amtc_maskHasSector(requested_valid_mask, 1)) {
+        assert(!amtc_maskHasSector(cache_entry.DirtySectors, 1));
       }
 
+      // V85S-r1: token ownership never proves that bytes are valid.
+      // Donate only sectors whose ValidSectors bits are physically present.
+      // A token-only donation is legal; the requester must obtain missing bytes
+      // from another real data source before completing a read/partial store.
       if (send_valid_mask == 0) {
         // Only fall back to current valid sectors when the forwarded request
         // failed to carry a precise sector mask.  Do not satisfy a precise
@@ -1905,9 +2008,14 @@ action(a_issueReadRequest, "a", desc="Issue GETS") {
       }
 
       DPRINTF(RubySlicc,
-              "AMTC_L1_DONATE_ALLTOK_META addr=%#x req=%d valid=%d tokmask=%d t0=%d t1=%d\n",
+              "AMTC_L1_DONATE_ALLTOK_SCOPE_V85S_R8 addr=%#x req=%d reqvalid=%d sendvalid=%d tokmask=%d dirty=%d\n",
+              address, req_mask, requested_valid_mask, send_valid_mask,
+              send_token_mask, cache_entry.DirtySectors);
+      DPRINTF(RubySlicc,
+              "AMTC_L1_DONATE_ALLTOK_META addr=%#x req=%d valid=%d tokmask=%d t0=%d t1=%d dirtymask=%d state=%s\n",
               address, req_mask, send_valid_mask, send_token_mask,
-              cache_entry.TokensSec0, cache_entry.TokensSec1);
+              cache_entry.TokensSec0, cache_entry.TokensSec1,
+              cache_entry.DirtySectors, cache_entry.CacheState);
     }
     cache_entry.TokensSec0 := 0;
     cache_entry.TokensSec1 := 0;
@@ -1968,6 +2076,12 @@ action(a_issueReadRequest, "a", desc="Issue GETS") {
           send_t1 := 1;
           send_token_mask := amtc_unionMasks(send_token_mask, 2);
         }
+
+        // V85S-r8: the non-last-token path must never donate the final
+        // requested-sector token.  If this fires, request classification is
+        // wrong; silently clearing validity would lose dirty-data authority.
+        if (send_t0 > 0) { assert(cache_entry.TokensSec0 > 1); }
+        if (send_t1 > 0) { assert(cache_entry.TokensSec1 > 1); }
 
         enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
           out_msg.addr := address;
@@ -2282,32 +2396,39 @@ action(ee_sendDataWithAllTokens, "\e", desc="Send data and all tokens from cache
   }
 
   action(hh_store_hit, "\\h", desc="CPU store hit") {
+    assert(is_valid(cache_entry));
     L1Dcache.setMRU(cache_entry);
-    sequencer.writeCallback(address, cache_entry.DataBlk, false, MachineType:L1Cache);
-    cache_entry.Dirty := true;
 
-    // Look directly into the CPU queue to get the UNSTRIPPED physical address
+    // Look directly into the CPU queue to get the unstripped physical address.
     peek(mandatoryQueue_in, RubyRequest) {
       int req_offset := getOffset(in_msg.PhysicalAddress);
       int store_mask := amtc_calculateNeededMask(req_offset, in_msg.Size);
+      store_mask := amtc_sanitizeMask(store_mask);
 
-      // Now we accurately dirty ONLY the sector the CPU actually wrote to.
-      // Audit78: a CPU store hit must have exclusive tokens for the written
-      // sector(s).  If stale state classification lets a partial-token sector
-      // reach this action, do not add an illegal dirty bit; log it so the
-      // in_port gating can be fixed without corrupting dirty-token metadata.
       int store_excl_mask := amtc_exclusiveTokenMask(cache_entry);
-      int store_dirty_mask := amtc_intersectMasks(store_mask, store_excl_mask);
+      int store_valid_mask := amtc_intersectMasks(cache_entry.ValidSectors,
+                                                  store_mask);
+      int store_owned_mask := amtc_intersectMasks(store_excl_mask,
+                                                  store_mask);
 
-      if (store_dirty_mask != store_mask) {
-        DPRINTF(RubySlicc,
-                "AMTC_L1_AUDIT78_STORE_DIRTY_MASK_CLAMP addr=%#x store=%x dirty=%x excl=%x valid=%x T0=%d T1=%d\n",
-                address, store_mask, store_dirty_mask, store_excl_mask,
-                cache_entry.ValidSectors, cache_entry.TokensSec0,
-                cache_entry.TokensSec1);
-      }
+      // V85S-r9: a store hit is legal only with both authoritative old bytes
+      // and exact exclusive ownership for every touched sector.  Do not issue
+      // the CPU callback and then clamp metadata; fail at the producer if the
+      // mandatory classifier ever routes an invalid hit here.
+      assert(store_valid_mask == store_mask);
+      assert(store_owned_mask == store_mask);
 
-      cache_entry.DirtySectors := amtc_unionMasks(cache_entry.DirtySectors, store_dirty_mask);
+      sequencer.writeCallback(address, cache_entry.DataBlk, false,
+                              MachineType:L1Cache);
+      cache_entry.Dirty := true;
+      cache_entry.DirtySectors :=
+          amtc_unionMasks(cache_entry.DirtySectors, store_mask);
+
+      DPRINTF(RubySlicc,
+              "AMTC_L1_STORE_HIT_DATA_OWNED_V85S_R9 addr=%#x mask=%x valid=%x dirty=%x excl=%x T0=%d T1=%d\n",
+              address, store_mask, cache_entry.ValidSectors,
+              cache_entry.DirtySectors, store_excl_mask,
+              cache_entry.TokensSec0, cache_entry.TokensSec1);
     }
   }
 
@@ -2361,15 +2482,12 @@ action(ee_sendDataWithAllTokens, "\e", desc="Send data and all tokens from cache
                                 machineIDToMachineType(in_msg.Sender));
 
         int ext_store_excl_mask := amtc_exclusiveTokenMask(cache_entry);
-        int ext_store_dirty_mask := amtc_intersectMasks(store_mask, ext_store_excl_mask);
+        int ext_store_valid_owned_mask :=
+            amtc_intersectMasks(cache_entry.ValidSectors, ext_store_excl_mask);
+        int ext_store_dirty_mask :=
+            amtc_intersectMasks(store_mask, ext_store_valid_owned_mask);
 
-        if (ext_store_dirty_mask != store_mask) {
-          DPRINTF(RubySlicc,
-                  "AMTC_L1_AUDIT78_EXTERNAL_STORE_DIRTY_MASK_CLAMP addr=%#x store=%x dirty=%x excl=%x valid=%x T0=%d T1=%d\n",
-                  address, store_mask, ext_store_dirty_mask, ext_store_excl_mask,
-                  cache_entry.ValidSectors, cache_entry.TokensSec0,
-                  cache_entry.TokensSec1);
-        }
+        assert(ext_store_dirty_mask == store_mask);
 
         if (ext_store_dirty_mask != 0) {
           cache_entry.Dirty := true;
@@ -2555,42 +2673,24 @@ out_msg.TokensSec1 := 0;
     }
   }
 
-  action(q_updateTokensFromResponse, "q", desc="Update token count based on response") {
+  action(q_updateTokensFromResponse, "q", desc="Strict additive token update based on response") {
     peek(responseNetwork_in, ResponseMsg) {
       assert(is_valid(cache_entry));
+
       int tokens_per_sector := max_tokens() / 2;
+      int new_t0 := cache_entry.TokensSec0 + in_msg.TokensSec0;
+      int new_t1 := cache_entry.TokensSec1 + in_msg.TokensSec1;
 
-      // --- 1. Update tokens ---
-      // Token responses can overlap with a token the requester already holds in
-      // S/S_IM/SM.  In particular, the L2 near-token repair may send the
-      // expected remaining grant even when the requester already holds >1 shared
-      // token due to earlier duplicate shared grants.  Clamp per-sector counts
-      // to the architectural max before setState() checks dirty M/MM invariants.
-      int old_t0 := cache_entry.TokensSec0;
-      int old_t1 := cache_entry.TokensSec1;
+      // V85S: every response token is a physical token transfer.  Never clamp
+      // an over-count; an over-count is a protocol-conservation violation.
+      assert(new_t0 >= 0);
+      assert(new_t1 >= 0);
+      assert(new_t0 <= tokens_per_sector);
+      assert(new_t1 <= tokens_per_sector);
 
-      cache_entry.TokensSec0 := cache_entry.TokensSec0 + in_msg.TokensSec0;
-      cache_entry.TokensSec1 := cache_entry.TokensSec1 + in_msg.TokensSec1;
+      cache_entry.TokensSec0 := new_t0;
+      cache_entry.TokensSec1 := new_t1;
 
-      if (cache_entry.TokensSec0 > tokens_per_sector) {
-        DPRINTF(RubySlicc,
-                "AMTC_L1_TOKEN_SATURATE addr=%#x sec=0 old=%d in=%d new=%d cap=%d\n",
-                address, old_t0, in_msg.TokensSec0,
-                cache_entry.TokensSec0, tokens_per_sector);
-        cache_entry.TokensSec0 := tokens_per_sector;
-      }
-      if (cache_entry.TokensSec1 > tokens_per_sector) {
-        DPRINTF(RubySlicc,
-                "AMTC_L1_TOKEN_SATURATE addr=%#x sec=1 old=%d in=%d new=%d cap=%d\n",
-                address, old_t1, in_msg.TokensSec1,
-                cache_entry.TokensSec1, tokens_per_sector);
-        cache_entry.TokensSec1 := tokens_per_sector;
-      }
-
-      // --- 2. Dirty handling ---
-      // Dirty owner data may arrive with partial tokens.  Preserve the dirty
-      // mask, but setState() will keep such a line in an owner/read-only state
-      // unless all dirty sectors become exclusive.
       if (in_msg.Dirty) {
         int resp_dirty_mask := amtc_intersectMasks(in_msg.valid_sector_mask,
                                                    cache_entry.ValidSectors);
@@ -2602,17 +2702,10 @@ out_msg.TokensSec1 := 0;
           amtc_unionMasks(cache_entry.DirtySectors, resp_dirty_mask);
       }
 
-      // --- 3. CRITICAL: Recompute ValidSectors from tokens ---
-//      int new_valid := 0;
-//
-//      if (cache_entry.TokensSec0 == tokens_per_sector) {
-//          new_valid := amtc_unionMasks(new_valid, 1);
-//      }
-//
-//      if (cache_entry.TokensSec1 == tokens_per_sector) {
-//          new_valid := amtc_unionMasks(new_valid, 2);
-//      }
-//      cache_entry.ValidSectors := new_valid;
+      DPRINTF(RubySlicc,
+              "AMTC_L1_TOKEN_ADD_V85S addr=%#x type=%s in0=%d in1=%d t0=%d t1=%d\n",
+              address, in_msg.Type, in_msg.TokensSec0, in_msg.TokensSec1,
+              cache_entry.TokensSec0, cache_entry.TokensSec1);
     }
   }
 
@@ -2977,181 +3070,86 @@ action(amtc_markValidSectorsFromResponse, "mvs", desc="Mark valid sectors from r
     }
   }
 
-  action(amtc_recomputeValidFromTokens, "rv", desc="Recompute valid sectors from tokens") {
-  int new_valid := 0;
-
-  // Tokens > 0 means we have at least Shared permission, so the data is valid!
-  if (cache_entry.TokensSec0 > 0) {
-    new_valid := amtc_unionMasks(new_valid, 1);
+  action(amtc_recomputeValidFromTokens, "rv", desc="Clear validity when a sector loses its last token") {
+    // V85S: token ownership is permission, not proof that bytes were installed.
+    // This helper may invalidate data after token donation, but must never set a
+    // ValidSectors bit solely because a token exists.
+    if (cache_entry.TokensSec0 == 0) {
+      // V85S-r8: dropping local validity is legal only for clean bytes.
+      assert(!amtc_maskHasSector(cache_entry.DirtySectors, 0));
+      cache_entry.ValidSectors := amtc_subtractMask(cache_entry.ValidSectors, 1);
+    }
+    if (cache_entry.TokensSec1 == 0) {
+      assert(!amtc_maskHasSector(cache_entry.DirtySectors, 1));
+      cache_entry.ValidSectors := amtc_subtractMask(cache_entry.ValidSectors, 2);
+    }
   }
-  if (cache_entry.TokensSec1 > 0) {
-    new_valid := amtc_unionMasks(new_valid, 2);
-  }
-
-  cache_entry.ValidSectors := new_valid;
-}
   // Legacy L1 owner-read request action removed: owner convergence belongs to L2/TCC.
   // Legacy immediate missing-sector pull removed: L1 is passive.
 
-  action(acc_accumulateResponse, "acc", desc="Strictly accumulate incoming partial data and tokens") {
+  action(acc_accumulateResponse, "acc", desc="Strictly accumulate incoming partial data and physical tokens") {
     peek(responseNetwork_in, ResponseMsg) {
-        // Audit72: late DATA/ACK responses can arrive after ck_checkCompletion
-        // has issued the CPU callback and deallocated the TBE.  Never let the
-        // strict accumulator assert on such a stale response; just drop it and
-        // let the transition pop the response queue.
-        if (!is_valid(tbe)) {
-            DPRINTF(RubySlicc,
-                    "AMTC_L1_ACC_DROP_LATE_RESPONSE_NO_TBE addr=%#x valid=%x token=%x T0=%d T1=%d cache_valid=%d\n",
-                    address, in_msg.valid_sector_mask, in_msg.token_sector_mask,
-                    in_msg.TokensSec0, in_msg.TokensSec1, is_valid(cache_entry));
-        } else if (in_msg.Type == CoherenceResponseType:ACK_OWNER &&
-            in_msg.TokensSec0 == 0 &&
-            in_msg.TokensSec1 == 0 &&
-            in_msg.valid_sector_mask == 0 &&
-            in_msg.token_sector_mask == 0) {
-            // Audit68: zero-token ACK_OWNER can be a late stale-owner response
-            // after the original write TBE has already been removed.  Ignore it
-            // before touching tbe/cache_entry validity.
-            DPRINTF(RubySlicc,
-                    "AMTC_L1_ACC_IGNORE_ZERO_OWNER_ACK addr=%#x tbe_valid=%d cache_valid=%d\n",
-                    address, is_valid(tbe), is_valid(cache_entry));
-        } else {
+      // Late responses are allowed after completion, but they must not mutate a
+      // new/stable transaction after the original TBE has retired.
+      if (!is_valid(tbe)) {
+        DPRINTF(RubySlicc,
+                "AMTC_L1_ACC_DROP_LATE_RESPONSE_NO_TBE addr=%#x valid=%x token=%x T0=%d T1=%d cache_valid=%d\n",
+                address, in_msg.valid_sector_mask, in_msg.token_sector_mask,
+                in_msg.TokensSec0, in_msg.TokensSec1, is_valid(cache_entry));
+      } else if (in_msg.Type == CoherenceResponseType:ACK_OWNER &&
+                 in_msg.TokensSec0 == 0 &&
+                 in_msg.TokensSec1 == 0 &&
+                 in_msg.valid_sector_mask == 0 &&
+                 in_msg.token_sector_mask == 0) {
+        DPRINTF(RubySlicc,
+                "AMTC_L1_ACC_IGNORE_ZERO_OWNER_ACK addr=%#x tbe_valid=%d cache_valid=%d\n",
+                address, is_valid(tbe), is_valid(cache_entry));
+      } else {
         assert(is_valid(tbe));
         assert(is_valid(cache_entry));
 
         int incoming_valid_mask := 0;
-
-        // Only DATA responses install bytes.  Control ACKs can legally carry
-        // token_sector_mask/valid_sector_mask metadata, but treating that as
-        // received data lets a token-only ACK complete a miss with an empty
-        // cache block.  Keep L1 passive: ACKs update tokens only; DATA updates
-        // the received-data mask.
         if (in_msg.Type == CoherenceResponseType:DATA_SHARED ||
             in_msg.Type == CoherenceResponseType:DATA_OWNER) {
-            incoming_valid_mask := amtc_intersectMasks(in_msg.valid_sector_mask,
-                                                       tbe.RequestedSectorMask);
+          incoming_valid_mask :=
+              amtc_intersectMasks(in_msg.valid_sector_mask,
+                                  tbe.RequestedSectorMask);
         }
 
         tbe.ReceivedSectorMask :=
-            amtc_unionMasks(
-                tbe.ReceivedSectorMask,
-                incoming_valid_mask);
+            amtc_unionMasks(tbe.ReceivedSectorMask, incoming_valid_mask);
 
-        if (incoming_valid_mask != 0 || in_msg.TokensSec0 != 0 || in_msg.TokensSec1 != 0) {
-            tbe.ForwardProgressFlag := true;
+        if (incoming_valid_mask != 0 ||
+            in_msg.TokensSec0 != 0 ||
+            in_msg.TokensSec1 != 0) {
+          tbe.ForwardProgressFlag := true;
         }
 
-        // ACK/DATA token metadata update only; no recursive protocol actions.
-        // Token responses can arrive from both L2 and Directory for the same
-        // convergence window.  Clamp per-sector token counts so duplicate or
-        // overlapping token ACKs cannot push the cache entry past exclusive
-        // ownership and trip setState(M/MM) invariants.
         int tokens_per_sector := max_tokens() / 2;
+        int new_t0 := cache_entry.TokensSec0 + in_msg.TokensSec0;
+        int new_t1 := cache_entry.TokensSec1 + in_msg.TokensSec1;
 
-        cache_entry.TokensSec0 := cache_entry.TokensSec0 + in_msg.TokensSec0;
-        cache_entry.TokensSec1 := cache_entry.TokensSec1 + in_msg.TokensSec1;
+        // V85S: no saturation and no 511->512 repair.  The only legal write
+        // completion is exact accumulation of physical tokens.
+        assert(new_t0 >= 0);
+        assert(new_t1 >= 0);
+        assert(new_t0 <= tokens_per_sector);
+        assert(new_t1 <= tokens_per_sector);
 
-        if (cache_entry.TokensSec0 > tokens_per_sector) {
-            cache_entry.TokensSec0 := tokens_per_sector;
-        }
-        if (cache_entry.TokensSec1 > tokens_per_sector) {
-            cache_entry.TokensSec1 := tokens_per_sector;
-        }
+        cache_entry.TokensSec0 := new_t0;
+        cache_entry.TokensSec1 := new_t1;
 
-        // Audit65: L2/Directory may reply to a GETX with DATA_OWNER carrying
-        // max-1 tokens for the requested sector while retaining/returning the
-        // final accounting token on a parallel path.  The centralized
-        // ck_checkCompletion path can then legally see DATA_OWNER for the
-        // requested store sector but only 511/512 tokens, and the hard-coded
-        // transition target enters MM before another retry can collect the
-        // last token.  For a write-side DATA_OWNER grant, repair only the
-        // requested dirty sectors that are exactly one token short.  This is
-        // deliberately narrower than the generic saturation above: it does
-        // not affect reads, DATA_SHARED, ACKs, or unrequested sectors.
-        if (tbe.TypeOfAccess == AccessType:Write &&
-            in_msg.Type == CoherenceResponseType:DATA_OWNER) {
-
-            if (amtc_maskHasSector(tbe.RequestedSectorMask, 0) &&
-                cache_entry.TokensSec0 == (tokens_per_sector - 1)) {
-                DPRINTF(RubySlicc,
-                        "AMTC_L1_GETX_NEAR_TOKEN_REPAIR addr=%#x sec=0 req=%x old=%d max=%d\n",
-                        address, tbe.RequestedSectorMask,
-                        cache_entry.TokensSec0, tokens_per_sector);
-                cache_entry.TokensSec0 := tokens_per_sector;
-            }
-
-            if (amtc_maskHasSector(tbe.RequestedSectorMask, 1) &&
-                cache_entry.TokensSec1 == (tokens_per_sector - 1)) {
-                DPRINTF(RubySlicc,
-                        "AMTC_L1_GETX_NEAR_TOKEN_REPAIR addr=%#x sec=1 req=%x old=%d max=%d\n",
-                        address, tbe.RequestedSectorMask,
-                        cache_entry.TokensSec1, tokens_per_sector);
-                cache_entry.TokensSec1 := tokens_per_sector;
-            }
-        }
-        }
+        DPRINTF(RubySlicc,
+                "AMTC_L1_ACC_TOKEN_ADD_V85S addr=%#x type=%s req=%x in0=%d in1=%d t0=%d t1=%d recv=%x\n",
+                address, in_msg.Type, tbe.RequestedSectorMask,
+                in_msg.TokensSec0, in_msg.TokensSec1,
+                cache_entry.TokensSec0, cache_entry.TokensSec1,
+                tbe.ReceivedSectorMask);
+      }
     }
   }
 
-action(amtc_markRequestedSectorsValidFromTBE, "mrv",
-       desc="Self-owner repair: mark requested sectors valid after token-only read convergence") {
-    assert(is_valid(tbe));
-    assert(is_valid(cache_entry));
 
-    int repair_mask := amtc_sanitizeMask(tbe.RequestedSectorMask);
-    cache_entry.ValidSectors := amtc_unionMasks(cache_entry.ValidSectors, repair_mask);
-
-    DPRINTF(RubySlicc,
-            "AMTC_L1_SELF_OWNER_TOKEN_READ_REPAIR addr=%#x repair=%x valid=%x T0=%d T1=%d\n",
-            address, repair_mask, cache_entry.ValidSectors,
-            cache_entry.TokensSec0, cache_entry.TokensSec1);
-}
-
-action(optr_repairOwnerPullWriteTokensFromData, "optr",
-       desc="Owner-pull data-only write response implies self-owned requested-sector tokens") {
-    if (is_valid(tbe) && is_valid(cache_entry)) {
-        peek(responseNetwork_in, ResponseMsg) {
-            if (tbe.OwnerPullIssued &&
-                tbe.TypeOfAccess == AccessType:Write &&
-                (in_msg.Type == CoherenceResponseType:DATA_SHARED ||
-                 in_msg.Type == CoherenceResponseType:DATA_OWNER) &&
-                in_msg.TokensSec0 == 0 &&
-                in_msg.TokensSec1 == 0) {
-
-                int data_mask := amtc_intersectMasks(in_msg.valid_sector_mask,
-                                                     tbe.RequestedSectorMask);
-                int tokens_per_sector := max_tokens() / 2;
-                bool repaired := false;
-
-                if (amtc_maskHasSector(data_mask, 0) &&
-                    cache_entry.TokensSec0 < tokens_per_sector) {
-                    DPRINTF(RubySlicc,
-                            "AMTC_L1_OWNERPULL_WRITE_TOKEN_REPAIR addr=%#x sec=0 req=%x recv=%x old=%d max=%d\n",
-                            address, tbe.RequestedSectorMask,
-                            tbe.ReceivedSectorMask,
-                            cache_entry.TokensSec0, tokens_per_sector);
-                    cache_entry.TokensSec0 := tokens_per_sector;
-                    repaired := true;
-                }
-
-                if (amtc_maskHasSector(data_mask, 1) &&
-                    cache_entry.TokensSec1 < tokens_per_sector) {
-                    DPRINTF(RubySlicc,
-                            "AMTC_L1_OWNERPULL_WRITE_TOKEN_REPAIR addr=%#x sec=1 req=%x recv=%x old=%d max=%d\n",
-                            address, tbe.RequestedSectorMask,
-                            tbe.ReceivedSectorMask,
-                            cache_entry.TokensSec1, tokens_per_sector);
-                    cache_entry.TokensSec1 := tokens_per_sector;
-                    repaired := true;
-                }
-
-                if (repaired) {
-                    tbe.ForwardProgressFlag := true;
-                }
-            }
-        }
-    }
-}
 
 action(ck_checkCompletion, "ck",
        desc="Evaluate convergence status and wake CPU only after convergence") {
@@ -3201,12 +3199,13 @@ action(ck_checkCompletion, "ck",
 
         bool read_can_complete := data_ready && shared_ready && is_read;
 
-        // Audit72 old-conversion rule: CPU stores/RFOs are the producer of the
-        // bytes being written.  Once L1 owns all requested-sector tokens, the
-        // store may complete; writeCallback() installs the CPU's store data.
-        // Reads still require data_ready above.
+        // V85S-r9: ownership is permission, not a substitute for old bytes.
+        // CPU stores in this workload may be sub-sector/partial, so completion
+        // requires authoritative data for every requested sector as well as
+        // exact ownership.  When ownership converges first, r7 requests a
+        // data-only owner pull instead of fabricating validity here.
         bool write_can_complete :=
-            exclusive_ready && is_write;
+            data_ready && exclusive_ready && is_write;
         bool did_complete := false;
 
         tbe.SharedReady := false;
@@ -3253,12 +3252,11 @@ action(ck_checkCompletion, "ck",
             if (!already_called_back) {
                 tbe.CallbackIssued := true;
 
-                // Store/RFO completion can be token-only.  The CPU store will
-                // install the written bytes via writeCallback(), so mark the
-                // requested sectors valid before entering MM.  Reads still
-                // require data_ready above.
-                cache_entry.ValidSectors :=
-                    amtc_unionMasks(cache_entry.ValidSectors, req_mask_snapshot);
+                // data_ready above proves that the requested bytes were either
+                // already resident or installed by a real response.  Never set
+                // ValidSectors from token ownership in the completion path.
+                assert(amtc_maskContainsAll(cache_entry.ValidSectors,
+                                            req_mask_snapshot));
 
                 cache_entry.CacheState := State:MM;
                 int ck_excl_mask := amtc_exclusiveTokenMask(cache_entry);
@@ -3266,15 +3264,16 @@ action(ck_checkCompletion, "ck",
                 if (tbe.TargetMask != 0) {
                     write_dirty_req_mask := tbe.TargetMask;
                 }
-                int ck_dirty_mask := amtc_intersectMasks(write_dirty_req_mask, ck_excl_mask);
 
-                if (ck_dirty_mask != write_dirty_req_mask) {
-                    DPRINTF(RubySlicc,
-                            "AMTC_L1_AUDIT78_CK_DIRTY_MASK_CLAMP_V26 addr=%#x req=%x target=%x dirty=%x excl=%x valid=%x T0=%d T1=%d\n",
-                            address, req_mask_snapshot, write_dirty_req_mask,
-                            ck_dirty_mask, ck_excl_mask, cache_entry.ValidSectors,
-                            cache_entry.TokensSec0, cache_entry.TokensSec1);
-                }
+                int ck_valid_owned_mask :=
+                    amtc_intersectMasks(cache_entry.ValidSectors, ck_excl_mask);
+                int ck_dirty_mask :=
+                    amtc_intersectMasks(write_dirty_req_mask,
+                                        ck_valid_owned_mask);
+
+                // The actual CPU write target must be both valid and exclusive
+                // before the callback can make it dirty.
+                assert(ck_dirty_mask == write_dirty_req_mask);
 
                 if (ck_dirty_mask != 0) {
                     cache_entry.Dirty := true;
@@ -3888,19 +3887,14 @@ action(t_handleStrictTimeout, "t_to", desc="Guarded passive timeout resend") {
     n_popResponseQueue;
   }
 
-  // Self-owner read repair: L1 was in M/MM, missed a stale ValidSectors bit,
-  // issued GETS for one sector, and received all requested tokens as a control
-  // ACK but no bytes.  Directory will keep returning zero-token ACK_OWNER
-  // because it believes this L1 is already the owner.  Mark the requested
-  // sector valid locally and satisfy the original read.
-  transition(M_IS, Ack_All_Tokens, M) {
+  // V85S: token ownership never proves that the requested bytes are present.
+  // If a modified-owner read has all tokens but still lacks data, keep the
+  // transaction transient and fetch the backing bytes through owner-pull.
+  transition(M_IS, Ack_All_Tokens) {
     q_updateTokensFromResponse;
-    amtc_markRequestedSectorsValidFromTBE;
-    x_external_load_hit;
-    s_deallocateTBE;
-    j_unsetReissueTimer;
+    r_issueReadOwnerPullFallback;
+    j_rearmReissueTimerIfPending;
     n_popResponseQueue;
-    kd_wakeUpDependents;
   }
 
   // Token-only ACK can complete a warm S->M sector upgrade. The directory may
@@ -3992,7 +3986,6 @@ action(t_handleStrictTimeout, "t_to", desc="Guarded passive timeout resend") {
   transition(OM, {Data_Shared, Data_Owner}) {
     u_writeDataToCache;
     acc_accumulateResponse;
-    optr_repairOwnerPullWriteTokensFromData;
     ck_checkCompletion;
     j_rearmReissueTimerIfPending;
     n_popResponseQueue;
@@ -4070,7 +4063,6 @@ action(t_handleStrictTimeout, "t_to", desc="Guarded passive timeout resend") {
   transition(M_IM, Data_Owner, M_IM) {
     u_writeDataToCache;
     acc_accumulateResponse;
-    optr_repairOwnerPullWriteTokensFromData;
     ck_checkCompletion;
     j_rearmReissueTimerIfPending;
     n_popResponseQueue;
@@ -4088,7 +4080,6 @@ action(t_handleStrictTimeout, "t_to", desc="Guarded passive timeout resend") {
   transition(M_IM, Data_Shared, M_IM) {
     u_writeDataToCache;
     acc_accumulateResponse;
-    optr_repairOwnerPullWriteTokensFromData;
     ck_checkCompletion;
     j_rearmReissueTimerIfPending;
     n_popResponseQueue;
@@ -4282,6 +4273,21 @@ action(t_handleStrictTimeout, "t_to", desc="Guarded passive timeout resend") {
     amtc_markValidSectorsFromResponse;
     amtc_recomputeValidFromTokens;
     n_popResponseQueue;
+  }
+
+  // V85S-r12: Directory/DMA owner-pull is observational.  Stable holders
+  // return real bytes with zero tokens and retain their exact state/ownership.
+  transition({S, O, M, MM}, Transient_GETS_Owner_Pull) {
+    dop_sendDataOnlyOwnerPullV85S12;
+    m_popRequestQueue;
+  }
+
+  // Non-holders participate in the L2 fanout with a zero-token ACK.  Directory
+  // drains these while waiting for a real data holder; ACK(0) is never evidence
+  // that all physical tokens have returned to Directory.
+  transition({NP, I}, Transient_GETS_Owner_Pull) {
+    doa_sendOwnerPullAckNoDataV85S12;
+    m_popRequestQueue;
   }
 
   // =====================================================================
@@ -4565,7 +4571,6 @@ action(t_handleStrictTimeout, "t_to", desc="Guarded passive timeout resend") {
   transition({IM_WAIT_PARTIAL, IM_WAIT_EXCL}, {Data_Shared, Data_Owner}) {
     u_writeDataToCache;
     acc_accumulateResponse;
-    optr_repairOwnerPullWriteTokensFromData;
     ck_checkCompletion;
     // Audit72: no extra forced GETX retry; ck_checkCompletion owns write completion.
     n_popResponseQueue;
